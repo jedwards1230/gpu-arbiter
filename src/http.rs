@@ -4,8 +4,9 @@
 //! |---|---|---|---|
 //! | GET | `/status` | LAN | Full [`StatusSnapshot`] for remote machines + dashboards |
 //! | GET | `/healthz` | LAN | Liveness |
-//! | POST | `/pin` | LAN | Force-hold `{mode: gaming\|available\|auto}` |
 //! | POST | `/ollama/start`,`/ollama/stop` | localhost-only | Manual override (debugging) |
+//!
+//! State is fully **auto** — derived from observed reality (no manual override).
 //!
 //! Security: single port bound `0.0.0.0`, LAN-restricted by a firewalld rich
 //! rule (copy the game-shell bridge pattern). The `/ollama/*` handlers
@@ -24,19 +25,18 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Router, response::IntoResponse};
-use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::Config;
 use crate::ollama;
-use crate::state::{ArbiterState, Pin, ReconcileTrigger, StatusSnapshot};
+use crate::state::{ArbiterState, ReconcileTrigger, StatusSnapshot};
 
 /// Shared application state handed to every handler.
 ///
 /// `state` is the live [`ArbiterState`] (also mutated by the reconcile task);
-/// `triggers` lets handlers nudge a reconcile (`POST /pin`, `POST /ollama/*`);
-/// `cfg` is the (immutable, shared) daemon config the `/ollama/*` debug handlers
-/// need to address the right systemd unit.
+/// `triggers` lets the `/ollama/*` handlers nudge a reconcile; `cfg` is the
+/// (immutable, shared) daemon config those debug handlers need to address the
+/// right systemd unit.
 #[derive(Clone)]
 pub struct AppState {
     /// Live arbiter state, shared with the reconcile task.
@@ -47,22 +47,12 @@ pub struct AppState {
     pub cfg: Arc<Config>,
 }
 
-/// Request body for `POST /pin`: `{"mode": "gaming" | "available" | "auto"}`.
-///
-/// Deserializes straight into [`Pin`] via its lowercase serde rename.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PinRequest {
-    /// Desired pin mode.
-    pub mode: Pin,
-}
-
 /// Build the axum [`Router`] for the control surface. Pulled out of [`serve`] so
 /// it can be exercised without binding a socket.
 pub fn router(app: AppState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/healthz", get(healthz))
-        .route("/pin", post(pin))
         .route("/ollama/start", post(ollama_start))
         .route("/ollama/stop", post(ollama_stop))
         .with_state(app)
@@ -95,21 +85,11 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
-/// `POST /pin` — set the manual override, then trigger a reconcile so the new
-/// pin takes effect immediately.
-pub async fn pin(State(app): State<AppState>, Json(req): Json<PinRequest>) -> impl IntoResponse {
-    app.state.lock().await.pin = req.mode;
-    // Best-effort nudge: a failed send just means a reconcile is already
-    // imminent / the channel is gone (shutdown) — the pin is recorded regardless.
-    let _ = app.triggers.send(ReconcileTrigger::Pin).await;
-    (StatusCode::OK, "ok")
-}
-
 /// `POST /ollama/start` — manual start (debugging). Rejects non-loopback peers.
 ///
 /// A direct override: starts the unit now. (Note the reconcile authority will
 /// re-evict on the next pass if a game is running — this is a debug escape
-/// hatch, not a way to override gaming. Use `POST /pin available` for that.)
+/// hatch, not a way to override gaming.)
 pub async fn ollama_start(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(app): State<AppState>,
@@ -177,13 +157,5 @@ mod tests {
     fn lan_peer_is_not_localhost() {
         // A generic RFC 1918 LAN address — the `/ollama/*` handlers must reject it.
         assert!(!is_localhost(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))));
-    }
-
-    #[test]
-    fn pin_request_deserializes() {
-        let r: PinRequest = serde_json::from_str(r#"{"mode":"gaming"}"#).unwrap();
-        assert_eq!(r.mode, Pin::Gaming);
-        let r: PinRequest = serde_json::from_str(r#"{"mode":"auto"}"#).unwrap();
-        assert_eq!(r.mode, Pin::Auto);
     }
 }

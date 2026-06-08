@@ -185,11 +185,11 @@ pub async fn reconcile(
     let snap = observe(cfg).await?;
     let claims = claim_set(&snap, cfg);
 
-    // Brief lock: read pin, decide, record the fresh claim set, snapshot the
-    // current state so we can pick an Ollama action without holding the lock.
+    // Brief lock: decide, record the fresh claim set, snapshot the current state
+    // so we can pick an Ollama action without holding the lock.
     let (current, desired) = {
         let mut guard = state.lock().await;
-        let desired = ArbiterState::resolve_state(guard.pin, &claims);
+        let desired = ArbiterState::resolve_state(&claims);
         let current = guard.state;
         guard.claims = claims;
         tracing::debug!(
@@ -406,8 +406,8 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_empty_observation_drives_available() {
-        // On a non-Linux host observe() is empty → no claims → Pin::Auto resolves
-        // to Available. Starting from Gaming exercises the verified-restart path
+        // On a non-Linux host observe() is empty → no claims → resolves to
+        // Available. Starting from Gaming exercises the verified-restart path
         // (ollama::start fails-soft without systemd; reconcile still succeeds).
         let cfg = Config::default();
         let mut s = ArbiterState::new();
@@ -419,37 +419,6 @@ mod tests {
         let g = state.lock().await;
         assert_eq!(g.state, State::Available);
         assert!(g.claims.is_empty());
-    }
-
-    #[tokio::test]
-    async fn reconcile_pin_gaming_holds_state_without_claims() {
-        // Pin::Gaming forces Gaming even though the (empty) observation has no
-        // claims. Starting from Available drives the evict→gaming path; the
-        // eviction shell-outs fail-soft but the state still settles to Gaming.
-        let cfg = Config::default();
-        let mut s = ArbiterState::new();
-        s.pin = crate::state::Pin::Gaming;
-        assert_eq!(s.state, State::Available);
-        let state = shared(s);
-        reconcile(&state, &cfg, ReconcileTrigger::Pin)
-            .await
-            .unwrap();
-        let g = state.lock().await;
-        assert_eq!(g.state, State::Gaming);
-        assert!(g.claims.is_empty());
-    }
-
-    #[tokio::test]
-    async fn reconcile_pin_available_stays_available() {
-        let cfg = Config::default();
-        let mut s = ArbiterState::new();
-        s.pin = crate::state::Pin::Available;
-        s.state = State::Gaming;
-        let state = shared(s);
-        reconcile(&state, &cfg, ReconcileTrigger::Pin)
-            .await
-            .unwrap();
-        assert_eq!(state.lock().await.state, State::Available);
     }
 
     #[test]

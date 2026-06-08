@@ -1,12 +1,12 @@
 //! gpu-arbiter-tray — pure-Rust KDE/Plasma (Wayland) status tray companion.
 //!
 //! A small user-session app that shows the [`gpu_arbiter`] daemon's state at a
-//! glance and fires a desktop notification on every transition. It owns no
-//! authority: it polls the daemon's localhost HTTP `/status` every couple of
-//! seconds, reflects it as a colored tray dot + tooltip, and offers a Pin
-//! submenu that `POST`s `/pin` back. The root daemon stays minimal; everything
-//! desktop-facing lives here in the user session (where the session D-Bus —
-//! hence the tray host and notifications — actually exists).
+//! glance and fires a desktop notification on every transition. Read-only: it
+//! polls the daemon's localhost HTTP `/status` every couple of seconds and
+//! reflects it as a colored tray dot + tooltip (state is fully auto — there's no
+//! override to set). The root daemon stays minimal; everything desktop-facing
+//! lives here in the user session (where the session D-Bus — hence the tray host
+//! and notifications — actually exists).
 //!
 //! Pure-Rust, musl-clean: `ksni` (StatusNotifierItem) and `notify-rust` both go
 //! through `zbus` (no libdbus); `ureq` is built with no TLS (localhost http
@@ -37,8 +37,8 @@ mod linux {
     use std::sync::LazyLock;
     use std::time::Duration;
 
-    use gpu_arbiter::state::{Pin, State, StatusSnapshot};
-    use ksni::menu::{MenuItem, StandardItem, SubMenu};
+    use gpu_arbiter::state::{State, StatusSnapshot};
+    use ksni::menu::{MenuItem, StandardItem};
     use ksni::{Handle, Icon, ToolTip, Tray, TrayMethods};
     use notify_rust::{Notification, Timeout, Urgency};
 
@@ -54,9 +54,6 @@ mod linux {
 
     fn status_url() -> String {
         format!("{}/status", &*BASE_URL)
-    }
-    fn pin_url() -> String {
-        format!("{}/pin", &*BASE_URL)
     }
 
     // --- Icon: a flat ARGB32 status dot generated in-process ------------------
@@ -109,14 +106,6 @@ mod linux {
         }
     }
 
-    fn pin_label(pin: Pin) -> &'static str {
-        match pin {
-            Pin::Auto => "auto",
-            Pin::Gaming => "gaming",
-            Pin::Available => "available",
-        }
-    }
-
     // --- Tray state -----------------------------------------------------------
 
     /// What the tray renders. Mutated by the poll loop via [`Handle::update`].
@@ -135,13 +124,12 @@ mod linux {
                         format!(" ({})", s.ollama.models.join(", "))
                     };
                     format!(
-                        "State: {}  (pin: {})\n\
+                        "State: {}\n\
                          VRAM: {} / {} MiB used\n\
                          Ollama: {}{}\n\
                          Since: {}\n\
                          Daemon: v{}",
                         state_label(s.state),
-                        pin_label(s.pin),
                         s.gpu_vram_used_mb,
                         s.gpu_vram_total_mb,
                         if s.ollama.running {
@@ -184,39 +172,8 @@ mod linux {
         }
 
         fn menu(&self) -> Vec<MenuItem<Self>> {
-            // A Pin item: POST /pin {mode}, then optimistically reflect it locally
-            // (the next poll confirms / corrects).
-            fn pin_item(label: &str, mode: &'static str) -> StandardItem<GpuTray> {
-                StandardItem {
-                    label: label.to_string(),
-                    activate: Box::new(move |t: &mut GpuTray| match post_pin(mode) {
-                        Ok(()) => {
-                            if let Some(s) = t.status.as_mut() {
-                                s.pin = match mode {
-                                    "gaming" => Pin::Gaming,
-                                    "available" => Pin::Available,
-                                    _ => Pin::Auto,
-                                };
-                            }
-                        }
-                        Err(e) => t.last_error = Some(format!("pin {mode} failed: {e}")),
-                    }),
-                    ..Default::default()
-                }
-            }
-
+            // Auto-only: the tray is a read-only status indicator (no overrides).
             vec![
-                SubMenu {
-                    label: "Pin".into(),
-                    submenu: vec![
-                        pin_item("Auto", "auto").into(),
-                        pin_item("Gaming", "gaming").into(),
-                        pin_item("Available", "available").into(),
-                    ],
-                    ..Default::default()
-                }
-                .into(),
-                MenuItem::Separator,
                 StandardItem {
                     label: "Quit".into(),
                     activate: Box::new(|_t: &mut GpuTray| std::process::exit(0)),
@@ -235,14 +192,6 @@ mod linux {
             .map_err(|e| e.to_string())?
             .body_mut()
             .read_json::<StatusSnapshot>()
-            .map_err(|e| e.to_string())
-    }
-
-    /// POST `/pin` with the daemon's contract body: `{"mode": "<mode>"}`.
-    fn post_pin(mode: &str) -> Result<(), String> {
-        ureq::post(pin_url())
-            .send_json(serde_json::json!({ "mode": mode }))
-            .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
