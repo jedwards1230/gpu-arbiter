@@ -33,15 +33,16 @@ pub mod state;
 // cross-platform; the shell-out runs on Linux but compiles everywhere.
 pub mod gpu;
 
-// systemctl stop/start + nvidia-smi VRAM wait + SIGKILL escalation.
-pub mod ollama;
+// Managed-unit lifecycle: systemctl stop/start + nvidia-smi VRAM wait + SIGKILL
+// escalation, keyed off a unit name (not a single hardcoded Ollama unit).
+pub mod units;
 
-// The reconcile authority: /proc scan → claim set → drive ollama. The
+// The reconcile authority: /proc scan → claim set → drive the managed units. The
 // snapshot→claim-set logic is pure; the scan itself is Linux-gated internally.
 pub mod reconcile;
 
-// axum HTTP control surface: GET /status /healthz, POST /ollama/*.
-// Cross-platform (tokio/axum only).
+// axum HTTP control surface: GET /status /healthz, POST /units/{unit}/* (and the
+// /ollama/* back-compat alias). Cross-platform (tokio/axum only).
 pub mod http;
 
 // cn_proc netlink listener (neli) → debounced reconcile trigger. Linux-only:

@@ -29,6 +29,36 @@ pub struct GamePattern {
     pub match_substr: String,
 }
 
+/// serde default for [`ManagedUnit::eager_restart`] — defaults to eager warm-up.
+fn default_true() -> bool {
+    true
+}
+
+/// One systemd unit the arbiter owns and evicts from the GPU when a game
+/// launches (stop → poll-VRAM-free → SIGKILL, the same loop the single Ollama
+/// unit used to get).
+///
+/// Renders in TOML as:
+/// ```toml
+/// [[managed_units]]
+/// unit = "ollama.service"
+/// eager_restart = true     # restart this unit when gaming ends
+/// vram_match = "ollama"    # substring for /status VRAM attribution (optional)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ManagedUnit {
+    /// systemd unit the daemon exclusively owns.
+    pub unit: String,
+    /// Restart this unit when gaming ends (eager warm-up). Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub eager_restart: bool,
+    /// Substring matched (case-insensitive) against `nvidia-smi` compute-proc
+    /// names to attribute this unit's VRAM in `/status`. `None` → no VRAM is
+    /// reported for the unit (the field is omitted rather than reported as 0).
+    #[serde(default)]
+    pub vram_match: Option<String>,
+}
+
 /// The full daemon configuration. Field names are the TOML keys.
 ///
 /// Maps to the deployment variable names (TOML key ← `gpu_arbiter_*`):
@@ -37,8 +67,9 @@ pub struct GamePattern {
 /// |---|---|
 /// | `enabled` | `gpu_arbiter_enabled` |
 /// | `port` | `gpu_arbiter_port` |
-/// | `ollama_unit` | `gpu_arbiter_ollama_unit` |
-/// | `eager_ollama` | `gpu_arbiter_eager_ollama` |
+/// | `ollama_unit` | `gpu_arbiter_ollama_unit` (legacy; see `managed_units`) |
+/// | `eager_ollama` | `gpu_arbiter_eager_ollama` (legacy; see `managed_units`) |
+/// | `managed_units` | `gpu_arbiter_managed_units` |
 /// | `eviction_timeout_s` | `gpu_arbiter_eviction_timeout_s` |
 /// | `vram_free_threshold_mb` | `gpu_arbiter_vram_free_threshold_mb` |
 /// | `reconcile_interval_s` | `gpu_arbiter_reconcile_interval_s` |
@@ -54,10 +85,18 @@ pub struct Config {
     pub enabled: bool,
     /// HTTP listen port (bound `0.0.0.0`; LAN-restricted by firewalld).
     pub port: u16,
-    /// systemd unit the daemon exclusively owns.
+    /// **Legacy** single managed unit. Superseded by `managed_units`; still
+    /// accepted and, when `managed_units` is unset, synthesized into a
+    /// one-element list (see [`Config::resolved_units`]).
     pub ollama_unit: String,
-    /// Restart Ollama when gaming ends (eager warm-up).
+    /// **Legacy** eager-restart toggle for the single Ollama unit. Superseded by
+    /// each `managed_units` entry's `eager_restart`; see [`Config::resolved_units`].
     pub eager_ollama: bool,
+    /// Ordered list of systemd units the arbiter evicts from the GPU on a game
+    /// launch and restores when gaming ends. When empty, the legacy
+    /// `ollama_unit` / `eager_ollama` fields synthesize a single entry — see
+    /// [`Config::resolved_units`], the one accessor the daemon drives off.
+    pub managed_units: Vec<ManagedUnit>,
     /// Seconds to wait for a graceful Ollama teardown before SIGKILL escalation.
     pub eviction_timeout_s: u64,
     /// VRAM-used threshold (MiB) under which the GPU is considered "freed" after
@@ -87,6 +126,7 @@ impl Default for Config {
             port: 48750,
             ollama_unit: "ollama.service".to_string(),
             eager_ollama: true,
+            managed_units: Vec::new(),
             eviction_timeout_s: 5,
             vram_free_threshold_mb: 2000,
             reconcile_interval_s: 30,
@@ -121,6 +161,27 @@ pub enum ConfigError {
 }
 
 impl Config {
+    /// The ordered list of managed units the daemon actually drives — the single
+    /// source of truth for eviction/restart and `/status`.
+    ///
+    /// If `managed_units` is non-empty it's returned verbatim (order preserved —
+    /// eviction runs in this order). Otherwise a **one-element** list is
+    /// synthesized from the legacy `ollama_unit` / `eager_ollama` fields with
+    /// `vram_match = "ollama"`, so an unconfigured daemon (or one still using only
+    /// the old keys) evicts + attributes VRAM for Ollama exactly as it did before
+    /// `managed_units` existed. This is the backward-compatibility contract.
+    pub fn resolved_units(&self) -> Vec<ManagedUnit> {
+        if self.managed_units.is_empty() {
+            vec![ManagedUnit {
+                unit: self.ollama_unit.clone(),
+                eager_restart: self.eager_ollama,
+                vram_match: Some("ollama".to_string()),
+            }]
+        } else {
+            self.managed_units.clone()
+        }
+    }
+
     /// Parse a [`Config`] from a TOML string. Pure — unit-tested on macOS.
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         Ok(toml::from_str(s)?)
@@ -183,6 +244,88 @@ mod tests {
         // Parse error, not silently default.
         let err = Config::from_toml("port = \"not_a_number\"").unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn resolved_units_legacy_fallback_synthesizes_single_entry() {
+        // No `managed_units` → the legacy single-Ollama-unit behavior: exactly one
+        // entry, carrying the legacy `ollama_unit` / `eager_ollama` values and the
+        // implicit `vram_match = "ollama"` so /status attribution is unchanged.
+        let c = Config::default();
+        let units = c.resolved_units();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].unit, "ollama.service");
+        assert!(units[0].eager_restart);
+        assert_eq!(units[0].vram_match.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn resolved_units_legacy_fields_carry_through() {
+        // The old keys still steer the synthesized entry.
+        let c = Config::from_toml(
+            r#"
+            ollama_unit = "custom-llm.service"
+            eager_ollama = false
+            "#,
+        )
+        .unwrap();
+        let units = c.resolved_units();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].unit, "custom-llm.service");
+        assert!(!units[0].eager_restart);
+    }
+
+    #[test]
+    fn parses_managed_units_list_in_order() {
+        // The motivating two-tenant case: Ollama + an ASR runner, evicted in the
+        // declared order. `eager_restart` defaults to true; `vram_match` is optional.
+        let c = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama.service"
+            eager_restart = true
+            vram_match = "ollama"
+
+            [[managed_units]]
+            unit = "asr-runner.service"
+            vram_match = "parakeet"
+
+            [[managed_units]]
+            unit = "no-restart.service"
+            eager_restart = false
+            "#,
+        )
+        .unwrap();
+        let units = c.resolved_units();
+        assert_eq!(units.len(), 3);
+        // Order is preserved (eviction runs in this order).
+        assert_eq!(units[0].unit, "ollama.service");
+        assert_eq!(units[1].unit, "asr-runner.service");
+        assert_eq!(units[2].unit, "no-restart.service");
+        // eager_restart defaults to true when omitted.
+        assert!(units[1].eager_restart);
+        assert!(!units[2].eager_restart);
+        // vram_match is optional.
+        assert_eq!(units[0].vram_match.as_deref(), Some("ollama"));
+        assert_eq!(units[1].vram_match.as_deref(), Some("parakeet"));
+        assert_eq!(units[2].vram_match, None);
+    }
+
+    #[test]
+    fn managed_units_take_precedence_over_legacy_fields() {
+        // When both are present, `managed_units` wins — the legacy fields are
+        // ignored (no implicit Ollama entry is appended).
+        let c = Config::from_toml(
+            r#"
+            ollama_unit = "ignored.service"
+            [[managed_units]]
+            unit = "only.service"
+            "#,
+        )
+        .unwrap();
+        let units = c.resolved_units();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].unit, "only.service");
     }
 
     #[test]

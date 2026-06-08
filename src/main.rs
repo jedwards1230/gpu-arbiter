@@ -108,9 +108,15 @@ mod linux {
             return Ok(());
         }
 
+        let managed_units = cfg
+            .resolved_units()
+            .into_iter()
+            .map(|u| u.unit)
+            .collect::<Vec<_>>()
+            .join(", ");
         tracing::info!(
             port = cfg.port,
-            ollama_unit = %cfg.ollama_unit,
+            managed_units = %managed_units,
             detect_steam = cfg.detect_steam,
             reconcile_interval_s = cfg.reconcile_interval_s,
             "gpu-arbiter starting"

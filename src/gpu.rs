@@ -165,20 +165,23 @@ pub async fn query_compute_procs() -> Result<Vec<GpuGraphicsProc>, GpuError> {
     Ok(parse_graphics_procs_csv(&out))
 }
 
-/// Best-effort VRAM (MiB) attributed to Ollama, summed across its compute
-/// processes. Matches by process name substring `ollama` (case-insensitive) —
-/// `nvidia-smi` reports the full binary path, e.g. `/usr/local/bin/ollama` or its
-/// `ollama runner` subprocess. Pure helper over an observed compute-proc list.
+/// Best-effort VRAM (MiB) attributed to a managed unit, summed across the compute
+/// processes whose name contains `needle` (case-insensitive) — `nvidia-smi`
+/// reports the full binary path, e.g. `/usr/local/bin/ollama` or an
+/// `ollama runner` subprocess, so a substring like `"ollama"` or `"parakeet"`
+/// matches. Pure helper over an observed compute-proc list, driven by each unit's
+/// configured `vram_match`.
 ///
-/// Returns `None` when no Ollama compute proc is seen (so `/status` omits the
+/// Returns `None` when no matching compute proc is seen (so `/status` omits the
 /// field rather than reporting a misleading `0`).
-pub fn ollama_vram_mb(compute: &[GpuGraphicsProc]) -> Option<u64> {
+pub fn vram_mb_matching(compute: &[GpuGraphicsProc], needle: &str) -> Option<u64> {
+    let needle = needle.to_ascii_lowercase();
     let mut matched = compute
         .iter()
-        .filter(|p| p.name.to_ascii_lowercase().contains("ollama"))
+        .filter(|p| p.name.to_ascii_lowercase().contains(&needle))
         .map(|p| p.vram_mb)
         .peekable();
-    matched.peek()?; // no Ollama compute proc → None (don't report a misleading 0)
+    matched.peek()?; // no matching compute proc → None (don't report a misleading 0)
     Some(matched.sum())
 }
 
@@ -250,19 +253,27 @@ mod tests {
     }
 
     #[test]
-    fn ollama_vram_sums_matching_compute_procs() {
-        // Real nvidia-smi reports the full path; match is by `ollama` substring.
+    fn vram_matching_sums_matching_compute_procs() {
+        // Real nvidia-smi reports the full path; match is by substring.
         let procs = parse_graphics_procs_csv(
             "111, /usr/local/bin/ollama, 21000\n222, /usr/bin/ollama runner, 500\n333, python3, 4000\n",
         );
-        assert_eq!(ollama_vram_mb(&procs), Some(21500));
+        assert_eq!(vram_mb_matching(&procs, "ollama"), Some(21500));
+        // A different needle attributes a different tenant's VRAM.
+        assert_eq!(vram_mb_matching(&procs, "python"), Some(4000));
     }
 
     #[test]
-    fn ollama_vram_none_when_absent() {
+    fn vram_matching_is_case_insensitive() {
+        let procs = parse_graphics_procs_csv("111, /opt/ASR/Parakeet, 8000\n");
+        assert_eq!(vram_mb_matching(&procs, "parakeet"), Some(8000));
+    }
+
+    #[test]
+    fn vram_matching_none_when_absent() {
         let procs = parse_graphics_procs_csv("333, python3, 4000\n");
-        assert_eq!(ollama_vram_mb(&procs), None);
-        assert_eq!(ollama_vram_mb(&[]), None);
+        assert_eq!(vram_mb_matching(&procs, "ollama"), None);
+        assert_eq!(vram_mb_matching(&[], "ollama"), None);
     }
 
     #[tokio::test]
