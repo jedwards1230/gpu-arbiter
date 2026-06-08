@@ -44,15 +44,18 @@ which is a *compute* proc).
 ## HTTP API
 
 Single port (default `48750`) bound `0.0.0.0`, LAN-restricted by a firewalld
-rich rule. `/ollama/*` is additionally localhost-only.
+rich rule. `/units/*` (and the `/ollama/*` alias) are additionally localhost-only.
 
 | Method | Path | Bind | Purpose |
 |---|---|---|---|
 | GET | `/status` | LAN | Full state snapshot (below) |
 | GET | `/healthz` | LAN | Liveness |
-| POST | `/ollama/start`, `/ollama/stop` | localhost | Manual override (debugging) |
+| POST | `/units/{unit}/start`, `/units/{unit}/stop` | localhost | Manual override (debugging) |
+| POST | `/ollama/start`, `/ollama/stop` | localhost | Back-compat alias for the first managed unit |
 
 State is fully **auto** — derived from observed reality; there is no manual override.
+The `{unit}` must be one of the configured `managed_units`; an unknown unit is
+rejected with `404`, so the endpoint can't drive arbitrary systemd units.
 
 `/status` payload:
 
@@ -60,15 +63,22 @@ State is fully **auto** — derived from observed reality; there is no manual ov
 {
   "state": "gaming",
   "claims": ["steam:440"],
-  "ollama": { "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
+  "units": [
+    { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
+    { "unit": "asr-runner.service", "running": false, "models": [] }
+  ],
+  "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
   "gpu_vram_used_mb": 21500,
   "gpu_vram_total_mb": 32768,
   "since": "2026-06-07T20:00:00Z"
 }
 ```
 
-`state` is `gaming` | `available` | `evicting` (the transient kill window —
-remote consumers treat `evicting` as busy).
+`units` is the per-managed-unit array, in eviction order. `ollama` is a
+**back-compat alias** mirroring the Ollama unit (or the first managed unit if
+none is named `ollama`), so consumers written against the old singular block keep
+working. `state` is `gaming` | `available` | `evicting` (the transient kill
+window — remote consumers treat `evicting` as busy).
 
 ## Configuration
 
@@ -80,8 +90,9 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 |---|---|---|
 | `enabled` | `true` | Master enable |
 | `port` | `48750` | HTTP listen port |
-| `ollama_unit` | `"ollama.service"` | systemd unit the daemon owns |
-| `eager_ollama` | `true` | Restart Ollama when gaming ends |
+| `managed_units` | _(synthesized from `ollama_unit`)_ | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
+| `ollama_unit` | `"ollama.service"` | **Legacy** single managed unit (used when `managed_units` is unset) |
+| `eager_ollama` | `true` | **Legacy** restart-on-gaming-end for the single unit |
 | `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation |
 | `vram_free_threshold_mb` | `2000` | VRAM-used below this = GPU "freed" |
 | `reconcile_interval_s` | `30` | Slow backstop interval (detection is event-driven) |
@@ -91,11 +102,36 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 | `vram_game_threshold_mb` | `4000` | Threshold for the heuristic |
 | `gpu_allowlist` | `["ollama", "kwin_wayland", "plasmashell", "Xwayland"]` | Sanctioned tenants |
 
-Example:
+### Managed units
+
+`managed_units` is an **ordered list** of systemd units the arbiter evicts from
+the GPU when a game launches (each runs the same `stop → poll-VRAM-free →
+SIGKILL` loop, in order) and restores when gaming ends. Each entry:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `unit` | _(required)_ | systemd unit the daemon owns |
+| `eager_restart` | `true` | Restart this unit when gaming ends |
+| `vram_match` | _(none)_ | Substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution |
+
+If `managed_units` is omitted, a single entry is synthesized from the legacy
+`ollama_unit` / `eager_ollama` fields (with `vram_match = "ollama"`), so an
+unconfigured daemon behaves exactly as before.
+
+Example — two GPU tenants that both yield to gaming:
 
 ```toml
 port = 48750
-eager_ollama = true
+
+[[managed_units]]
+unit = "ollama.service"
+eager_restart = true
+vram_match = "ollama"
+
+[[managed_units]]
+unit = "asr-runner.service"
+eager_restart = true
+vram_match = "parakeet"
 
 [[game_patterns]]
 name = "heroic"

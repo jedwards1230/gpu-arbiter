@@ -1,6 +1,11 @@
-//! Ollama lifecycle: `systemctl` stop/start + `nvidia-smi` VRAM-free wait +
-//! SIGKILL escalation. The daemon is the **only** thing that starts/stops
-//! `ollama.service` (systemd keeps it `disabled`).
+//! Managed-unit lifecycle: `systemctl` stop/start + `nvidia-smi` VRAM-free wait +
+//! SIGKILL escalation. The daemon is the **only** thing that starts/stops the
+//! units it manages (each is kept `disabled` so systemd never races it).
+//!
+//! Every function is keyed off a `unit: &str` (an entry from
+//! [`crate::config::Config::resolved_units`]) rather than a single hardcoded
+//! Ollama unit, so an arbitrary ordered set of GPU tenants gets the identical
+//! `stop → poll-VRAM-free → SIGKILL` eviction.
 //!
 //! The shell-outs use async `tokio::process::Command`. The *decisions*
 //! (whether VRAM is freed, whether to escalate) are pure helpers, unit-tested
@@ -12,9 +17,9 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::gpu::{self, GpuMemory};
 
-/// Ollama control errors.
+/// Managed-unit control errors.
 #[derive(Debug, thiserror::Error)]
-pub enum OllamaError {
+pub enum UnitError {
     /// A `systemctl` invocation failed.
     #[error("systemctl {action} {unit} failed: {detail}")]
     Systemctl {
@@ -37,7 +42,7 @@ pub enum EvictionOutcome {
     Freed,
     /// Timed out → SIGKILL was issued and the daemon proceeded regardless.
     Escalated,
-    /// Ollama was already stopped / not running; nothing to do.
+    /// The unit was already stopped / not running; nothing to do.
     AlreadyClear,
 }
 
@@ -109,8 +114,8 @@ pub fn parse_ollama_ps(out: &str) -> Vec<String> {
 }
 
 /// Run `systemctl <action> <unit>`; map a non-zero exit / spawn failure into a
-/// typed [`OllamaError::Systemctl`]. Async.
-async fn systemctl(action: &str, unit: &str) -> Result<std::process::Output, OllamaError> {
+/// typed [`UnitError::Systemctl`]. Async.
+async fn systemctl(action: &str, unit: &str) -> Result<std::process::Output, UnitError> {
     let fut = tokio::process::Command::new("systemctl")
         .arg(action)
         .arg(unit)
@@ -118,34 +123,35 @@ async fn systemctl(action: &str, unit: &str) -> Result<std::process::Output, Oll
     // A wedged systemd must never hang the reconcile task — bound it.
     tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut)
         .await
-        .map_err(|_| OllamaError::Systemctl {
+        .map_err(|_| UnitError::Systemctl {
             action: action.to_string(),
             unit: unit.to_string(),
             detail: format!("timed out after {SYSTEMCTL_TIMEOUT:?}"),
         })?
-        .map_err(|e| OllamaError::Systemctl {
+        .map_err(|e| UnitError::Systemctl {
             action: action.to_string(),
             unit: unit.to_string(),
             detail: format!("spawn failed: {e}"),
         })
 }
 
-/// Query whether the Ollama unit is currently active.
+/// Query whether `unit` is currently active.
 ///
 /// `systemctl is-active <unit>` exits 0 (stdout `active`) when running and
 /// non-zero otherwise — a non-zero exit here is **not** an error, it's the
-/// "inactive" answer. Only a spawn failure surfaces as [`OllamaError`].
-pub async fn is_running(cfg: &Config) -> Result<bool, OllamaError> {
-    let out = systemctl("is-active", &cfg.ollama_unit).await?;
+/// "inactive" answer. Only a spawn failure surfaces as [`UnitError`].
+pub async fn is_running(unit: &str) -> Result<bool, UnitError> {
+    let out = systemctl("is-active", unit).await?;
     Ok(out.status.success())
 }
 
-/// Best-effort list of loaded model names (for `/status`).
+/// Best-effort list of loaded Ollama model names (for `/status`).
 ///
-/// Returns an empty vec when Ollama is not running, the `ollama` CLI is absent,
-/// or the query fails — never an error (purely informational, must not break a
-/// `/status` response).
-pub async fn loaded_models(_cfg: &Config) -> Vec<String> {
+/// Ollama-specific (`ollama ps`); the reconcile loop only calls this for units
+/// it recognizes as Ollama. Returns an empty vec when Ollama is not running, the
+/// `ollama` CLI is absent, or the query fails — never an error (purely
+/// informational, must not break a `/status` response).
+pub async fn ollama_loaded_models() -> Vec<String> {
     let fut = tokio::process::Command::new("ollama").arg("ps").output();
     // Best-effort + bounded: a hung `ollama ps` must not stall the reconcile.
     match tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut).await {
@@ -156,50 +162,56 @@ pub async fn loaded_models(_cfg: &Config) -> Vec<String> {
     }
 }
 
-/// Start the Ollama unit (eager warm-up after a verified `gaming → available`
+/// Start `unit` (eager warm-up after a verified `gaming → available`
 /// transition). A non-zero `systemctl start` exit is a real failure.
-pub async fn start(cfg: &Config) -> Result<(), OllamaError> {
-    let out = systemctl("start", &cfg.ollama_unit).await?;
+pub async fn start(unit: &str) -> Result<(), UnitError> {
+    let out = systemctl("start", unit).await?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(OllamaError::Systemctl {
+        Err(UnitError::Systemctl {
             action: "start".to_string(),
-            unit: cfg.ollama_unit.clone(),
+            unit: unit.to_string(),
             detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         })
     }
 }
 
-/// Evict Ollama from the GPU: `systemctl stop`, then poll `nvidia-smi` until VRAM
+/// Evict `unit` from the GPU: `systemctl stop`, then poll `nvidia-smi` until VRAM
 /// drops below `vram_free_threshold_mb` (graceful) or `eviction_timeout_s`
 /// elapses. On timeout, re-check the unit: if it's already inactive the process
 /// is gone and its VRAM released (VRAM free *or PID gone* gate) —
 /// that's a graceful [`EvictionOutcome::Freed`]. Only a unit that's genuinely
 /// still up gets `systemctl kill -s SIGKILL`, after which we **proceed regardless**
 /// (gaming wins the GPU unconditionally; a game launch must never hang waiting on
-/// Ollama).
+/// a managed unit).
+///
+/// `cfg` supplies the shared `eviction_timeout_s` / `vram_free_threshold_mb`
+/// (the same gates apply to every managed unit). Note the VRAM poll watches
+/// *total* GPU memory, so with several heavy tenants the threshold is reached
+/// once the GPU as a whole has drained — evicting units in order keeps this
+/// monotonic.
 ///
 /// Returns:
-/// - [`EvictionOutcome::AlreadyClear`] if Ollama wasn't running to begin with,
+/// - [`EvictionOutcome::AlreadyClear`] if the unit wasn't running to begin with,
 /// - [`EvictionOutcome::Freed`] if VRAM drained gracefully within the timeout,
 /// - [`EvictionOutcome::Escalated`] if the timeout forced a SIGKILL.
 ///
 /// The GPU poll failing is non-fatal: a missing/erroring `nvidia-smi` reading is
 /// treated as "not yet free", so the worst case is escalation, never a stall.
-pub async fn evict(cfg: &Config) -> Result<EvictionOutcome, OllamaError> {
-    // Nothing to do if Ollama isn't running.
-    if !is_running(cfg).await? {
+pub async fn evict(unit: &str, cfg: &Config) -> Result<EvictionOutcome, UnitError> {
+    // Nothing to do if the unit isn't running.
+    if !is_running(unit).await? {
         return Ok(EvictionOutcome::AlreadyClear);
     }
 
     // Graceful teardown: SIGTERM frees the CUDA context in ~1s. An in-flight
     // request dying is accepted by design.
-    let stop = systemctl("stop", &cfg.ollama_unit).await?;
+    let stop = systemctl("stop", unit).await?;
     if !stop.status.success() {
-        return Err(OllamaError::Systemctl {
+        return Err(UnitError::Systemctl {
             action: "stop".to_string(),
-            unit: cfg.ollama_unit.clone(),
+            unit: unit.to_string(),
             detail: String::from_utf8_lossy(&stop.stderr).trim().to_string(),
         });
     }
@@ -223,12 +235,12 @@ pub async fn evict(cfg: &Config) -> Result<EvictionOutcome, OllamaError> {
                 // is already inactive, the process is gone and its CUDA context
                 // (hence VRAM) released — SIGKILL would hit nothing. Treat that as
                 // a graceful release instead of a misleading `Escalated`.
-                if !is_running(cfg).await.unwrap_or(true) {
+                if !is_running(unit).await.unwrap_or(true) {
                     return Ok(EvictionOutcome::Freed);
                 }
                 // Unit genuinely still up (orphaned runner outside the cgroup,
                 // wedged teardown): force-kill and proceed — gaming wins the GPU.
-                let _ = systemctl_kill(cfg).await;
+                let _ = systemctl_kill(unit).await;
                 return Ok(EvictionOutcome::Escalated);
             }
             EvictionStep::KeepWaiting => {
@@ -238,31 +250,31 @@ pub async fn evict(cfg: &Config) -> Result<EvictionOutcome, OllamaError> {
     }
 }
 
-/// SIGKILL the Ollama unit's processes (`systemctl kill -s SIGKILL <unit>`).
+/// SIGKILL a unit's processes (`systemctl kill -s SIGKILL <unit>`).
 /// Best-effort escalation — the caller proceeds regardless of the result.
-async fn systemctl_kill(cfg: &Config) -> Result<(), OllamaError> {
+async fn systemctl_kill(unit: &str) -> Result<(), UnitError> {
     let fut = tokio::process::Command::new("systemctl")
         .args(["kill", "-s", "SIGKILL"])
-        .arg(&cfg.ollama_unit)
+        .arg(unit)
         .output();
     let out = tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut)
         .await
-        .map_err(|_| OllamaError::Systemctl {
+        .map_err(|_| UnitError::Systemctl {
             action: "kill".to_string(),
-            unit: cfg.ollama_unit.clone(),
+            unit: unit.to_string(),
             detail: format!("timed out after {SYSTEMCTL_TIMEOUT:?}"),
         })?
-        .map_err(|e| OllamaError::Systemctl {
+        .map_err(|e| UnitError::Systemctl {
             action: "kill".to_string(),
-            unit: cfg.ollama_unit.clone(),
+            unit: unit.to_string(),
             detail: format!("spawn failed: {e}"),
         })?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(OllamaError::Systemctl {
+        Err(UnitError::Systemctl {
             action: "kill".to_string(),
-            unit: cfg.ollama_unit.clone(),
+            unit: unit.to_string(),
             detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         })
     }
@@ -389,15 +401,14 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         // On macOS / CI there is typically no systemctl; spawn failure surfaces
         // as a typed error rather than a panic. On a systemd host this returns a
         // real bool. Either way: not a panic.
-        let cfg = Config::default();
-        let r = is_running(&cfg).await;
-        assert!(r.is_ok() || matches!(r, Err(OllamaError::Systemctl { .. })));
+        let r = is_running("ollama.service").await;
+        assert!(r.is_ok() || matches!(r, Err(UnitError::Systemctl { .. })));
     }
 
     #[tokio::test]
-    async fn loaded_models_never_errors_without_ollama() {
-        // loaded_models is best-effort: no `ollama` binary → empty vec, no panic.
-        let cfg = Config::default();
-        let _ = loaded_models(&cfg).await; // must not panic
+    async fn ollama_loaded_models_never_errors_without_ollama() {
+        // ollama_loaded_models is best-effort: no `ollama` binary → empty vec, no
+        // panic.
+        let _ = ollama_loaded_models().await; // must not panic
     }
 }

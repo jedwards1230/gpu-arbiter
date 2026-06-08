@@ -76,14 +76,18 @@ pub enum ReconcileTrigger {
     Manual,
 }
 
-/// Ollama's observed sub-state, embedded in [`StatusSnapshot`].
+/// One managed unit's observed sub-state, embedded in [`StatusSnapshot`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct OllamaStatus {
-    /// Whether `ollama.service` is currently active.
+pub struct UnitStatus {
+    /// The systemd unit name (`"ollama.service"`).
+    pub unit: String,
+    /// Whether the unit is currently active.
     pub running: bool,
-    /// Loaded model names (best-effort; empty when not running / unknown).
+    /// Loaded model names (best-effort; Ollama-only — empty for other units, or
+    /// when not running / unknown).
     pub models: Vec<String>,
-    /// VRAM attributed to Ollama in MiB (best-effort; `None` when unknown).
+    /// VRAM attributed to this unit in MiB (best-effort; `None` when unknown or
+    /// the unit has no `vram_match`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_mb: Option<u64>,
 }
@@ -95,11 +99,17 @@ pub struct OllamaStatus {
 /// {
 ///   "state": "gaming",
 ///   "claims": ["steam:440"],
-///   "ollama": { "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
+///   "units": [{ "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 }],
+///   "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
 ///   "gpu_vram_used_mb": 21500, "gpu_vram_total_mb": 32768,
 ///   "since": "2026-06-07T20:00:00Z"
 /// }
 /// ```
+///
+/// `units` is the per-unit array (the managed-units generalization). `ollama` is
+/// a **back-compat alias** mirroring the Ollama unit (or the first managed unit
+/// if none is named "ollama"), so consumers written against the pre-`units`
+/// singular block keep working unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     /// Daemon version (`CARGO_PKG_VERSION`, baked from the git tag at release
@@ -109,14 +119,30 @@ pub struct StatusSnapshot {
     pub state: State,
     /// Observed claim tokens (`["steam:440"]`).
     pub claims: Vec<String>,
-    /// Ollama sub-state.
-    pub ollama: OllamaStatus,
+    /// Per-managed-unit sub-state, in eviction order.
+    pub units: Vec<UnitStatus>,
+    /// Back-compat alias for the Ollama (or first) managed unit. Mirrors the
+    /// pre-`units` singular block.
+    pub ollama: UnitStatus,
     /// Total GPU VRAM used (MiB), across all tenants.
     pub gpu_vram_used_mb: u64,
     /// Total GPU VRAM capacity (MiB).
     pub gpu_vram_total_mb: u64,
     /// RFC 3339 timestamp the current state was entered.
     pub since: String,
+}
+
+impl StatusSnapshot {
+    /// Pick the back-compat `ollama` alias from the per-unit list: the unit whose
+    /// name contains `ollama`, else the first unit, else an empty default. Pure.
+    fn ollama_alias(units: &[UnitStatus]) -> UnitStatus {
+        units
+            .iter()
+            .find(|u| u.unit.contains("ollama"))
+            .or_else(|| units.first())
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 /// The live, in-memory state owned by the single reconcile task.
@@ -130,8 +156,8 @@ pub struct ArbiterState {
     pub state: State,
     /// Current observed claim set (recomputed each reconcile).
     pub claims: Vec<Claim>,
-    /// Last observed Ollama sub-state.
-    pub ollama: OllamaStatus,
+    /// Last observed per-managed-unit sub-state, in eviction order.
+    pub units: Vec<UnitStatus>,
     /// Last observed total VRAM used (MiB).
     pub gpu_vram_used_mb: u64,
     /// Last observed total VRAM capacity (MiB).
@@ -145,7 +171,7 @@ impl Default for ArbiterState {
         Self {
             state: State::Available,
             claims: Vec::new(),
-            ollama: OllamaStatus::default(),
+            units: Vec::new(),
             gpu_vram_used_mb: 0,
             gpu_vram_total_mb: 0,
             since: SystemTime::now(),
@@ -187,7 +213,8 @@ impl ArbiterState {
             version: env!("CARGO_PKG_VERSION").to_string(),
             state: self.state,
             claims: self.claims.iter().map(Claim::token).collect(),
-            ollama: self.ollama.clone(),
+            ollama: StatusSnapshot::ollama_alias(&self.units),
+            units: self.units.clone(),
             gpu_vram_used_mb: self.gpu_vram_used_mb,
             gpu_vram_total_mb: self.gpu_vram_total_mb,
             since: format_rfc3339(self.since),
@@ -307,7 +334,9 @@ mod tests {
         assert!(json.contains(r#""state":"gaming""#));
         assert!(json.contains(r#""claims":["steam:440"]"#));
         assert!(json.contains(r#""since":"2026-06-07T20:00:00Z""#));
-        // OllamaStatus.vram_mb is None → skipped.
+        // No units observed → both `units` is empty and the `ollama` alias
+        // defaults (vram_mb None → skipped).
+        assert!(json.contains(r#""units":[]"#));
         assert!(!json.contains("vram_mb"));
     }
 
@@ -317,7 +346,12 @@ mod tests {
         // emitted (the inverse of the None-is-skipped case above).
         let mut s = ArbiterState::new();
         s.state = State::Evicting;
-        s.ollama.vram_mb = Some(21000);
+        s.units = vec![UnitStatus {
+            unit: "ollama.service".into(),
+            running: true,
+            models: vec![],
+            vram_mb: Some(21000),
+        }];
         s.gpu_vram_used_mb = 21500;
         s.gpu_vram_total_mb = 32768;
         let json = serde_json::to_string(&s.snapshot()).unwrap();
@@ -325,6 +359,48 @@ mod tests {
         assert!(json.contains(r#""vram_mb":21000"#));
         assert!(json.contains(r#""gpu_vram_used_mb":21500"#));
         assert!(json.contains(r#""gpu_vram_total_mb":32768"#));
+    }
+
+    #[test]
+    fn ollama_alias_mirrors_named_unit_not_just_first() {
+        // The back-compat `ollama` alias picks the ollama-named unit even when it
+        // isn't first, so legacy consumers keep reading Ollama's block.
+        let mut s = ArbiterState::new();
+        s.units = vec![
+            UnitStatus {
+                unit: "asr-runner.service".into(),
+                running: true,
+                models: vec![],
+                vram_mb: Some(8000),
+            },
+            UnitStatus {
+                unit: "ollama.service".into(),
+                running: true,
+                models: vec!["qwen3:30b".into()],
+                vram_mb: Some(21000),
+            },
+        ];
+        let snap = s.snapshot();
+        assert_eq!(snap.units.len(), 2);
+        // alias resolves to the ollama unit (second in the list).
+        assert_eq!(snap.ollama.unit, "ollama.service");
+        assert_eq!(snap.ollama.vram_mb, Some(21000));
+        // order of `units` is preserved (eviction order).
+        assert_eq!(snap.units[0].unit, "asr-runner.service");
+    }
+
+    #[test]
+    fn ollama_alias_falls_back_to_first_unit() {
+        // No ollama-named unit → alias is the first managed unit.
+        let mut s = ArbiterState::new();
+        s.units = vec![UnitStatus {
+            unit: "asr-runner.service".into(),
+            running: false,
+            models: vec![],
+            vram_mb: None,
+        }];
+        let snap = s.snapshot();
+        assert_eq!(snap.ollama.unit, "asr-runner.service");
     }
 
     #[test]
