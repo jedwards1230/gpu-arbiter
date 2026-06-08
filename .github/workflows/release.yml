@@ -54,6 +54,12 @@ concurrency:
 
 permissions:
   contents: write
+  # ai-release.yml@v0 reads merged PRs for the changelog, and the detect job below
+  # runs `gh pr list` — both need pull-requests:read. Without it the reusable call
+  # fails GitHub's startup validation ("requesting 'pull-requests: read', but only
+  # allowed 'pull-requests: none'"). A restricted `permissions:` block defaults
+  # every unlisted scope to `none`, so it must be granted explicitly.
+  pull-requests: read
 
 jobs:
   detect:
