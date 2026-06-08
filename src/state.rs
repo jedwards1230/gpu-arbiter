@@ -226,13 +226,51 @@ impl ArbiterState {
     }
 }
 
-/// Format a [`SystemTime`] as an RFC 3339 / ISO-8601 UTC string for `/status`.
+/// Format a [`SystemTime`] as an RFC 3339 / ISO-8601 UTC string for `/status`
+/// (`"2026-06-07T20:00:00Z"`).
 ///
-/// Stubbed — a real implementation will format without pulling a date crate
-/// (or via a tiny helper). Returns a placeholder for now.
-pub fn format_rfc3339(_t: SystemTime) -> String {
-    // TODO: real RFC 3339 formatting (no chrono dep — keep pure-Rust/libc).
-    String::from("1970-01-01T00:00:00Z")
+/// Pure & cross-platform — no `chrono`/date crate and no `libc`. The seconds
+/// count is split into a UTC civil date via the inverse of Howard Hinnant's
+/// `days_from_civil` algorithm (valid for the full proleptic Gregorian range,
+/// well beyond any timestamp this daemon emits). Sub-second precision is dropped
+/// (the `/status` contract uses whole-second timestamps); times before the Unix
+/// epoch (which the daemon never produces) clamp to the epoch.
+pub fn format_rfc3339(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (year, month, day, hour, min, sec) = civil_from_unix_secs(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Convert a count of seconds since the Unix epoch into UTC
+/// `(year, month, day, hour, minute, second)`. Pure.
+///
+/// Date math is the inverse of Howard Hinnant's `days_from_civil`
+/// (<http://howardhinnant.github.io/date_algorithms.html>), which is exact for
+/// the whole Gregorian calendar with no leap-second fudging (UTC `/status`
+/// timestamps don't carry leap seconds).
+fn civil_from_unix_secs(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = (secs % 86_400) as u32;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+
+    // days_from_civil inverse: shift so the era starts on 0000-03-01.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11], Mar-based
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+
+    (year, month, day, hour, min, sec)
 }
 
 #[cfg(test)]
@@ -267,6 +305,51 @@ mod tests {
             ArbiterState::resolve_state(Pin::Available, &[Claim::Steam("440".into())]),
             State::Available
         );
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn format_rfc3339_known_timestamps() {
+        // Epoch.
+        assert_eq!(format_rfc3339(at(0)), "1970-01-01T00:00:00Z");
+        // 2026-06-07T20:00:00Z — the plan doc's example `since`.
+        // (days from epoch to 2026-06-07 = 20611; *86400 + 20h.)
+        assert_eq!(
+            format_rfc3339(at(20611 * 86_400 + 20 * 3600)),
+            "2026-06-07T20:00:00Z"
+        );
+        // A well-known reference: 2001-09-09T01:46:40Z = 1_000_000_000.
+        assert_eq!(format_rfc3339(at(1_000_000_000)), "2001-09-09T01:46:40Z");
+        // Leap day: 2024-02-29T12:34:56Z = 1_709_210_096.
+        assert_eq!(format_rfc3339(at(1_709_210_096)), "2024-02-29T12:34:56Z");
+    }
+
+    #[test]
+    fn format_rfc3339_drops_subsecond_and_clamps_pre_epoch() {
+        // Sub-second component is truncated to whole seconds.
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_500);
+        assert_eq!(format_rfc3339(t), "1970-01-01T00:00:01Z");
+        // A time before the epoch clamps to the epoch (daemon never emits these).
+        let pre = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(10);
+        assert_eq!(format_rfc3339(pre), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn snapshot_serializes_with_real_timestamp() {
+        let mut s = ArbiterState::new();
+        s.since = at(20611 * 86_400 + 20 * 3600);
+        s.claims = vec![Claim::Steam("440".into())];
+        s.state = State::Gaming;
+        let snap = s.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains(r#""state":"gaming""#));
+        assert!(json.contains(r#""claims":["steam:440"]"#));
+        assert!(json.contains(r#""since":"2026-06-07T20:00:00Z""#));
+        // OllamaStatus.vram_mb is None → skipped.
+        assert!(!json.contains("vram_mb"));
     }
 
     #[test]

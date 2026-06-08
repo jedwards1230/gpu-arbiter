@@ -79,20 +79,60 @@ pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
         .collect()
 }
 
-/// Shell out to `nvidia-smi` for total memory usage. Async; runs the blocking
-/// process under tokio. Stubbed.
+/// Run `nvidia-smi` with `args` and return its stdout. Async — the process is
+/// driven by tokio's reactor, so it never blocks the runtime.
+///
+/// Linux-only at *runtime* (no `nvidia-smi` on macOS), but compiles everywhere:
+/// the spawn failure (binary absent) surfaces as [`GpuError::Command`].
+async fn run_nvidia_smi(args: &[&str]) -> Result<String, GpuError> {
+    let out = tokio::process::Command::new("nvidia-smi")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| GpuError::Command(format!("spawning nvidia-smi: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(GpuError::Command(format!(
+            "nvidia-smi exited {}: {}",
+            out.status,
+            stderr.trim()
+        )));
+    }
+    String::from_utf8(out.stdout)
+        .map_err(|e| GpuError::Parse(format!("nvidia-smi stdout not UTF-8: {e}")))
+}
+
+/// Shell out to `nvidia-smi` for total GPU memory usage. Async.
+///
+/// Invokes
+/// `nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits`
+/// and feeds the stdout through the pure [`parse_memory_csv`].
 pub async fn query_memory() -> Result<GpuMemory, GpuError> {
-    // TODO: tokio::process::Command::new("nvidia-smi")
-    //   .args(["--query-gpu=memory.used,memory.total",
-    //          "--format=csv,noheader,nounits"]) → parse_memory_csv(stdout).
-    todo!("nvidia-smi memory query")
+    let out = run_nvidia_smi(&[
+        "--query-gpu=memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ])
+    .await?;
+    parse_memory_csv(&out)
 }
 
 /// Shell out to `nvidia-smi` for the GPU *graphics* process list (feeds the
-/// opt-in VRAM heuristic). Async. Stubbed.
+/// opt-in VRAM heuristic). Async.
+///
+/// Invokes
+/// `nvidia-smi --query-graphics-apps=pid,process_name,used_memory --format=csv,noheader,nounits`
+/// and feeds the stdout through the pure [`parse_graphics_procs_csv`].
+///
+/// Querying **graphics** apps (not compute) is load-bearing for the heuristic's
+/// safety-by-construction: Ollama is a *compute* GPU process, so it never
+/// appears in this list and physically cannot be flagged.
 pub async fn query_graphics_procs() -> Result<Vec<GpuGraphicsProc>, GpuError> {
-    // TODO: query graphics apps via nvidia-smi → parse_graphics_procs_csv.
-    todo!("nvidia-smi graphics process query")
+    let out = run_nvidia_smi(&[
+        "--query-graphics-apps=pid,process_name,used_memory",
+        "--format=csv,noheader,nounits",
+    ])
+    .await?;
+    Ok(parse_graphics_procs_csv(&out))
 }
 
 #[cfg(test)]
@@ -131,5 +171,53 @@ mod tests {
         let procs = parse_graphics_procs_csv("42, X, [N/A]\n");
         assert_eq!(procs.len(), 1);
         assert_eq!(procs[0].vram_mb, 0);
+    }
+
+    #[test]
+    fn parse_memory_uses_first_line_on_multi_gpu() {
+        let m = parse_memory_csv("21500, 32768\n100, 8192\n").unwrap();
+        assert_eq!(m.used_mb, 21500);
+        assert_eq!(m.total_mb, 32768);
+    }
+
+    #[test]
+    fn parse_memory_rejects_missing_total() {
+        assert!(parse_memory_csv("21500\n").is_err());
+    }
+
+    #[test]
+    fn parse_graphics_procs_realistic_path_name() {
+        // nvidia-smi reports the full process path as process_name.
+        let out = "1234, /usr/lib/steam/game.x86_64, 8192\n";
+        let procs = parse_graphics_procs_csv(out);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].pid, 1234);
+        assert_eq!(procs[0].name, "/usr/lib/steam/game.x86_64");
+        assert_eq!(procs[0].vram_mb, 8192);
+    }
+
+    #[test]
+    fn parse_graphics_procs_empty_is_empty() {
+        assert!(parse_graphics_procs_csv("").is_empty());
+        assert!(parse_graphics_procs_csv("\n\n").is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_memory_errors_when_nvidia_smi_absent() {
+        // On macOS / CI there is no nvidia-smi on PATH → spawn fails → Command
+        // error (never a panic). On a real GPU host this would succeed; the test
+        // only asserts the no-binary path is a clean typed error.
+        if which_nvidia_smi() {
+            return; // skip on a host that actually has nvidia-smi
+        }
+        let err = query_memory().await.unwrap_err();
+        assert!(matches!(err, GpuError::Command(_)));
+    }
+
+    /// Best-effort PATH probe so the spawn-failure test self-skips on a GPU host.
+    fn which_nvidia_smi() -> bool {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|p| p.join("nvidia-smi").is_file()))
+            .unwrap_or(false)
     }
 }
