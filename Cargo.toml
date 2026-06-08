@@ -33,11 +33,28 @@ libc = "0.2"
 # path-param syntax: `/{p}`.
 axum = "0.8"
 
+# --- gpu-arbiter-tray companion (second bin: src/bin/gpu-arbiter-tray.rs) ------
+# ureq is the tray's HTTP *client* for polling the daemon over localhost. NO TLS:
+# `default-features = false` drops the whole rustls/ring/aws-lc stack, keeping the
+# tray pure-Rust and musl-clean (it only ever talks plain http://127.0.0.1).
+# `json` wires serde de/serialization of the bodies. Cross-platform — builds on
+# the macOS dev host even though only the Linux tray module references it.
+ureq = { version = "3", default-features = false, features = ["json"] }
+
 # cn_proc process-event connector lives behind a Linux-only netlink socket, so
 # neli is only pulled on Linux — macOS dev boxes never compile it. The
 # `connector` module is always available; the `async` feature (which itself
 # enables tokio + parking_lot) is what unlocks `socket::asynchronous` for the
 # async-native `recv` over the CN_IDX_PROC multicast group. (The bare `tokio`
 # feature only pulls the optional dep — it does NOT expose the async socket.)
+#
+# ksni (StatusNotifierItem tray) + notify-rust (desktop notifications) power the
+# gpu-arbiter-tray companion. Both are Linux desktop D-Bus integrations — they
+# don't build on macOS, so they're Linux-gated and the tray bin has a macOS stub
+# main. Both are pure-Rust (zbus, NOT libdbus) → musl-clean. ksni 0.3 is
+# async-native (its Handle::update is async), satisfied by the existing tokio.
 [target.'cfg(target_os = "linux")'.dependencies]
 neli = { version = "0.7", features = ["async"] }
+ksni = "0.3"
+# Default features = zbus (pure Rust). Do NOT enable `d`/`dbus` (the libdbus FFI path).
+notify-rust = "4"
