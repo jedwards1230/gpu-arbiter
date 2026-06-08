@@ -1,0 +1,145 @@
+# Cross-build the static gpu-arbiter binary, generate AI release notes, and
+# attach the binary to a GitHub Release.
+#
+# Version compute, tag creation, and AI release notes are delegated to the shared
+# jedwards1230/release-workflows/.github/workflows/ai-release.yml@v0 (see
+# home-orchestration .claude/rules/release-conventions.md). The git tag is the
+# single source of truth; the version is baked into the binary at build time via
+# CARGO_PKG_VERSION (no version pushed back to main).
+#
+# Triggered by auto-release.yml on a labelled PR merge, or manually via dispatch.
+
+name: Release
+
+run-name: "Release ${{ inputs.version_override || format('{0} bump', inputs.bump_type) }}"
+
+on:
+  workflow_call:
+    inputs:
+      bump_type:
+        required: true
+        type: string
+      version_override:
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Version bump type"
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      version_override:
+        description: "Version override (e.g. 1.2.3)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Tag & Generate Notes
+    uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@v0
+    with:
+      service_name: gpu-arbiter
+      service_description: "a root daemon that evicts Ollama from the GPU when a game launches on desktop-1 and restores it when gaming ends"
+      bump_type: ${{ inputs.bump_type }}
+      version_override: ${{ inputs.version_override }}
+      create_release: false
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+  build:
+    name: Build static binary
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: apt-get update && apt-get install -y --no-install-recommends musl-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
+      - name: Build (x86_64-unknown-linux-musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Stage binary
+        run: |
+          set -euo pipefail
+          install -D target/x86_64-unknown-linux-musl/release/gpu-arbiter \
+            dist/gpu-arbiter-x86_64-unknown-linux-musl
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpu-arbiter-musl
+          path: dist/gpu-arbiter-x86_64-unknown-linux-musl
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: gpu-arbiter-musl
+          path: dist
+
+      - name: Decode release body
+        env:
+          BODY_B64: ${{ needs.prepare.outputs.release_body }}
+        run: |
+          set -euo pipefail
+          # ai-release.yml emits a base64-encoded body to survive GitHub Actions'
+          # job-output character restrictions; decode before passing body_path.
+          echo "$BODY_B64" | base64 -d > /tmp/release_body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Release ${{ needs.prepare.outputs.version }}
+          body_path: /tmp/release_body.md
+          make_latest: true
+          files: dist/gpu-arbiter-x86_64-unknown-linux-musl
+
+      - name: Write workflow summary
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREV: ${{ needs.prepare.outputs.prev_tag }}
+          BUMP_TYPE: ${{ needs.prepare.outputs.bump_type }}
+        run: |
+          {
+            echo "## Release ${TAG}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Version | ${VERSION} |"
+            echo "| Tag | ${TAG} |"
+            echo "| Previous | ${PREV} |"
+            echo "| Bump | ${BUMP_TYPE} |"
+            echo "| Artifact | \`gpu-arbiter-x86_64-unknown-linux-musl\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

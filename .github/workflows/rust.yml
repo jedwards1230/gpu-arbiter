@@ -1,0 +1,63 @@
+# Rust CI for the gpu-arbiter daemon (crate at repo root).
+#
+# Builds, formats, lints, and tests the crate inside a slim official `rust`
+# container (toolchain preinstalled; no system libs needed — all deps are
+# pure-Rust). The daemon is Linux-only at runtime but builds/tests anywhere; the
+# Linux runner exercises the real (cfg-gated) code paths.
+
+name: Rust
+
+run-name: "Rust CI — ${{ github.event_name }} on ${{ github.ref_name }} by @${{ github.actor }}"
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/rust.yml']
+  pull_request:
+    paths: ['src/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', '.github/workflows/rust.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Add rustfmt + clippy
+        run: rustup component add rustfmt clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        id: fmt
+        run: cargo fmt --check
+
+      - name: Clippy
+        id: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        id: build
+        run: cargo build --release
+
+      - name: Test
+        id: test
+        run: cargo test
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Rust CI"
+            echo ""
+            echo "| Step | Result |"
+            echo "|------|--------|"
+            echo "| Format | ${{ steps.fmt.outcome }} |"
+            echo "| Clippy | ${{ steps.clippy.outcome }} |"
+            echo "| Build (release) | ${{ steps.build.outcome }} |"
+            echo "| Test | ${{ steps.test.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

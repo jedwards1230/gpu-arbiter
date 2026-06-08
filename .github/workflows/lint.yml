@@ -1,0 +1,25 @@
+# Non-Rust lint (matches game-shell's split: Rust quality lives in rust.yml,
+# everything else here). The Rust crate is the whole repo, so the only non-Rust
+# surface is the GitHub Actions workflows themselves — lint them with actionlint
+# so a malformed workflow is caught before it silently no-ops.
+
+name: Lint
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/**']
+  pull_request:
+    paths: ['.github/workflows/**']
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: actionlint
+        uses: raven-actions/actionlint@v2

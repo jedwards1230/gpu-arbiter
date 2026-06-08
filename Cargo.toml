@@ -1,0 +1,45 @@
+[package]
+name = "gpu-arbiter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "GPU arbiter for desktop-1: evicts Ollama from the GPU when a game launches (kernel cn_proc detection), restores it when gaming ends, exposes an HTTP /status endpoint for remote AI-routing decisions"
+
+[[bin]]
+name = "gpu-arbiter"
+path = "src/main.rs"
+
+[lib]
+name = "gpu_arbiter"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+# JSON for the axum `/status` body + `/pin` request parsing. Pure-Rust; the
+# serializer/deserializer also lets the HTTP contract be unit-tested on macOS.
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+# thiserror 2 (typed parse/netlink edges — NOT game-shell's "1").
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+# Checked casts of raw netlink `proc_event` payloads — a truncated/garbage
+# datagram is logged-and-skipped, never a panic or OOB read (this is a root
+# daemon). Cross-platform (the cast helpers are pure); the netlink wiring that
+# feeds them is Linux-gated.
+bytemuck = "1"
+# Pure-Rust HTTP server on hyper (server-only — no reqwest/TLS, which also keeps
+# the musl build clear of the ring/aws-lc cross-compile minefield). Note 0.8
+# path-param syntax: `/{p}`.
+axum = "0.8"
+
+# cn_proc process-event connector lives behind a Linux-only netlink socket, so
+# neli is only pulled on Linux — macOS dev boxes never compile it. The
+# `connector` module + `tokio` feature give async-native `recv` over the
+# CN_IDX_PROC multicast group.
+[target.'cfg(target_os = "linux")'.dependencies]
+neli = { version = "0.7", features = ["tokio"] }

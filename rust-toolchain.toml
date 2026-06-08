@@ -1,0 +1,5 @@
+# Pin the stable channel for reproducible builds. The crate is edition 2024 and
+# uses let-chains, so it needs a stable >= 1.88 (rust-version in Cargo.toml).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,58 @@
+# Trigger a release when a PR is merged to main, gated on a semver label.
+#
+# Per home-orchestration .claude/rules/release-conventions.md the release is
+# OPT-IN: the merged PR must carry exactly one of semver:patch / semver:minor /
+# semver:major. No label → no release (chore-only merges make no noise). There is
+# deliberately NO patch default.
+
+name: Auto-release on merge
+
+run-name: "Auto-release: ${{ github.event.pull_request.title }}"
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  detect:
+    name: Detect bump type
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    outputs:
+      bump_type: ${{ steps.bump.outputs.type }}
+      release: ${{ steps.bump.outputs.release }}
+    steps:
+      - name: Determine bump type from semver label
+        id: bump
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          if echo "$LABELS" | grep -q '"semver:major"'; then
+            echo "type=major" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -q '"semver:minor"'; then
+            echo "type=minor" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -q '"semver:patch"'; then
+            echo "type=patch" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=none" >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no semver:* label on merged PR — skipping release"
+          fi
+
+  release:
+    name: Release
+    needs: [detect]
+    if: needs.detect.outputs.release == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      bump_type: ${{ needs.detect.outputs.bump_type }}
+    secrets: inherit
