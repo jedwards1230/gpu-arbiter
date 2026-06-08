@@ -179,12 +179,12 @@ mod linux {
     ///
     /// Two trigger sources are merged with `tokio::select!`:
     /// - the **periodic backstop** `interval` (covers dropped netlink events),
-    /// - the **trigger channel** (`ProcEvent` / `Pin` / `Manual`).
+    /// - the **trigger channel** (`ProcEvent` / `Manual`).
     ///
     /// `ProcEvent`s are **debounced**: the first one starts a `DEBOUNCE` deadline
     /// and we keep draining the channel until it elapses, collapsing a launch
-    /// storm into a single reconcile. `Pin`/`Manual`/`Timer` reconcile
-    /// immediately (they're deliberate, low-rate, latency-sensitive).
+    /// storm into a single reconcile. `Manual`/`Timer` reconcile immediately
+    /// (they're deliberate, low-rate, latency-sensitive).
     async fn reconcile_task(
         state: Arc<Mutex<ArbiterState>>,
         cfg: Arc<Config>,
@@ -230,8 +230,8 @@ mod linux {
     /// caller should reconcile with.
     ///
     /// Returns [`ReconcileTrigger::ProcEvent`] when the window elapses (or the
-    /// channel closes) with only proc events seen. A `Pin`/`Manual`/`Timer`
-    /// trigger arriving mid-window is **returned** (not dropped) so it actually
+    /// channel closes) with only proc events seen. A `Manual`/`Timer` trigger
+    /// arriving mid-window is **returned** (not dropped) so it actually
     /// drives the immediate reconcile — `recv()` consumed it from the channel, so
     /// returning it is the only way it isn't silently lost. Deadline is fixed (not
     /// sliding) so sustained churn can't defer the reconcile indefinitely.

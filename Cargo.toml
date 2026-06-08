@@ -18,8 +18,8 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-# JSON for the axum `/status` body + `/pin` request parsing. Pure-Rust; the
-# serializer/deserializer also lets the HTTP contract be unit-tested on macOS.
+# JSON for the axum `/status` body. Pure-Rust; the serializer/deserializer also
+# lets the HTTP contract be unit-tested on macOS.
 serde_json = "1"
 toml = "0.8"
 anyhow = "1"

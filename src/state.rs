@@ -1,5 +1,5 @@
-//! Shared contract: the state machine, pin override, claim model, reconcile
-//! triggers, and the `/status` snapshot.
+//! Shared contract: the state machine, claim model, reconcile triggers, and the
+//! `/status` snapshot.
 //!
 //! These types are the **frozen API** the rest of the daemon (and downstream
 //! agents) code against. They are pure and cross-platform — no Linux-only
@@ -54,30 +54,13 @@ impl Serialize for Claim {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
-    /// A game is running (or pinned). Ollama is evicted; GPU reserved for play.
+    /// A game is running. Ollama is evicted; GPU reserved for play.
     Gaming,
     /// No game observed and the GPU is verified clean — Ollama may run.
     Available,
     /// Transient: a game just launched and Ollama is being torn down. Remote
     /// consumers treat this as busy.
     Evicting,
-}
-
-/// Manual override that force-holds (or releases) the arbiter, set via
-/// `POST /pin`. `auto` (the default) means "follow observed reality".
-///
-/// Serializes lowercase: `{"mode": "gaming" | "available" | "auto"}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Pin {
-    /// Follow observed reality (reconcile decides). The default.
-    #[default]
-    Auto,
-    /// Force-hold `gaming` regardless of observation (your deliberate override
-    /// / backstop from another machine).
-    Gaming,
-    /// Force-hold `available` regardless of observation.
-    Available,
 }
 
 /// Why a reconcile pass was triggered. Fed over the `mpsc` of triggers into the
@@ -89,8 +72,6 @@ pub enum ReconcileTrigger {
     /// The periodic ~30 s backstop timer — recomputes truth even if events
     /// were dropped.
     Timer,
-    /// A `POST /pin` changed the override.
-    Pin,
     /// A manual `POST /ollama/*` or other explicit nudge.
     Manual,
 }
@@ -113,7 +94,6 @@ pub struct OllamaStatus {
 /// ```json
 /// {
 ///   "state": "gaming",
-///   "pin": "auto",
 ///   "claims": ["steam:440"],
 ///   "ollama": { "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
 ///   "gpu_vram_used_mb": 21500, "gpu_vram_total_mb": 32768,
@@ -127,8 +107,6 @@ pub struct StatusSnapshot {
     pub version: String,
     /// Current externally-visible state.
     pub state: State,
-    /// Active manual override.
-    pub pin: Pin,
     /// Observed claim tokens (`["steam:440"]`).
     pub claims: Vec<String>,
     /// Ollama sub-state.
@@ -150,8 +128,6 @@ pub struct StatusSnapshot {
 pub struct ArbiterState {
     /// Current externally-visible state.
     pub state: State,
-    /// Active manual override.
-    pub pin: Pin,
     /// Current observed claim set (recomputed each reconcile).
     pub claims: Vec<Claim>,
     /// Last observed Ollama sub-state.
@@ -168,7 +144,6 @@ impl Default for ArbiterState {
     fn default() -> Self {
         Self {
             state: State::Available,
-            pin: Pin::Auto,
             claims: Vec::new(),
             ollama: OllamaStatus::default(),
             gpu_vram_used_mb: 0,
@@ -179,31 +154,22 @@ impl Default for ArbiterState {
 }
 
 impl ArbiterState {
-    /// Construct the initial state (boot default: `available`, `auto` pin).
+    /// Construct the initial state (boot default: `available`).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Resolve the externally-visible state from the observed claim set and the
-    /// active pin. Pure function — the heart of the state machine.
-    ///
-    /// - `Pin::Gaming` → always `gaming`.
-    /// - `Pin::Available` → always `available`.
-    /// - `Pin::Auto` → `gaming` if any claim is present, else `available`.
+    /// Resolve the externally-visible state from the observed claim set. Pure
+    /// function — the heart of the state machine: `gaming` if any claim is
+    /// present, else `available`.
     ///
     /// The `evicting` transient is set explicitly by the eviction path, not
     /// derived here.
-    pub fn resolve_state(pin: Pin, claims: &[Claim]) -> State {
-        match pin {
-            Pin::Gaming => State::Gaming,
-            Pin::Available => State::Available,
-            Pin::Auto => {
-                if claims.is_empty() {
-                    State::Available
-                } else {
-                    State::Gaming
-                }
-            }
+    pub fn resolve_state(claims: &[Claim]) -> State {
+        if claims.is_empty() {
+            State::Available
+        } else {
+            State::Gaming
         }
     }
 
@@ -220,7 +186,6 @@ impl ArbiterState {
         StatusSnapshot {
             version: env!("CARGO_PKG_VERSION").to_string(),
             state: self.state,
-            pin: self.pin,
             claims: self.claims.iter().map(Claim::token).collect(),
             ollama: self.ollama.clone(),
             gpu_vram_used_mb: self.gpu_vram_used_mb,
@@ -289,25 +254,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auto_follows_claims() {
+    fn resolve_follows_claims() {
+        // No claims → available; any claim → gaming.
+        assert_eq!(ArbiterState::resolve_state(&[]), State::Available);
         assert_eq!(
-            ArbiterState::resolve_state(Pin::Auto, &[]),
-            State::Available
-        );
-        assert_eq!(
-            ArbiterState::resolve_state(Pin::Auto, &[Claim::Steam("440".into())]),
+            ArbiterState::resolve_state(&[Claim::Steam("440".into())]),
             State::Gaming
-        );
-    }
-
-    #[test]
-    fn resolve_pin_overrides() {
-        // Pin gaming wins even with no claims.
-        assert_eq!(ArbiterState::resolve_state(Pin::Gaming, &[]), State::Gaming);
-        // Pin available wins even with claims present.
-        assert_eq!(
-            ArbiterState::resolve_state(Pin::Available, &[Claim::Steam("440".into())]),
-            State::Available
         );
     }
 

@@ -50,15 +50,15 @@ rich rule. `/ollama/*` is additionally localhost-only.
 |---|---|---|---|
 | GET | `/status` | LAN | Full state snapshot (below) |
 | GET | `/healthz` | LAN | Liveness |
-| POST | `/pin` | LAN | Force-hold `{"mode": "gaming"\|"available"\|"auto"}` |
 | POST | `/ollama/start`, `/ollama/stop` | localhost | Manual override (debugging) |
+
+State is fully **auto** — derived from observed reality; there is no manual override.
 
 `/status` payload:
 
 ```json
 {
   "state": "gaming",
-  "pin": "auto",
   "claims": ["steam:440"],
   "ollama": { "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
   "gpu_vram_used_mb": 21500,

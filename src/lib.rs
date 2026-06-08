@@ -26,7 +26,7 @@ pub mod config;
 // heuristic). Pure & cross-platform — unit-tested with literal cmdlines.
 pub mod classify;
 
-// State machine, pin override, /status snapshot. Pure & cross-platform.
+// State machine, claim model, /status snapshot. Pure & cross-platform.
 pub mod state;
 
 // nvidia-smi shell-out + its (pure) output parser. The parser is
@@ -40,7 +40,7 @@ pub mod ollama;
 // snapshot→claim-set logic is pure; the scan itself is Linux-gated internally.
 pub mod reconcile;
 
-// axum HTTP control surface: GET /status /healthz, POST /pin /ollama/*.
+// axum HTTP control surface: GET /status /healthz, POST /ollama/*.
 // Cross-platform (tokio/axum only).
 pub mod http;
 
