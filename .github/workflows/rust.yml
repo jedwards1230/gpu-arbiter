@@ -48,6 +48,19 @@ jobs:
         id: test
         run: cargo test
 
+      # Prove the artifact we actually deploy (static musl — the same target
+      # release.yml ships, and what packages the tray too) compiles on every PR,
+      # not just the glibc build above.
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: apt-get update && apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build (musl static — deployed artifact)
+        id: build_musl
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
       - name: Summary
         if: always()
         run: |
@@ -60,4 +73,5 @@ jobs:
             echo "| Clippy | ${{ steps.clippy.outcome }} |"
             echo "| Build (release) | ${{ steps.build.outcome }} |"
             echo "| Test | ${{ steps.test.outcome }} |"
+            echo "| Build (musl static) | ${{ steps.build_musl.outcome }} |"
           } >> "$GITHUB_STEP_SUMMARY"

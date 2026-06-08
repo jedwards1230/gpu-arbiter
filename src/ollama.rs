@@ -172,8 +172,11 @@ pub async fn start(cfg: &Config) -> Result<(), OllamaError> {
 }
 
 /// Evict Ollama from the GPU: `systemctl stop`, then poll `nvidia-smi` until VRAM
-/// drops below `vram_free_threshold_mb` or `eviction_timeout_s` elapses — on
-/// timeout, escalate to `systemctl kill -s SIGKILL` and **proceed regardless**
+/// drops below `vram_free_threshold_mb` (graceful) or `eviction_timeout_s`
+/// elapses. On timeout, re-check the unit: if it's already inactive the process
+/// is gone and its VRAM released (the plan's "VRAM free *or PID gone*" gate) —
+/// that's a graceful [`EvictionOutcome::Freed`]. Only a unit that's genuinely
+/// still up gets `systemctl kill -s SIGKILL`, after which we **proceed regardless**
 /// (gaming wins the GPU unconditionally; a game launch must never hang waiting on
 /// Ollama).
 ///
@@ -213,7 +216,18 @@ pub async fn evict(cfg: &Config) -> Result<EvictionOutcome, OllamaError> {
         match eviction_step(mem, start.elapsed(), cfg) {
             EvictionStep::Freed => return Ok(EvictionOutcome::Freed),
             EvictionStep::Escalate => {
-                // Force-kill and proceed regardless — gaming wins the GPU.
+                // Timed out on VRAM — but `systemctl stop` already reaped the
+                // unit synchronously, so the only way we're here is either real
+                // VRAM pressure OR a flaky `nvidia-smi` (read as u64::MAX → never
+                // "free"). The plan's "VRAM free *or PID gone*" gate: if the unit
+                // is already inactive, the process is gone and its CUDA context
+                // (hence VRAM) released — SIGKILL would hit nothing. Treat that as
+                // a graceful release instead of a misleading `Escalated`.
+                if !is_running(cfg).await.unwrap_or(true) {
+                    return Ok(EvictionOutcome::Freed);
+                }
+                // Unit genuinely still up (orphaned runner outside the cgroup,
+                // wedged teardown): force-kill and proceed — gaming wins the GPU.
                 let _ = systemctl_kill(cfg).await;
                 return Ok(EvictionOutcome::Escalated);
             }
