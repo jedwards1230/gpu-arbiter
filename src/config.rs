@@ -199,4 +199,67 @@ mod tests {
         assert_eq!(c.game_patterns[0].name, "heroic");
         assert_eq!(c.game_patterns[0].match_substr, "Heroic");
     }
+
+    /// Config contract guard: this is the **verbatim** output of the Ansible
+    /// `config.toml.j2` template rendered with `desktop-common`'s stock
+    /// `defaults/main.yaml` (plus two `game_patterns` exercising the loop and
+    /// the `\`/`"` escaping). If the daemon's serde schema and the rendered
+    /// file ever drift apart, this parse fails — keeping the cross-repo contract
+    /// honest. Regenerate from the template, do not hand-edit.
+    #[test]
+    fn parses_rendered_ansible_template() {
+        let rendered = r#"# Managed by Ansible - DO NOT EDIT MANUALLY
+# gpu-arbiter daemon config. Keys map 1:1 to the serde Config struct in
+# gpu-arbiter src/config.rs (TOML key = gpu_arbiter_* var minus the prefix).
+
+# String values are escaped (`\` and `"`) so a quote in any Ansible var can't
+# break out of its TOML string and inject arbitrary config.
+enabled = false
+port = 48750
+ollama_unit = "ollama.service"
+eager_ollama = true
+eviction_timeout_s = 5
+vram_free_threshold_mb = 2000
+reconcile_interval_s = 30
+
+# --- detection ---
+detect_steam = true
+vram_heuristic = false
+vram_game_threshold_mb = 4000
+gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
+
+
+[[game_patterns]]
+name = "heroic"
+match = "Heroic"
+
+
+[[game_patterns]]
+name = "quo\"te\\back"
+match = "Has\"Quote\\Back"
+"#;
+        let c = Config::from_toml(rendered).expect("rendered Ansible config must parse");
+
+        // Every serde field is populated by the rendered file (the contract).
+        assert!(!c.enabled); // Ansible default is feature-off.
+        assert_eq!(c.port, 48750);
+        assert_eq!(c.ollama_unit, "ollama.service");
+        assert!(c.eager_ollama);
+        assert_eq!(c.eviction_timeout_s, 5);
+        assert_eq!(c.vram_free_threshold_mb, 2000);
+        assert_eq!(c.reconcile_interval_s, 30);
+        assert!(c.detect_steam);
+        assert!(!c.vram_heuristic);
+        assert_eq!(c.vram_game_threshold_mb, 4000);
+        assert_eq!(
+            c.gpu_allowlist,
+            vec!["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
+        );
+        // The `match` TOML key (serde-renamed) and `\`/`"` escaping round-trip.
+        assert_eq!(c.game_patterns.len(), 2);
+        assert_eq!(c.game_patterns[0].name, "heroic");
+        assert_eq!(c.game_patterns[0].match_substr, "Heroic");
+        assert_eq!(c.game_patterns[1].name, "quo\"te\\back");
+        assert_eq!(c.game_patterns[1].match_substr, "Has\"Quote\\Back");
+    }
 }
