@@ -20,11 +20,38 @@
 //! `spawn_blocking` inside `reconcile`. SIGTERM/SIGINT trigger a graceful
 //! shutdown.
 
+/// Handle `--version`/`-V` and `--help`/`-h` before any runtime setup, printing
+/// to stdout and exiting 0. Kept platform-independent so the version is
+/// reportable even on the non-Linux stub build (and from CI). The version is
+/// `CARGO_PKG_VERSION`, baked from the git tag at release build time.
+fn handle_cli_flags() {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("gpu-arbiter {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "gpu-arbiter {} — gaming-first GPU arbiter daemon\n\n\
+                     Usage: gpu-arbiter [--version] [--help]\n\n\
+                     The daemon takes no runtime arguments; it reads its config from\n\
+                     /etc/gpu-arbiter/config.toml (missing file → built-in defaults).",
+                    env!("CARGO_PKG_VERSION")
+                );
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+}
+
 // Linux is the only runtime target (netlink cn_proc, /proc, nvidia-smi,
 // systemctl). The crate still builds/tests on macOS via the non-Linux `main`
 // stub below and the cfg-gated/stubbed module internals.
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
+    handle_cli_flags();
     linux::run()
 }
 
@@ -272,6 +299,7 @@ mod linux {
 /// point of the lib/main split.
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    handle_cli_flags();
     eprintln!(
         "gpu-arbiter only runs on Linux (requires cn_proc netlink, /proc, nvidia-smi, systemctl)."
     );

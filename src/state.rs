@@ -122,6 +122,9 @@ pub struct OllamaStatus {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
+    /// Daemon version (`CARGO_PKG_VERSION`, baked from the git tag at release
+    /// build time). Lets a remote consumer / the tray tell which build is live.
+    pub version: String,
     /// Current externally-visible state.
     pub state: State,
     /// Active manual override.
@@ -215,6 +218,7 @@ impl ArbiterState {
     /// Produce the serializable `/status` snapshot from live state.
     pub fn snapshot(&self) -> StatusSnapshot {
         StatusSnapshot {
+            version: env!("CARGO_PKG_VERSION").to_string(),
             state: self.state,
             pin: self.pin,
             claims: self.claims.iter().map(Claim::token).collect(),
@@ -344,7 +348,10 @@ mod tests {
         s.claims = vec![Claim::Steam("440".into())];
         s.state = State::Gaming;
         let snap = s.snapshot();
+        // The compiled-in version is always surfaced (round-trips for the tray).
+        assert_eq!(snap.version, env!("CARGO_PKG_VERSION"));
         let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains(r#""version":"#));
         assert!(json.contains(r#""state":"gaming""#));
         assert!(json.contains(r#""claims":["steam:440"]"#));
         assert!(json.contains(r#""since":"2026-06-07T20:00:00Z""#));
