@@ -6,7 +6,11 @@
 //! The pure core ([`claim_set`]) maps an observed [`ProcSnapshot`] to a
 //! [`Claim`] set and is unit-tested on macOS with literal snapshots. The
 //! side-effecting parts — the `/proc` scan that *builds* the snapshot, and the
-//! Ollama drive — are async and integration-tested on desktop-1.
+//! Ollama drive — are async and integration-tested on a live Linux host.
+
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 use crate::classify::{self, GpuGraphicsProc};
 use crate::config::Config;
@@ -147,7 +151,7 @@ pub async fn observe(_cfg: &Config) -> anyhow::Result<ProcSnapshot> {
 
 /// Run one reconcile pass: observe → compute claims → resolve state → drive
 /// Ollama (evict on `available → gaming`; verified restart on `gaming →
-/// available`). Mutates `state` in place.
+/// available`).
 ///
 /// `trigger` is recorded for logging only — the decision is always recomputed
 /// from observed truth, regardless of *why* the pass fired. **Level-triggered**:
@@ -155,37 +159,55 @@ pub async fn observe(_cfg: &Config) -> anyhow::Result<ProcSnapshot> {
 /// full truth, so a missed event or daemon restart self-corrects within one
 /// pass.
 ///
+/// ## Locking — the long eviction runs *off* the state lock
+///
+/// `state` is the shared `Arc<Mutex<ArbiterState>>`. This function takes the lock
+/// only for **brief** mutations and releases it across every slow shell-out (the
+/// `/proc` scan, `nvidia-smi`, `systemctl`). Critically, the
+/// `evicting → ... → gaming` kill window — which can take up to
+/// `eviction_timeout_s` — happens with the lock **dropped**, so `GET /status`
+/// never blocks during the very window the transient `evicting` state exists to
+/// advertise. The reconcile task is still the only *writer*, so there is no
+/// write/write race; readers just never contend with a long write.
+///
 /// Eviction biases toward gaming: the `available → gaming` transition flips the
 /// transient `evicting` state (remote consumers stop dispatching AI work)
 /// *before* the GPU is actually torn down, then settles to `gaming`. The
-/// `gaming → available` restart is **verified** — `claim_set` is already
-/// recomputed from a fresh observation here, so an orphaned game child keeps the
-/// state `gaming` and Ollama stays off.
+/// `gaming → available` restart is **verified** — `claim_set` is recomputed from
+/// a fresh observation, so an orphaned game child keeps the state `gaming` and
+/// Ollama stays off.
 pub async fn reconcile(
-    state: &mut ArbiterState,
+    state: &Arc<Mutex<ArbiterState>>,
     cfg: &Config,
     trigger: ReconcileTrigger,
 ) -> anyhow::Result<()> {
+    // Slow, off-lock: scan /proc (+ optional GPU procs).
     let snap = observe(cfg).await?;
     let claims = claim_set(&snap, cfg);
-    let desired = ArbiterState::resolve_state(state.pin, &claims);
 
-    // Record the freshly observed claim set regardless of the action taken.
-    state.claims = claims;
+    // Brief lock: read pin, decide, record the fresh claim set, snapshot the
+    // current state so we can pick an Ollama action without holding the lock.
+    let (current, desired) = {
+        let mut guard = state.lock().await;
+        let desired = ArbiterState::resolve_state(guard.pin, &claims);
+        let current = guard.state;
+        guard.claims = claims;
+        tracing::debug!(
+            ?trigger,
+            from = ?current,
+            to = ?desired,
+            claims = guard.claims.len(),
+            "reconcile"
+        );
+        (current, desired)
+    };
 
-    tracing::debug!(
-        ?trigger,
-        from = ?state.state,
-        to = ?desired,
-        claims = state.claims.len(),
-        "reconcile"
-    );
-
-    match ollama_action(state.state, desired) {
+    match ollama_action(current, desired) {
         OllamaAction::Evict => {
-            // available → gaming: announce `evicting` first so remote machines
-            // back off, tear Ollama down, then settle into `gaming`.
-            state.set_state(State::Evicting);
+            // available → gaming: announce `evicting` first (brief lock) so remote
+            // machines back off, then tear Ollama down with the lock DROPPED so
+            // `/status` stays responsive across the whole kill window.
+            state.lock().await.set_state(State::Evicting);
             match ollama::evict(cfg).await {
                 Ok(outcome) => tracing::info!(?outcome, "evicted ollama for gaming"),
                 Err(e) => {
@@ -193,11 +215,11 @@ pub async fn reconcile(
                 }
             }
             // Gaming wins the GPU unconditionally — even if eviction errored.
-            state.set_state(State::Gaming);
+            state.lock().await.set_state(State::Gaming);
         }
         OllamaAction::Restart => {
             // gaming → available (verified: the snapshot above was clean).
-            state.set_state(State::Available);
+            state.lock().await.set_state(State::Available);
             if cfg.eager_ollama
                 && let Err(e) = ollama::start(cfg).await
             {
@@ -207,7 +229,7 @@ pub async fn reconcile(
         OllamaAction::None => {
             // No transition needing an Ollama action: just settle the state
             // (covers the `evicting → gaming` settle and steady-state passes).
-            state.set_state(desired);
+            state.lock().await.set_state(desired);
         }
     }
 
@@ -218,22 +240,38 @@ pub async fn reconcile(
 /// Refresh the Ollama + GPU sub-state embedded in `/status` (best-effort —
 /// informational fields never fail a reconcile). A failed GPU read leaves the
 /// last-known VRAM numbers in place.
-async fn refresh_substate(state: &mut ArbiterState, cfg: &Config) {
+///
+/// The shell-outs run with the lock **dropped**; only the final field write takes
+/// it briefly, so `/status` never blocks on `systemctl is-active`/`nvidia-smi`.
+async fn refresh_substate(state: &Arc<Mutex<ArbiterState>>, cfg: &Config) {
     let running = ollama::is_running(cfg).await.unwrap_or(false);
     let models = if running {
         ollama::loaded_models(cfg).await
     } else {
         Vec::new()
     };
-    state.ollama = OllamaStatus {
+    // Attribute VRAM to Ollama from the compute-proc list (Ollama is a *compute*
+    // tenant). Best-effort: a failed/absent query leaves vram_mb as None so
+    // `/status` omits it rather than lying with a 0.
+    let vram_mb = if running {
+        gpu::query_compute_procs()
+            .await
+            .ok()
+            .and_then(|procs| gpu::ollama_vram_mb(&procs))
+    } else {
+        None
+    };
+    let mem = gpu::query_memory().await.ok();
+
+    let mut guard = state.lock().await;
+    guard.ollama = OllamaStatus {
         running,
         models,
-        vram_mb: state.ollama.vram_mb,
+        vram_mb,
     };
-
-    if let Ok(mem) = gpu::query_memory().await {
-        state.gpu_vram_used_mb = mem.used_mb;
-        state.gpu_vram_total_mb = mem.total_mb;
+    if let Some(mem) = mem {
+        guard.gpu_vram_used_mb = mem.used_mb;
+        guard.gpu_vram_total_mb = mem.total_mb;
     }
 }
 
@@ -360,19 +398,27 @@ mod tests {
     // ── reconcile orchestration (macOS: observe() yields an empty snapshot, so
     //    claim_set is empty; the systemctl/nvidia-smi shell-outs fail-soft) ──
 
+    /// Wrap a state in the shared `Arc<Mutex>` the (refactored) `reconcile` now
+    /// takes, mirroring the daemon's real wiring.
+    fn shared(state: ArbiterState) -> Arc<Mutex<ArbiterState>> {
+        Arc::new(Mutex::new(state))
+    }
+
     #[tokio::test]
     async fn reconcile_empty_observation_drives_available() {
         // On a non-Linux host observe() is empty → no claims → Pin::Auto resolves
         // to Available. Starting from Gaming exercises the verified-restart path
         // (ollama::start fails-soft without systemd; reconcile still succeeds).
         let cfg = Config::default();
-        let mut state = ArbiterState::new();
-        state.state = State::Gaming;
-        reconcile(&mut state, &cfg, ReconcileTrigger::Timer)
+        let mut s = ArbiterState::new();
+        s.state = State::Gaming;
+        let state = shared(s);
+        reconcile(&state, &cfg, ReconcileTrigger::Timer)
             .await
             .unwrap();
-        assert_eq!(state.state, State::Available);
-        assert!(state.claims.is_empty());
+        let g = state.lock().await;
+        assert_eq!(g.state, State::Available);
+        assert!(g.claims.is_empty());
     }
 
     #[tokio::test]
@@ -381,30 +427,34 @@ mod tests {
         // claims. Starting from Available drives the evict→gaming path; the
         // eviction shell-outs fail-soft but the state still settles to Gaming.
         let cfg = Config::default();
-        let mut state = ArbiterState::new();
-        state.pin = crate::state::Pin::Gaming;
-        assert_eq!(state.state, State::Available);
-        reconcile(&mut state, &cfg, ReconcileTrigger::Pin)
+        let mut s = ArbiterState::new();
+        s.pin = crate::state::Pin::Gaming;
+        assert_eq!(s.state, State::Available);
+        let state = shared(s);
+        reconcile(&state, &cfg, ReconcileTrigger::Pin)
             .await
             .unwrap();
-        assert_eq!(state.state, State::Gaming);
-        assert!(state.claims.is_empty());
+        let g = state.lock().await;
+        assert_eq!(g.state, State::Gaming);
+        assert!(g.claims.is_empty());
     }
 
     #[tokio::test]
     async fn reconcile_pin_available_stays_available() {
         let cfg = Config::default();
-        let mut state = ArbiterState::new();
-        state.pin = crate::state::Pin::Available;
-        state.state = State::Gaming;
-        reconcile(&mut state, &cfg, ReconcileTrigger::Pin)
+        let mut s = ArbiterState::new();
+        s.pin = crate::state::Pin::Available;
+        s.state = State::Gaming;
+        let state = shared(s);
+        reconcile(&state, &cfg, ReconcileTrigger::Pin)
             .await
             .unwrap();
-        assert_eq!(state.state, State::Available);
+        assert_eq!(state.lock().await.state, State::Available);
     }
 
     #[test]
     fn transition_actions() {
+        // available → gaming: evict; gaming → available: verified restart.
         assert_eq!(
             ollama_action(State::Available, State::Gaming),
             OllamaAction::Evict
@@ -413,12 +463,25 @@ mod tests {
             ollama_action(State::Gaming, State::Available),
             OllamaAction::Restart
         );
+        // Steady states take no Ollama action.
         assert_eq!(
             ollama_action(State::Gaming, State::Gaming),
             OllamaAction::None
         );
         assert_eq!(
+            ollama_action(State::Available, State::Available),
+            OllamaAction::None
+        );
+        // `evicting` is a transient internal state; whatever it resolves to next
+        // takes no *new* Ollama action (the evict already ran). Covers the
+        // settle-to-gaming path AND the race where a game exits mid-eviction
+        // (evicting → available): no spurious restart, the next pass corrects.
+        assert_eq!(
             ollama_action(State::Evicting, State::Gaming),
+            OllamaAction::None
+        );
+        assert_eq!(
+            ollama_action(State::Evicting, State::Available),
             OllamaAction::None
         );
     }

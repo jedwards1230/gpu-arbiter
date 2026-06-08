@@ -1,11 +1,26 @@
 # gpu-arbiter
 
-A small root daemon for **desktop-1** (CachyOS, RTX 5090) that treats the box as
-a **gaming PC first, AI workstation second**. It detects game launches via the
-kernel process-event connector (`cn_proc`) — local *or* Moonlight-streamed, both
-are just local processes — instantly evicts Ollama from the GPU when a game
-starts, restores it when gaming ends, and exposes an HTTP `/status` endpoint so
-other machines can tell whether the box is free for AI work.
+A small root daemon for a Linux gaming workstation that also doubles as an AI
+compute box — it treats the machine as a **gaming PC first, AI workstation
+second**. It detects game launches via the kernel process-event connector
+(`cn_proc`) — local *or* Moonlight-streamed, both are just local processes —
+instantly evicts Ollama from the GPU when a game starts, restores it when gaming
+ends, and exposes an HTTP `/status` endpoint so other machines can tell whether
+the box is free for AI work.
+
+## Requirements
+
+- **Linux** (the `cn_proc` netlink connector and `/proc` scanning are Linux-only)
+- An **NVIDIA GPU** with `nvidia-smi` on `PATH`
+- **systemd** (`systemctl` controls the Ollama unit; the daemon ships as a
+  systemd service)
+- **root** (the `cn_proc` multicast socket needs `CAP_NET_ADMIN`; the daemon
+  also drives `systemctl` and `nvidia-smi`)
+- **Ollama** installed as a systemd unit (kept `disabled` — the daemon owns its
+  lifecycle)
+
+The crate builds and tests on any host (including macOS) — Linux-only edges are
+`#[cfg(target_os = "linux")]` with non-Linux stubs.
 
 ## How it works
 

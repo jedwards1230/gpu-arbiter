@@ -1,6 +1,6 @@
 //! gpu-arbiter daemon (thin binary).
 //!
-//! Treats desktop-1 as a gaming PC first, AI workstation second: a kernel
+//! Treats the host as a gaming PC first, AI workstation second: a kernel
 //! `cn_proc` listener detects game launches (local *or* Moonlight-streamed —
 //! both are just local processes), a level-triggered reconcile loop evicts
 //! Ollama from the GPU when a game starts and restores it when gaming ends, and
@@ -70,6 +70,17 @@ mod linux {
     async fn async_main() -> anyhow::Result<()> {
         // 1. Config (missing file → defaults).
         let cfg = Arc::new(Config::load(CONFIG_PATH)?);
+
+        // Honor the master `enabled` switch: a manual `enabled = false` in the
+        // config (a quick disable without touching systemd) exits cleanly instead
+        // of being silently ignored. (The Ansible role *also* gates the unit on
+        // this, so normally the daemon never even starts when disabled — this is
+        // the belt-and-suspenders runtime check.)
+        if !cfg.enabled {
+            tracing::info!("gpu-arbiter is disabled in config (enabled = false); exiting");
+            return Ok(());
+        }
+
         tracing::info!(
             port = cfg.port,
             ollama_unit = %cfg.ollama_unit,
@@ -83,18 +94,16 @@ mod linux {
         let (triggers_tx, triggers_rx) = mpsc::channel::<ReconcileTrigger>(TRIGGER_CHANNEL_DEPTH);
 
         // 3. STARTUP reconcile BEFORE anything else can drive Ollama: a daemon
-        //    restart or boot must never start Ollama into a live game. We hold
-        //    the lock and run one synchronous pass here.
-        {
-            let mut guard = state.lock().await;
-            if let Err(e) = reconcile::reconcile(&mut guard, &cfg, ReconcileTrigger::Timer).await {
-                // A failed startup reconcile is non-fatal: we log and continue —
-                // the periodic backstop will retry. We do NOT start Ollama on
-                // our own here; reconcile is the only thing that does.
-                tracing::error!(error = %e, "startup reconcile failed; continuing (backstop will retry)");
-            }
-            tracing::info!(state = ?guard.state, "startup reconcile complete");
+        //    restart or boot must never start Ollama into a live game. Run one
+        //    synchronous pass here; nothing else touches Ollama until it returns
+        //    (the reconcile task and HTTP server aren't spawned yet).
+        if let Err(e) = reconcile::reconcile(&state, &cfg, ReconcileTrigger::Timer).await {
+            // A failed startup reconcile is non-fatal: we log and continue —
+            // the periodic backstop will retry. We do NOT start Ollama on
+            // our own here; reconcile is the only thing that does.
+            tracing::error!(error = %e, "startup reconcile failed; continuing (backstop will retry)");
         }
+        tracing::info!(state = ?state.lock().await.state, "startup reconcile complete");
 
         // 4. The single reconcile task that owns state mutation going forward.
         let reconcile_handle =
@@ -171,35 +180,48 @@ mod linux {
                 },
             };
 
-            // Debounce ONLY ProcEvent bursts. Deliberate triggers act now.
-            if trigger == ReconcileTrigger::ProcEvent {
-                debounce_proc_events(&mut triggers).await;
-            }
+            // Debounce ONLY ProcEvent bursts. Deliberate triggers act now. A
+            // deliberate trigger arriving mid-window is returned so it isn't lost
+            // (the log then reflects the trigger that actually drove the pass).
+            let effective = if trigger == ReconcileTrigger::ProcEvent {
+                debounce_proc_events(&mut triggers).await
+            } else {
+                trigger
+            };
 
-            let mut guard = state.lock().await;
-            if let Err(e) = reconcile::reconcile(&mut guard, &cfg, trigger).await {
+            // reconcile() manages the state lock internally — it holds it only
+            // for brief mutations and DROPS it across the slow eviction/shell-out
+            // window so `/status` never blocks (see reconcile docs).
+            if let Err(e) = reconcile::reconcile(&state, &cfg, effective).await {
                 tracing::error!(error = %e, "reconcile pass failed");
             }
         }
     }
 
     /// Swallow a burst of additional `ProcEvent`s within the `DEBOUNCE` window so
-    /// a game-launch storm collapses to one reconcile. Returns when the window
-    /// elapses with no further `ProcEvent`. A `Pin`/`Manual`/non-proc trigger
-    /// arriving mid-window is *not* dropped — we stop debouncing and let the
-    /// caller reconcile (the pending trigger is left for the next loop). Channel
-    /// close also ends the window.
-    async fn debounce_proc_events(triggers: &mut mpsc::Receiver<ReconcileTrigger>) {
+    /// a game-launch storm collapses to one reconcile, and return the trigger the
+    /// caller should reconcile with.
+    ///
+    /// Returns [`ReconcileTrigger::ProcEvent`] when the window elapses (or the
+    /// channel closes) with only proc events seen. A `Pin`/`Manual`/`Timer`
+    /// trigger arriving mid-window is **returned** (not dropped) so it actually
+    /// drives the immediate reconcile — `recv()` consumed it from the channel, so
+    /// returning it is the only way it isn't silently lost. Deadline is fixed (not
+    /// sliding) so sustained churn can't defer the reconcile indefinitely.
+    async fn debounce_proc_events(
+        triggers: &mut mpsc::Receiver<ReconcileTrigger>,
+    ) -> ReconcileTrigger {
         let deadline = tokio::time::Instant::now() + DEBOUNCE;
         loop {
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => return,
+                _ = tokio::time::sleep_until(deadline) => return ReconcileTrigger::ProcEvent,
                 recv = triggers.recv() => match recv {
-                    // Another proc event: keep coalescing (deadline unchanged, so
-                    // the window doesn't slide indefinitely under sustained churn).
+                    // Another proc event: keep coalescing (deadline unchanged).
                     Some(ReconcileTrigger::ProcEvent) => continue,
-                    // A deliberate trigger or close: stop debouncing now.
-                    Some(_) | None => return,
+                    // A deliberate trigger: stop debouncing and carry it through.
+                    Some(other) => return other,
+                    // Channel closed: the original ProcEvent still warrants a pass.
+                    None => return ReconcileTrigger::ProcEvent,
                 },
             }
         }

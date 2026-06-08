@@ -6,9 +6,20 @@
 //!   `nvidia-smi` CSV output into typed values. Unit-tested with literal CSV.
 //! - **The shell-out** ([`query_memory`], [`query_graphics_procs`]) runs
 //!   `nvidia-smi` via async `tokio::process::Command`. Compiles everywhere;
-//!   only succeeds where `nvidia-smi` exists (desktop-1).
+//!   only succeeds where `nvidia-smi` exists (a Linux + NVIDIA host).
+
+use std::time::Duration;
 
 use crate::classify::GpuGraphicsProc;
+
+/// Hard ceiling on any `nvidia-smi` shell-out. A wedged GPU (driver/Xid hang, GPU
+/// fallen off the bus, a stuck ioctl) is a real, well-known NVIDIA failure mode in
+/// which `nvidia-smi` blocks indefinitely. Bounding the call guarantees the
+/// eviction poll loop (and therefore a game launch) can never hang on it — a
+/// timeout surfaces as a [`GpuError::Command`], which the eviction path treats as
+/// "not yet free" and escalates past. Generous enough that a healthy call (tens
+/// of ms) never trips it.
+const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Total GPU memory snapshot (MiB), parsed from
 /// `nvidia-smi --query-gpu=memory.used,memory.total`.
@@ -85,10 +96,15 @@ pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
 /// Linux-only at *runtime* (no `nvidia-smi` on macOS), but compiles everywhere:
 /// the spawn failure (binary absent) surfaces as [`GpuError::Command`].
 async fn run_nvidia_smi(args: &[&str]) -> Result<String, GpuError> {
-    let out = tokio::process::Command::new("nvidia-smi")
+    let fut = tokio::process::Command::new("nvidia-smi")
         .args(args)
-        .output()
+        .output();
+    // A hung nvidia-smi must never wedge the eviction loop — bound it.
+    let out = tokio::time::timeout(NVIDIA_SMI_TIMEOUT, fut)
         .await
+        .map_err(|_| {
+            GpuError::Command(format!("nvidia-smi timed out after {NVIDIA_SMI_TIMEOUT:?}"))
+        })?
         .map_err(|e| GpuError::Command(format!("spawning nvidia-smi: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -133,6 +149,37 @@ pub async fn query_graphics_procs() -> Result<Vec<GpuGraphicsProc>, GpuError> {
     ])
     .await?;
     Ok(parse_graphics_procs_csv(&out))
+}
+
+/// Shell out to `nvidia-smi` for the GPU *compute* process list. Async.
+///
+/// Ollama is a **compute** GPU process, so its VRAM is reported here (not in the
+/// graphics-apps list). Used to populate the `/status` `ollama.vram_mb` field.
+/// Reuses [`parse_graphics_procs_csv`] (identical `pid,name,used_memory` shape).
+pub async fn query_compute_procs() -> Result<Vec<GpuGraphicsProc>, GpuError> {
+    let out = run_nvidia_smi(&[
+        "--query-compute-apps=pid,process_name,used_memory",
+        "--format=csv,noheader,nounits",
+    ])
+    .await?;
+    Ok(parse_graphics_procs_csv(&out))
+}
+
+/// Best-effort VRAM (MiB) attributed to Ollama, summed across its compute
+/// processes. Matches by process name substring `ollama` (case-insensitive) —
+/// `nvidia-smi` reports the full binary path, e.g. `/usr/local/bin/ollama` or its
+/// `ollama runner` subprocess. Pure helper over an observed compute-proc list.
+///
+/// Returns `None` when no Ollama compute proc is seen (so `/status` omits the
+/// field rather than reporting a misleading `0`).
+pub fn ollama_vram_mb(compute: &[GpuGraphicsProc]) -> Option<u64> {
+    let mut matched = compute
+        .iter()
+        .filter(|p| p.name.to_ascii_lowercase().contains("ollama"))
+        .map(|p| p.vram_mb)
+        .peekable();
+    matched.peek()?; // no Ollama compute proc → None (don't report a misleading 0)
+    Some(matched.sum())
 }
 
 #[cfg(test)]
@@ -200,6 +247,22 @@ mod tests {
     fn parse_graphics_procs_empty_is_empty() {
         assert!(parse_graphics_procs_csv("").is_empty());
         assert!(parse_graphics_procs_csv("\n\n").is_empty());
+    }
+
+    #[test]
+    fn ollama_vram_sums_matching_compute_procs() {
+        // Real nvidia-smi reports the full path; match is by `ollama` substring.
+        let procs = parse_graphics_procs_csv(
+            "111, /usr/local/bin/ollama, 21000\n222, /usr/bin/ollama runner, 500\n333, python3, 4000\n",
+        );
+        assert_eq!(ollama_vram_mb(&procs), Some(21500));
+    }
+
+    #[test]
+    fn ollama_vram_none_when_absent() {
+        let procs = parse_graphics_procs_csv("333, python3, 4000\n");
+        assert_eq!(ollama_vram_mb(&procs), None);
+        assert_eq!(ollama_vram_mb(&[]), None);
     }
 
     #[tokio::test]

@@ -14,15 +14,19 @@ on:
     types: [closed]
     branches: [main]
 
+# Least privilege: the detect job only reads PR labels. contents: write is
+# granted on the release job (via release.yml) where the tag/release is created.
 permissions:
-  contents: write
-  pull-requests: read
+  contents: read
 
 jobs:
   detect:
     name: Detect bump type
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       bump_type: ${{ steps.bump.outputs.type }}
       release: ${{ steps.bump.outputs.release }}

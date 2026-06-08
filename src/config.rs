@@ -170,6 +170,22 @@ mod tests {
     }
 
     #[test]
+    fn missing_file_is_defaults_not_an_error() {
+        // The daemon's "zero config needed" guarantee: a nonexistent path yields
+        // full defaults, never an error.
+        let c = Config::load("/nonexistent/gpu-arbiter/does-not-exist.toml").unwrap();
+        assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn malformed_toml_is_a_parse_error() {
+        // A template bug producing the wrong type must fail fast with a typed
+        // Parse error, not silently default.
+        let err = Config::from_toml("port = \"not_a_number\"").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
     fn parses_game_patterns() {
         let c = Config::from_toml(
             r#"

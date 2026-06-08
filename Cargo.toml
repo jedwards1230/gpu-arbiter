@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "GPU arbiter for desktop-1: evicts Ollama from the GPU when a game launches (kernel cn_proc detection), restores it when gaming ends, exposes an HTTP /status endpoint for remote AI-routing decisions"
+description = "GPU arbiter daemon: evicts Ollama from the GPU when a game launches (kernel cn_proc detection), restores it when gaming ends, exposes an HTTP /status endpoint for remote AI-routing decisions"
+repository = "https://github.com/jedwards1230/gpu-arbiter"
 
 [[bin]]
 name = "gpu-arbiter"
@@ -27,11 +28,6 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
-# Checked casts of raw netlink `proc_event` payloads — a truncated/garbage
-# datagram is logged-and-skipped, never a panic or OOB read (this is a root
-# daemon). Cross-platform (the cast helpers are pure); the netlink wiring that
-# feeds them is Linux-gated.
-bytemuck = "1"
 # Pure-Rust HTTP server on hyper (server-only — no reqwest/TLS, which also keeps
 # the musl build clear of the ring/aws-lc cross-compile minefield). Note 0.8
 # path-param syntax: `/{p}`.

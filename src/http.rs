@@ -175,7 +175,8 @@ mod tests {
 
     #[test]
     fn lan_peer_is_not_localhost() {
-        assert!(!is_localhost(IpAddr::V4(Ipv4Addr::new(192, 168, 8, 10))));
+        // A generic RFC 1918 LAN address — the `/ollama/*` handlers must reject it.
+        assert!(!is_localhost(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))));
     }
 
     #[test]

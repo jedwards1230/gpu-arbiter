@@ -353,6 +353,22 @@ mod tests {
     }
 
     #[test]
+    fn evicting_serializes_lowercase_and_vram_present() {
+        // The /status contract: `evicting` lowercases, and a known vram_mb is
+        // emitted (the inverse of the None-is-skipped case above).
+        let mut s = ArbiterState::new();
+        s.state = State::Evicting;
+        s.ollama.vram_mb = Some(21000);
+        s.gpu_vram_used_mb = 21500;
+        s.gpu_vram_total_mb = 32768;
+        let json = serde_json::to_string(&s.snapshot()).unwrap();
+        assert!(json.contains(r#""state":"evicting""#));
+        assert!(json.contains(r#""vram_mb":21000"#));
+        assert!(json.contains(r#""gpu_vram_used_mb":21500"#));
+        assert!(json.contains(r#""gpu_vram_total_mb":32768"#));
+    }
+
+    #[test]
     fn set_state_resets_since_only_on_change() {
         let mut s = ArbiterState::new();
         let t0 = s.since;

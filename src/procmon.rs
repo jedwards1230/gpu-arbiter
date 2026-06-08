@@ -9,10 +9,9 @@
 //!
 //! ## Safety of the netlink parse (this is a root daemon)
 //!
-//! The task brief calls for "BYTEMUCK CHECKED conversions (`try_from_bytes`)" so
-//! a truncated/garbage datagram can never panic or read out of bounds. `neli`
-//! 0.7's `connector` module already gives us exactly that property — and more
-//! safely than a hand-rolled `bytemuck` cast over a `Vec<u8>` would:
+//! A truncated/garbage datagram can never panic or read out of bounds because the
+//! parse goes entirely through `neli` 0.7's checked `connector` deserializer
+//! (safer than a hand-rolled cast over a `Vec<u8>`):
 //!
 //! - `recv::<Nlmsg, CnMsg<ProcEventHeader>>()` returns a *fallible iterator*; a
 //!   short/garbage datagram surfaces as `Err(..)` on the offending message
@@ -24,12 +23,8 @@
 //!   over-read. An unrecognized `what` discriminant becomes a typed `DeError`,
 //!   not UB.
 //!
-//! So the safe path here is to lean on neli's checked deserializer rather than
-//! re-implement the byte parsing with `bytemuck`. Each received message is
-//! handled in its own `match`: `Ok` → act, `Err` → `warn!`-and-skip. There is
-//! no `unwrap()`/`expect()`/`todo!()` on the hot path. (`bytemuck` remains a
-//! declared dep for any future raw-payload needs, but the typed neli path is
-//! strictly safer and is what we use.)
+//! Each received message is handled in its own `match`: `Ok` → act, `Err` →
+//! `warn!`-and-skip. There is no `unwrap()`/`expect()`/`todo!()` on the hot path.
 //!
 //! **Linux-only**: netlink + cn_proc are Linux kernel interfaces. A non-Linux
 //! stub keeps the crate compiling and `cargo test`-able on macOS.
@@ -76,15 +71,16 @@ pub enum ProcEventKind {
 }
 
 /// procmon errors.
+///
+/// Only socket-level failures are fatal (they end `run` so `main` can fall back
+/// to the backstop timer). Per-message parse errors are **not** modeled here —
+/// neli's checked deserializer surfaces them inline in the recv loop where they
+/// are `warn!`-and-skipped, never propagated.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcMonError {
     /// The netlink socket could not be opened / the multicast subscribe failed.
     #[error("opening cn_proc netlink socket: {0}")]
     Socket(String),
-    /// A received datagram was too short / malformed to interpret. Logged and
-    /// skipped at the call site — never fatal.
-    #[error("malformed proc_event datagram ({0} bytes)")]
-    Malformed(usize),
 }
 
 /// Whether a [`ProcEventKind`] should fire a reconcile trigger.

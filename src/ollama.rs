@@ -4,8 +4,8 @@
 //!
 //! The shell-outs use async `tokio::process::Command`. The *decisions*
 //! (whether VRAM is freed, whether to escalate) are pure helpers, unit-tested
-//! on macOS; the process invocations are thin and integration-tested on
-//! desktop-1.
+//! on macOS; the process invocations are thin and integration-tested on a live
+//! Linux + NVIDIA host.
 
 use std::time::Duration;
 
@@ -45,6 +45,15 @@ pub enum EvictionOutcome {
 /// after `systemctl stop`. Kept well below the per-second teardown so a graceful
 /// release is caught promptly, yet coarse enough not to hammer `nvidia-smi`.
 const EVICTION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Hard ceiling on any `systemctl` / `ollama` shell-out. A wedged systemd (stuck
+/// D-Bus, hung PID 1 transaction) or a hung `ollama ps` would otherwise block the
+/// single reconcile task indefinitely while it holds `state.lock()` — wedging
+/// `/status`, the backstop timer, and every future reconcile. Bounding each call
+/// keeps the worst-case eviction window finite (a game launch must never hang on
+/// Ollama). Healthy `systemctl` calls return in milliseconds, so this never trips
+/// in normal operation.
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pure predicate: is the GPU considered "freed" given a memory snapshot and the
 /// configured free threshold? Pure — unit-tested. Strict `<`.
@@ -91,8 +100,10 @@ pub fn parse_ollama_ps(out: &str) -> Vec<String> {
     out.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        // Drop the header row (its first column is the literal "NAME").
-        .skip_while(|l| l.split_whitespace().next() == Some("NAME"))
+        // Drop exactly the header row (the first non-empty line). `skip(1)` is
+        // unambiguous — `skip_while`-on-"NAME" would also swallow a model that
+        // happened to be named `NAME`.
+        .skip(1)
         .filter_map(|l| l.split_whitespace().next().map(str::to_string))
         .collect()
 }
@@ -100,11 +111,18 @@ pub fn parse_ollama_ps(out: &str) -> Vec<String> {
 /// Run `systemctl <action> <unit>`; map a non-zero exit / spawn failure into a
 /// typed [`OllamaError::Systemctl`]. Async.
 async fn systemctl(action: &str, unit: &str) -> Result<std::process::Output, OllamaError> {
-    tokio::process::Command::new("systemctl")
+    let fut = tokio::process::Command::new("systemctl")
         .arg(action)
         .arg(unit)
-        .output()
+        .output();
+    // A wedged systemd must never hang the reconcile task — bound it.
+    tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut)
         .await
+        .map_err(|_| OllamaError::Systemctl {
+            action: action.to_string(),
+            unit: unit.to_string(),
+            detail: format!("timed out after {SYSTEMCTL_TIMEOUT:?}"),
+        })?
         .map_err(|e| OllamaError::Systemctl {
             action: action.to_string(),
             unit: unit.to_string(),
@@ -128,12 +146,12 @@ pub async fn is_running(cfg: &Config) -> Result<bool, OllamaError> {
 /// or the query fails — never an error (purely informational, must not break a
 /// `/status` response).
 pub async fn loaded_models(_cfg: &Config) -> Vec<String> {
-    match tokio::process::Command::new("ollama")
-        .arg("ps")
-        .output()
-        .await
-    {
-        Ok(out) if out.status.success() => parse_ollama_ps(&String::from_utf8_lossy(&out.stdout)),
+    let fut = tokio::process::Command::new("ollama").arg("ps").output();
+    // Best-effort + bounded: a hung `ollama ps` must not stall the reconcile.
+    match tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut).await {
+        Ok(Ok(out)) if out.status.success() => {
+            parse_ollama_ps(&String::from_utf8_lossy(&out.stdout))
+        }
         _ => Vec::new(),
     }
 }
@@ -209,11 +227,17 @@ pub async fn evict(cfg: &Config) -> Result<EvictionOutcome, OllamaError> {
 /// SIGKILL the Ollama unit's processes (`systemctl kill -s SIGKILL <unit>`).
 /// Best-effort escalation — the caller proceeds regardless of the result.
 async fn systemctl_kill(cfg: &Config) -> Result<(), OllamaError> {
-    let out = tokio::process::Command::new("systemctl")
+    let fut = tokio::process::Command::new("systemctl")
         .args(["kill", "-s", "SIGKILL"])
         .arg(&cfg.ollama_unit)
-        .output()
+        .output();
+    let out = tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut)
         .await
+        .map_err(|_| OllamaError::Systemctl {
+            action: "kill".to_string(),
+            unit: cfg.ollama_unit.clone(),
+            detail: format!("timed out after {SYSTEMCTL_TIMEOUT:?}"),
+        })?
         .map_err(|e| OllamaError::Systemctl {
             action: "kill".to_string(),
             unit: cfg.ollama_unit.clone(),

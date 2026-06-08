@@ -47,7 +47,7 @@ jobs:
     uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@v0
     with:
       service_name: gpu-arbiter
-      service_description: "a root daemon that evicts Ollama from the GPU when a game launches on desktop-1 and restores it when gaming ends"
+      service_description: "a root daemon that evicts Ollama from the GPU when a game launches and restores it when gaming ends"
       bump_type: ${{ inputs.bump_type }}
       version_override: ${{ inputs.version_override }}
       create_release: false
