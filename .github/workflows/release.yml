@@ -140,6 +140,12 @@ jobs:
     if: needs.detect.outputs.release == 'true' && needs.detect.outputs.dry_run != 'true'
     runs-on: ubuntu-latest
     container: rust:1-bookworm
+    # Container jobs default to `sh`, which lacks `set -o pipefail` (a bashism).
+    # rust:1-bookworm ships bash — make it the default for this job's run steps
+    # so the `set -euo pipefail` in the bake/stage steps works.
+    defaults:
+      run:
+        shell: bash
     permissions:
       contents: read
     steps:
