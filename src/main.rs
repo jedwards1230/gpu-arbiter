@@ -12,7 +12,7 @@
 //! cross-platform modules aren't dead-code on non-Linux hosts where `main` is
 //! cfg-excluded).
 //!
-//! Runtime shape (per the design plan): a single **reconcile task owns state**,
+//! Runtime shape: a single **reconcile task owns state**,
 //! fed by an `mpsc` of [`gpu_arbiter::state::ReconcileTrigger`]s from the
 //! netlink task (`procmon`), a `tokio::time::interval`, and the HTTP handlers.
 //! `ProcEvent` bursts are coalesced by a **hand-rolled `select!` + deadline
@@ -70,7 +70,7 @@ mod linux {
     use gpu_arbiter::state::{ArbiterState, ReconcileTrigger};
     use tokio::sync::{Mutex, mpsc};
 
-    /// Where the Ansible role renders the config. A missing file is fine —
+    /// Where deployment tooling (e.g. Ansible) renders the config. A missing file is fine —
     /// `Config::load` falls back to full defaults.
     const CONFIG_PATH: &str = "/etc/gpu-arbiter/config.toml";
 

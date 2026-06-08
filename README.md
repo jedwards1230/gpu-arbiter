@@ -72,9 +72,9 @@ remote consumers treat `evicting` as busy).
 
 ## Configuration
 
-Loaded from a TOML file (rendered by the `desktop-common` Ansible role). Every
+Loaded from a TOML file (e.g. rendered by your deployment tooling). Every
 key is optional; a missing file yields the defaults below. Keys mirror the
-role's `gpu_arbiter_*` vars minus the prefix.
+`gpu_arbiter_*` variable names minus the prefix.
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -118,8 +118,8 @@ The daemon is **Linux-only at runtime** (netlink `cn_proc`, `/proc`,
 is cross-platform and unit-tested with literal inputs.
 
 CI publishes a static `x86_64-unknown-linux-musl` binary as a GitHub release
-artifact; the `desktop-common` Ansible role fetches it by version (on-host
-`cargo build` is the fallback) and installs it as a root systemd unit.
+artifact; your deployment tooling (e.g. Ansible) can fetch it by version (on-host
+`cargo build` is the fallback) and install it as a root systemd unit.
 
 ## License
 

@@ -9,7 +9,7 @@
 //! State is fully **auto** — derived from observed reality (no manual override).
 //!
 //! Security: single port bound `0.0.0.0`, LAN-restricted by a firewalld rich
-//! rule (copy the game-shell bridge pattern). The `/ollama/*` handlers
+//! rule (firewalld-gated HTTP bridge pattern). The `/ollama/*` handlers
 //! additionally reject any client whose peer address is not loopback —
 //! enforced in-process via [`ConnectInfo`] so it holds even if the firewall
 //! rule is missing/misconfigured.

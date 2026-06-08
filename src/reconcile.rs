@@ -81,7 +81,7 @@ pub fn flatten_cmdline(raw: &[u8]) -> String {
 ///
 /// The `/proc` walk is **synchronous, blocking** filesystem work, so it runs
 /// under [`tokio::task::spawn_blocking`] — it never stalls the runtime or the
-/// HTTP server (per the design plan's "Async shape"). The optional `nvidia-smi`
+/// HTTP server. The optional `nvidia-smi`
 /// graphics-proc query (only when the VRAM heuristic is on) is an async
 /// `tokio::process` shell-out and stays on the runtime.
 #[cfg(target_os = "linux")]

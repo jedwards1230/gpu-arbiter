@@ -174,7 +174,7 @@ pub async fn start(cfg: &Config) -> Result<(), OllamaError> {
 /// Evict Ollama from the GPU: `systemctl stop`, then poll `nvidia-smi` until VRAM
 /// drops below `vram_free_threshold_mb` (graceful) or `eviction_timeout_s`
 /// elapses. On timeout, re-check the unit: if it's already inactive the process
-/// is gone and its VRAM released (the plan's "VRAM free *or PID gone*" gate) —
+/// is gone and its VRAM released (VRAM free *or PID gone* gate) —
 /// that's a graceful [`EvictionOutcome::Freed`]. Only a unit that's genuinely
 /// still up gets `systemctl kill -s SIGKILL`, after which we **proceed regardless**
 /// (gaming wins the GPU unconditionally; a game launch must never hang waiting on
@@ -219,7 +219,7 @@ pub async fn evict(cfg: &Config) -> Result<EvictionOutcome, OllamaError> {
                 // Timed out on VRAM — but `systemctl stop` already reaped the
                 // unit synchronously, so the only way we're here is either real
                 // VRAM pressure OR a flaky `nvidia-smi` (read as u64::MAX → never
-                // "free"). The plan's "VRAM free *or PID gone*" gate: if the unit
+                // "free"). VRAM free *or PID gone* gate: if the unit
                 // is already inactive, the process is gone and its CUDA context
                 // (hence VRAM) released — SIGKILL would hit nothing. Treat that as
                 // a graceful release instead of a misleading `Escalated`.

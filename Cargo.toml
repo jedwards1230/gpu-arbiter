@@ -23,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 anyhow = "1"
-# thiserror 2 (typed parse/netlink edges — NOT game-shell's "1").
+# thiserror v2 (typed parse/netlink edges).
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
