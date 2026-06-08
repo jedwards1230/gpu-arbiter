@@ -1,11 +1,14 @@
-# Cross-build the static gpu-arbiter binary, generate AI release notes, and
-# attach the binary to a GitHub Release.
+# Cross-build the static gpu-arbiter binaries (daemon + tray), generate AI
+# release notes, and attach the binaries + their sha256 checksums to a GitHub
+# Release.
 #
 # Version compute, tag creation, and AI release notes are delegated to the shared
 # jedwards1230/release-workflows/.github/workflows/ai-release.yml@v0 (see
 # home-orchestration .claude/rules/release-conventions.md). The git tag is the
-# single source of truth; the version is baked into the binary at build time via
-# CARGO_PKG_VERSION (no version pushed back to main).
+# single source of truth: the build job stamps the computed version into the
+# TAGGED checkout's Cargo.toml (sed) before building, so CARGO_PKG_VERSION — and
+# therefore `--version` and the `/status` `version` field — match the release.
+# That edit lives only in the ephemeral tagged checkout; nothing is pushed to main.
 #
 # Triggered by auto-release.yml on a labelled PR merge, or manually via dispatch.
 
@@ -55,7 +58,7 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
   build:
-    name: Build static binary
+    name: Build static binaries
     needs: [prepare]
     runs-on: ubuntu-latest
     container: rust:1-bookworm
@@ -66,6 +69,19 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Bake release version into Cargo.toml
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The git tag is the single source of truth. Stamp the package version
+          # so CARGO_PKG_VERSION (→ `--version` and `/status.version`) matches the
+          # release. Only the package `version = "..."` line starts at column 0;
+          # dependency versions are inline (`tokio = { version = ... }`), so this
+          # is unambiguous. Edits only this ephemeral tagged checkout.
+          sed -i -E "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          echo "Baked version:"; grep -m1 '^version = ' Cargo.toml
 
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
@@ -79,19 +95,21 @@ jobs:
           key: musl
 
       - name: Build (x86_64-unknown-linux-musl)
+        # Builds both bins: the gpu-arbiter daemon and the gpu-arbiter-tray companion.
         run: cargo build --release --target x86_64-unknown-linux-musl
 
-      - name: Stage binary
+      - name: Stage binaries
         run: |
           set -euo pipefail
-          install -D target/x86_64-unknown-linux-musl/release/gpu-arbiter \
-            dist/gpu-arbiter-x86_64-unknown-linux-musl
+          base=target/x86_64-unknown-linux-musl/release
+          install -D "$base/gpu-arbiter" dist/gpu-arbiter-x86_64-unknown-linux-musl
+          install -D "$base/gpu-arbiter-tray" dist/gpu-arbiter-tray-x86_64-unknown-linux-musl
 
-      - name: Upload binary artifact
+      - name: Upload binary artifacts
         uses: actions/upload-artifact@v7
         with:
           name: gpu-arbiter-musl
-          path: dist/gpu-arbiter-x86_64-unknown-linux-musl
+          path: dist/*
           if-no-files-found: error
 
   release:
@@ -101,20 +119,60 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download binary artifact
+      - name: Download binary artifacts
         uses: actions/download-artifact@v8
         with:
           name: gpu-arbiter-musl
           path: dist
 
-      - name: Decode release body
+      - name: Compose release body (install snippet + AI notes)
         env:
           BODY_B64: ${{ needs.prepare.outputs.release_body }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           # ai-release.yml emits a base64-encoded body to survive GitHub Actions'
-          # job-output character restrictions; decode before passing body_path.
-          echo "$BODY_B64" | base64 -d > /tmp/release_body.md
+          # job-output character restrictions; decode before use.
+          echo "$BODY_B64" | base64 -d > /tmp/ai_body.md
+
+          d=dist/gpu-arbiter-x86_64-unknown-linux-musl
+          t=dist/gpu-arbiter-tray-x86_64-unknown-linux-musl
+          sha_d=$(sha256sum "$d" | awk '{print $1}')
+          sha_t=$(sha256sum "$t" | awk '{print $1}')
+
+          # Prepend an install snippet: how to fetch the binaries and point the
+          # homelab-ansible desktop-common role at this exact release (version +
+          # checksum the role verifies on download).
+          {
+            echo "## Install"
+            echo ""
+            echo "Static \`x86_64-unknown-linux-musl\` binaries (no runtime deps). Daemon runs as root; the tray runs as a user service."
+            echo ""
+            echo '```bash'
+            echo "curl -fsSL -o gpu-arbiter https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/gpu-arbiter-x86_64-unknown-linux-musl"
+            echo "curl -fsSL -o gpu-arbiter-tray https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/gpu-arbiter-tray-x86_64-unknown-linux-musl"
+            echo '```'
+            echo ""
+            echo "### Ansible (desktop-common)"
+            echo ""
+            echo "Point the role at this release:"
+            echo ""
+            echo '```yaml'
+            echo "gpu_arbiter_install_method: fetch"
+            echo "gpu_arbiter_version: ${VERSION}"
+            echo "gpu_arbiter_binary_sha256: ${sha_d}"
+            echo "gpu_arbiter_tray_binary_sha256: ${sha_t}"
+            echo '```'
+            echo ""
+            echo "| Artifact | sha256 |"
+            echo "|----------|--------|"
+            echo "| \`gpu-arbiter-x86_64-unknown-linux-musl\` | \`${sha_d}\` |"
+            echo "| \`gpu-arbiter-tray-x86_64-unknown-linux-musl\` | \`${sha_t}\` |"
+            echo ""
+            echo "---"
+            echo ""
+          } > /tmp/release_body.md
+          cat /tmp/ai_body.md >> /tmp/release_body.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -123,7 +181,9 @@ jobs:
           name: Release ${{ needs.prepare.outputs.version }}
           body_path: /tmp/release_body.md
           make_latest: true
-          files: dist/gpu-arbiter-x86_64-unknown-linux-musl
+          files: |
+            dist/gpu-arbiter-x86_64-unknown-linux-musl
+            dist/gpu-arbiter-tray-x86_64-unknown-linux-musl
 
       - name: Write workflow summary
         env:
@@ -141,5 +201,5 @@ jobs:
             echo "| Tag | ${TAG} |"
             echo "| Previous | ${PREV} |"
             echo "| Bump | ${BUMP_TYPE} |"
-            echo "| Artifact | \`gpu-arbiter-x86_64-unknown-linux-musl\` |"
+            echo "| Artifacts | \`gpu-arbiter\` + \`gpu-arbiter-tray\` (x86_64-musl) |"
           } >> "$GITHUB_STEP_SUMMARY"
