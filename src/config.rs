@@ -1,11 +1,11 @@
 //! Daemon configuration: serde/TOML load + defaults.
 //!
-//! The field names below are the **TOML keys** the Ansible `config.toml.j2`
-//! template renders. They mirror the plan's `gpu_arbiter_*` Ansible-var keys
-//! one-to-one, minus the `gpu_arbiter_` prefix (the prefix only namespaces the
-//! Ansible vars; inside the daemon's own config file the namespace is the file
-//! itself). Every field is `#[serde(default)]` so a sparse config file (or none
-//! at all) still produces a valid, fully-defaulted [`Config`].
+//! The field names below are the **TOML keys** a deployment template renders.
+//! They mirror the `gpu_arbiter_*` variable names one-to-one, minus the
+//! `gpu_arbiter_` prefix (the prefix only namespaces the deployment vars; inside
+//! the daemon's own config file the namespace is the file itself). Every field
+//! is `#[serde(default)]` so a sparse config file (or none at all) still
+//! produces a valid, fully-defaulted [`Config`].
 //!
 //! Pure & cross-platform: parsing is a pure function, unit-tested on macOS with
 //! literal TOML strings.
@@ -31,7 +31,7 @@ pub struct GamePattern {
 
 /// The full daemon configuration. Field names are the TOML keys.
 ///
-/// Maps to the plan's Ansible vars (TOML key ← `gpu_arbiter_*`):
+/// Maps to the deployment variable names (TOML key ← `gpu_arbiter_*`):
 ///
 /// | TOML key | Ansible var |
 /// |---|---|
@@ -200,12 +200,11 @@ mod tests {
         assert_eq!(c.game_patterns[0].match_substr, "Heroic");
     }
 
-    /// Config contract guard: this is the **verbatim** output of the Ansible
-    /// `config.toml.j2` template rendered with `desktop-common`'s stock
-    /// `defaults/main.yaml` (plus two `game_patterns` exercising the loop and
-    /// the `\`/`"` escaping). If the daemon's serde schema and the rendered
-    /// file ever drift apart, this parse fails — keeping the cross-repo contract
-    /// honest. Regenerate from the template, do not hand-edit.
+    /// Config contract guard: this is the **verbatim** output of a deployment
+    /// template rendered with stock defaults (plus two `game_patterns` exercising
+    /// the loop and the `\`/`"` escaping). If the daemon's serde schema and the
+    /// rendered file ever drift apart, this parse fails — keeping the
+    /// deployment contract honest. Regenerate from the template, do not hand-edit.
     #[test]
     fn parses_rendered_ansible_template() {
         let rendered = r#"# Managed by Ansible - DO NOT EDIT MANUALLY

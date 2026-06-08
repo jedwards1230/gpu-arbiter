@@ -1,8 +1,8 @@
 # Single-file release pipeline (modeled on jedwards1230/my-wiki's release.yml).
 #
 # Triggered on push to main (or manual dispatch). A `detect` job reads the merged
-# PR's semver label — releases are OPT-IN per .claude/rules/release-conventions.md:
-# no `semver:patch|minor|major` label → no release (no patch default). When a
+# PR's semver label — releases are OPT-IN: the merged PR must carry a semver:patch|minor|major label.
+# No matching label → no release (no patch default). When a
 # release is warranted it delegates version compute, tag creation, and AI release
 # notes to the shared jedwards1230/release-workflows/ai-release.yml@v0, then
 # cross-builds the static musl binaries (daemon + tray) and publishes the Release.
@@ -225,8 +225,8 @@ jobs:
           sha_d=$(sha256sum "$d" | awk '{print $1}')
           sha_t=$(sha256sum "$t" | awk '{print $1}')
 
-          # Prepend an install snippet: how to fetch the binaries and point the
-          # homelab-ansible desktop-common role at this exact release (version +
+          # Prepend an install snippet: how to fetch the binaries and point your
+          # deployment tooling (e.g. Ansible) at this exact release (version +
           # checksum the role verifies on download).
           {
             echo "## Install"
@@ -238,9 +238,9 @@ jobs:
             echo "curl -fsSL -o gpu-arbiter-tray https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/gpu-arbiter-tray-x86_64-unknown-linux-musl"
             echo '```'
             echo ""
-            echo "### Ansible (desktop-common)"
+            echo "### Ansible (example)"
             echo ""
-            echo "Point the role at this release:"
+            echo "Point your deployment tooling at this release:"
             echo ""
             echo '```yaml'
             echo "gpu_arbiter_install_method: fetch"

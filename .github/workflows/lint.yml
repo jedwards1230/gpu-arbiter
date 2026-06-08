@@ -1,4 +1,4 @@
-# Non-Rust lint (matches game-shell's split: Rust quality lives in rust.yml,
+# Non-Rust lint (two-file lint/build split: Rust quality lives in rust.yml,
 # everything else here). The Rust crate is the whole repo, so the only non-Rust
 # surface is the GitHub Actions workflows themselves — lint them with actionlint
 # so a malformed workflow is caught before it silently no-ops.

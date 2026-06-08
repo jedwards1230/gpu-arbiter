@@ -90,7 +90,7 @@ pub struct OllamaStatus {
 
 /// The `/status` payload, serialized verbatim for remote machines + dashboards.
 ///
-/// Matches the plan's JSON shape:
+/// JSON shape:
 /// ```json
 /// {
 ///   "state": "gaming",
@@ -271,7 +271,7 @@ mod tests {
     fn format_rfc3339_known_timestamps() {
         // Epoch.
         assert_eq!(format_rfc3339(at(0)), "1970-01-01T00:00:00Z");
-        // 2026-06-07T20:00:00Z — the plan doc's example `since`.
+        // 2026-06-07T20:00:00Z — a known reference timestamp used in tests.
         // (days from epoch to 2026-06-07 = 20611; *86400 + 20h.)
         assert_eq!(
             format_rfc3339(at(20611 * 86_400 + 20 * 3600)),
