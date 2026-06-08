@@ -1,65 +1,137 @@
-# Cross-build the static gpu-arbiter binaries (daemon + tray), generate AI
-# release notes, and attach the binaries + their sha256 checksums to a GitHub
-# Release.
+# Single-file release pipeline (modeled on jedwards1230/my-wiki's release.yml).
 #
-# Version compute, tag creation, and AI release notes are delegated to the shared
-# jedwards1230/release-workflows/.github/workflows/ai-release.yml@v0 (see
-# home-orchestration .claude/rules/release-conventions.md). The git tag is the
-# single source of truth: the build job stamps the computed version into the
-# TAGGED checkout's Cargo.toml (sed) before building, so CARGO_PKG_VERSION — and
-# therefore `--version` and the `/status` `version` field — match the release.
-# That edit lives only in the ephemeral tagged checkout; nothing is pushed to main.
+# Triggered on push to main (or manual dispatch). A `detect` job reads the merged
+# PR's semver label — releases are OPT-IN per .claude/rules/release-conventions.md:
+# no `semver:patch|minor|major` label → no release (no patch default). When a
+# release is warranted it delegates version compute, tag creation, and AI release
+# notes to the shared jedwards1230/release-workflows/ai-release.yml@v0, then
+# cross-builds the static musl binaries (daemon + tray) and publishes the Release.
 #
-# Triggered by auto-release.yml on a labelled PR merge, or manually via dispatch.
+# This replaces the earlier two-file auto-release.yml + release.yml pattern: a
+# `pull_request`-triggered workflow calling a *local* reusable workflow that in
+# turn called a *remote* reusable workflow fails GitHub's startup validation. A
+# single push-triggered workflow calling the remote reusable directly (my-wiki's
+# proven shape) avoids that.
+#
+# The git tag is the single source of truth: the build job stamps the computed
+# version into the TAGGED checkout's Cargo.toml (sed) before building, so
+# CARGO_PKG_VERSION — and thus `--version` and `/status.version` — match the
+# release. That edit lives only in the ephemeral tagged checkout; nothing is
+# pushed back to main.
 
 name: Release
 
-run-name: "Release ${{ inputs.version_override || format('{0} bump', inputs.bump_type) }}"
+run-name: >-
+  ${{
+    github.event_name == 'workflow_dispatch'
+      && format('Release: {0}{1}', inputs.dry_run && 'dry-run ' || '', inputs.bump_type)
+      || format('Release: {0}', github.event.head_commit.message || github.sha)
+  }}
 
 on:
-  workflow_call:
-    inputs:
-      bump_type:
-        required: true
-        type: string
-      version_override:
-        required: false
-        type: string
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       bump_type:
         description: "Version bump type"
-        required: false
-        default: patch
+        required: true
         type: choice
         options:
           - patch
           - minor
           - major
-      version_override:
-        description: "Version override (e.g. 1.2.3)"
+        default: patch
+      dry_run:
+        description: "Compute version + preview notes without tagging or publishing"
         required: false
-        type: string
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
+  detect:
+    name: Detect bump type
+    runs-on: ubuntu-latest
+    outputs:
+      bump_type: ${{ steps.bump.outputs.type }}
+      dry_run: ${{ steps.bump.outputs.dry_run }}
+      release: ${{ steps.bump.outputs.release }}
+    steps:
+      - name: Determine bump type
+        id: bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Resolve TYPE / DRY / RELEASE into shell vars, then write all three
+          # outputs in one grouped redirect at the end (shellcheck SC2129).
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual dispatch: use the provided inputs.
+            TYPE="${{ inputs.bump_type }}"
+            DRY="${{ inputs.dry_run }}"
+            RELEASE="true"
+          else
+            # Push to main: opt-in via the merged PR's semver label. No label → no
+            # release (chore merges make no noise). Retry — the GitHub API may not
+            # have the merge commit indexed the instant the push event fires.
+            LABELS=""
+            for attempt in 1 2 3; do
+              LABELS=$(gh pr list --state merged --base main --limit 100 \
+                --json labels,mergeCommit \
+                | jq -r --arg sha "$GITHUB_SHA" \
+                  '.[] | select(.mergeCommit.oid == $sha) | .labels[].name' 2>/dev/null || echo "")
+              if [ -n "$LABELS" ]; then break; fi
+              echo "Attempt ${attempt}: no labels for ${GITHUB_SHA} yet, retrying in 5s..."
+              sleep 5
+            done
+            echo "Labels for ${GITHUB_SHA}: ${LABELS:-<none>}"
+
+            DRY="false"
+            if echo "$LABELS" | grep -q 'semver:major'; then
+              TYPE="major"; RELEASE="true"
+            elif echo "$LABELS" | grep -q 'semver:minor'; then
+              TYPE="minor"; RELEASE="true"
+            elif echo "$LABELS" | grep -q 'semver:patch'; then
+              TYPE="patch"; RELEASE="true"
+            else
+              TYPE="none"; RELEASE="false"
+              echo "::notice::no semver:* label on the merged PR — skipping release"
+            fi
+          fi
+
+          {
+            echo "type=$TYPE"
+            echo "dry_run=$DRY"
+            echo "release=$RELEASE"
+          } >> "$GITHUB_OUTPUT"
+
   prepare:
     name: Tag & Generate Notes
+    needs: [detect]
+    if: needs.detect.outputs.release == 'true'
     uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@v0
     with:
       service_name: gpu-arbiter
       service_description: "a root daemon that evicts Ollama from the GPU when a game launches and restores it when gaming ends"
-      bump_type: ${{ inputs.bump_type }}
-      version_override: ${{ inputs.version_override }}
+      bump_type: ${{ needs.detect.outputs.bump_type }}
+      dry_run: ${{ needs.detect.outputs.dry_run == 'true' }}
       create_release: false
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
   build:
     name: Build static binaries
-    needs: [prepare]
+    needs: [detect, prepare]
+    if: needs.detect.outputs.release == 'true' && needs.detect.outputs.dry_run != 'true'
     runs-on: ubuntu-latest
     container: rust:1-bookworm
     permissions:
@@ -114,7 +186,8 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [prepare, build]
+    needs: [detect, prepare, build]
+    if: needs.detect.outputs.release == 'true' && needs.detect.outputs.dry_run != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
