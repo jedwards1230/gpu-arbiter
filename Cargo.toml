@@ -39,7 +39,9 @@ axum = "0.8"
 
 # cn_proc process-event connector lives behind a Linux-only netlink socket, so
 # neli is only pulled on Linux — macOS dev boxes never compile it. The
-# `connector` module + `tokio` feature give async-native `recv` over the
-# CN_IDX_PROC multicast group.
+# `connector` module is always available; the `async` feature (which itself
+# enables tokio + parking_lot) is what unlocks `socket::asynchronous` for the
+# async-native `recv` over the CN_IDX_PROC multicast group. (The bare `tokio`
+# feature only pulls the optional dep — it does NOT expose the async socket.)
 [target.'cfg(target_os = "linux")'.dependencies]
-neli = { version = "0.7", features = ["tokio"] }
+neli = { version = "0.7", features = ["async"] }

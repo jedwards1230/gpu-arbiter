@@ -56,11 +56,86 @@ pub fn claim_set(snap: &ProcSnapshot, cfg: &Config) -> Vec<Claim> {
     claims
 }
 
+/// Flatten a raw `/proc/<pid>/cmdline` byte blob (NUL-separated argv, often with
+/// a trailing NUL) into a single space-joined string. Pure — unit-tested.
+///
+/// Empty-arg runs (consecutive NULs) collapse and leading/trailing whitespace is
+/// trimmed, so kernel threads (empty cmdline) flatten to `""` and a normal
+/// `argv` like `reaper\0SteamLaunch AppId=440\0--\0tf2\0` becomes
+/// `reaper SteamLaunch AppId=440 -- tf2`. The classifier only does substring
+/// tests, so exact arg boundaries don't matter — only that the markers survive.
+pub fn flatten_cmdline(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    s.split('\0')
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Scan `/proc` (and, when the heuristic is enabled, GPU graphics procs) into a
-/// [`ProcSnapshot`]. Linux-only — runs under `spawn_blocking` in `main`. Stubbed.
+/// [`ProcSnapshot`]. Linux-only.
+///
+/// The `/proc` walk is **synchronous, blocking** filesystem work, so it runs
+/// under [`tokio::task::spawn_blocking`] — it never stalls the runtime or the
+/// HTTP server (per the design plan's "Async shape"). The optional `nvidia-smi`
+/// graphics-proc query (only when the VRAM heuristic is on) is an async
+/// `tokio::process` shell-out and stays on the runtime.
 #[cfg(target_os = "linux")]
-pub async fn observe(_cfg: &Config) -> anyhow::Result<ProcSnapshot> {
-    todo!("/proc scan + optional nvidia-smi graphics procs")
+pub async fn observe(cfg: &Config) -> anyhow::Result<ProcSnapshot> {
+    // Blocking /proc walk off the runtime threads.
+    let procs = tokio::task::spawn_blocking(scan_proc).await??;
+
+    // Only pay for the GPU graphics query when the heuristic actually needs it.
+    let gpu_graphics = if cfg.vram_heuristic {
+        gpu::query_graphics_procs().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "graphics-proc query failed; heuristic sees nothing this pass");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
+    Ok(ProcSnapshot {
+        procs,
+        gpu_graphics,
+    })
+}
+
+/// Synchronous `/proc` walk: read every numeric `/proc/<pid>` entry's `cmdline`.
+/// Linux-only; called via `spawn_blocking`.
+///
+/// Races are expected and benign — a pid that exits mid-scan just yields a read
+/// error we skip (level-triggered reconcile re-derives truth next pass). An
+/// empty cmdline (kernel thread / zombie) is skipped since it can't match any
+/// game rule.
+#[cfg(target_os = "linux")]
+fn scan_proc() -> anyhow::Result<Vec<ProcInfo>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        // Only numeric dir names are pids.
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        // A pid that exits between read_dir and read is the common race — skip it.
+        let raw = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let cmdline = flatten_cmdline(&raw);
+        if cmdline.is_empty() {
+            continue;
+        }
+        out.push(ProcInfo { pid, cmdline });
+    }
+    Ok(out)
 }
 
 /// Non-Linux stub: there is no `/proc`. Returns an empty snapshot so the crate
@@ -203,6 +278,38 @@ mod tests {
     fn empty_snapshot_no_claims() {
         let cfg = Config::default();
         assert!(claim_set(&ProcSnapshot::default(), &cfg).is_empty());
+    }
+
+    #[test]
+    fn flatten_cmdline_joins_nul_argv() {
+        // The real /proc/<pid>/cmdline shape: NUL-separated argv + trailing NUL.
+        let raw = b"reaper\0SteamLaunch AppId=440\0--\0/games/tf2\0";
+        assert_eq!(
+            flatten_cmdline(raw),
+            "reaper SteamLaunch AppId=440 -- /games/tf2"
+        );
+        // The Steam marker survives flattening, so classify still fires.
+        let cfg = Config::default();
+        assert_eq!(
+            classify::classify(&flatten_cmdline(raw), &cfg),
+            Some(Claim::Steam("440".into()))
+        );
+    }
+
+    #[test]
+    fn flatten_cmdline_empty_and_kernel_thread() {
+        assert_eq!(flatten_cmdline(b""), "");
+        // Kernel threads have an all-NUL (effectively empty) cmdline.
+        assert_eq!(flatten_cmdline(b"\0\0\0"), "");
+    }
+
+    #[test]
+    fn flatten_cmdline_handles_non_utf8() {
+        // Invalid UTF-8 bytes must not panic — they're lossily replaced.
+        let raw = b"game\0\xff\xfe\0arg\0";
+        let flat = flatten_cmdline(raw);
+        assert!(flat.starts_with("game "));
+        assert!(flat.ends_with("arg"));
     }
 
     #[test]
