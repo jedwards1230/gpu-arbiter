@@ -1,0 +1,30 @@
+# Claude PR review — calls the shared reusable workflow in
+# jedwards1230/release-workflows, which runs claude-code-action@v1 in Haiku
+# PR-review mode with the public jedwards1230-plugins marketplace + review-team
+# plugin enabled by default. The focus below is appended to the base prompt.
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  review:
+    uses: jedwards1230/release-workflows/.github/workflows/claude-pr-review.yml@v1
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    with:
+      focus: |
+        gpu-arbiter is a Rust daemon that arbitrates GPU access across clients.
+        - Concurrency: races, deadlocks, and lease/lock leaks around GPU device
+          arbitration and client lifecycle. Cleanup on client disconnect.
+        - Rust correctness: unwrap()/expect()/panic! on fallible paths in the
+          daemon loop; error propagation; unchecked Option/Result.
+        - IPC/socket input handling: unvalidated/untrusted client requests.
+        Do NOT re-flag rustfmt/clippy findings — CI lints already own those.
