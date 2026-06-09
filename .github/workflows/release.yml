@@ -4,7 +4,7 @@
 # PR's semver label — releases are OPT-IN: the merged PR must carry a semver:patch|minor|major label.
 # No matching label → no release (no patch default). When a
 # release is warranted it delegates version compute, tag creation, and AI release
-# notes to the shared jedwards1230/release-workflows/ai-release.yml@v0, then
+# notes to the shared jedwards1230/release-workflows/ai-release.yml@v1, then
 # cross-builds the static musl binaries (daemon + tray) and publishes the Release.
 #
 # This replaces the earlier two-file auto-release.yml + release.yml pattern: a
@@ -54,7 +54,7 @@ concurrency:
 
 permissions:
   contents: write
-  # ai-release.yml@v0 reads merged PRs for the changelog, and the detect job below
+  # ai-release.yml@v1 reads merged PRs for the changelog, and the detect job below
   # runs `gh pr list` — both need pull-requests:read. Without it the reusable call
   # fails GitHub's startup validation ("requesting 'pull-requests: read', but only
   # allowed 'pull-requests: none'"). A restricted `permissions:` block defaults
@@ -124,7 +124,7 @@ jobs:
     name: Tag & Generate Notes
     needs: [detect]
     if: needs.detect.outputs.release == 'true'
-    uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@v0
+    uses: jedwards1230/release-workflows/.github/workflows/ai-release.yml@v1
     with:
       service_name: gpu-arbiter
       service_description: "a root daemon that evicts Ollama from the GPU when a game launches and restores it when gaming ends"
