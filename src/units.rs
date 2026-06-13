@@ -173,7 +173,10 @@ pub async fn loaded_models(unit: &ManagedUnit) -> Vec<String> {
 /// as a reported name. The command string is split on whitespace into an argv and
 /// run **shell-free** (no shell, no quoting, no expansion) — the first token is
 /// the program, the rest are arguments. Best-effort + bounded: a blank command, a
-/// spawn failure, a non-zero exit, or a timeout all yield an empty vec.
+/// spawn failure, or a non-zero exit all yield an empty vec. The call is bounded
+/// to `SYSTEMCTL_TIMEOUT` (10s) — a custom introspection command that runs longer
+/// is killed and silently yields an empty vec, so it must be fast (it runs on the
+/// `/status` refresh path under the reconcile task).
 async fn run_introspect_cmd(cmd: &str) -> Vec<String> {
     let mut argv = cmd.split_whitespace();
     let Some(program) = argv.next() else {

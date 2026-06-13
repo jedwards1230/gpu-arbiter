@@ -150,20 +150,34 @@ list. The only recognized value is
 which runs
 .B "ollama ps"
 and parses its table for loaded model names. Any other non\-empty value reports
-no models (an explicit non\-Ollama kind suppresses the name heuristic). When
+.B no
+models and
+.B suppresses
+the name\-based back\-compat heuristic below: an explicit non\-Ollama
+.B kind
+is taken as "this tenant is not Ollama", so e.g.\&
+.B "kind = ""vllm"""
+on a unit named
+.I ollama.service
+will
+.B not
+run
+.BR "ollama ps" .
+The back\-compat heuristic applies
+.B only
+when
 .B kind
 is unset
 .B and
 .B introspect_cmd
-is unset, a
-.B back\-compat heuristic
-applies: a
+is unset: a
 .B unit
 name containing
 .I ollama
-(case\-insensitive) is treated as
+(case\-insensitive) is then treated as
 .BR """ollama""" .
-Ignored when
+.B kind
+is ignored entirely when
 .B introspect_cmd
 is set.
 .TP
@@ -177,19 +191,36 @@ an
 and run
 .B shell\-free
 (no shell, no quoting, no globbing, no variable expansion): the first token is
-the program, the rest are arguments. When set, it
+the program, the rest are arguments. When set to a non\-blank value, it
 .B takes precedence
 over
 .B kind
-and the name heuristic. Best\-effort: a missing binary, a non\-zero exit, an empty
-command, or a query timeout yields no models (never an error).
+and the name heuristic. A
+.B blank or whitespace\-only
+value is treated as
+.B unset
+and falls through to the next precedence level
+.RB ( kind ,
+then the name heuristic). Best\-effort: a missing binary, a non\-zero exit, an
+empty argv, or a query timeout yields no models (never an error). The command is
+.B bounded to 10 seconds
+(the shared
+.I SYSTEMCTL_TIMEOUT );
+a custom introspection command that runs longer is killed and silently yields an
+empty list, so keep it fast.
 .SH INTROSPECTION RESOLUTION
 For each managed unit, the
 .B models[]
-backend is resolved purely, in this order:
+backend is resolved purely, taking the
+.B first
+matching rule in this order:
 .IP 1. 4
 .B introspect_cmd
-set and non\-blank \(rA run that argv, one name per stdout line.
+is set and non\-blank \(rA run that argv, one name per stdout line.
+.RB ( A
+blank/whitespace\-only value does
+.B not
+match here; it is treated as unset and resolution continues.)
 .IP 2. 4
 else
 .B kind
@@ -200,20 +231,36 @@ else
 .IP 3. 4
 else
 .B kind
+is set to any
+.B other
+(non\-"ollama") value \(rA report
+.B no
+models. An explicit non\-Ollama
+.B kind
+.B suppresses
+the name heuristic in step 4, even for a unit named
+.IR ollama.service .
+.IP 4. 4
+else
+.RB ( kind
 unset
 .B and
+.B introspect_cmd
+unset) \(rA name heuristic: if the
 .B unit
 name contains
 .I ollama
-\(rA run
-.BR "ollama ps" .
-.IP 4. 4
-else \(rA report no models.
+(case\-insensitive), run
+.BR "ollama ps" ;
+otherwise report no models.
 .PP
 This preserves the original Ollama behavior as the default for an
-Ollama\-kinded or Ollama\-named unit, while letting any other tenant report a
-model/process list via
-.BR introspect_cmd .
+Ollama\-kinded or Ollama\-named unit (steps 2 and 4), while letting any other
+tenant report a model/process list via
+.B introspect_cmd
+(step 1) and letting an explicit non\-Ollama
+.B kind
+opt out of Ollama introspection entirely (step 3).
 .SH EXAMPLES
 A two\-tenant config where Ollama and an ASR runner both yield to gaming, the ASR
 runner reporting its own process list via an explicit command:
