@@ -488,6 +488,25 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
     }
 
     #[test]
+    fn introspection_overlong_command_falls_through() {
+        use crate::config::MAX_INTROSPECT_CMD_LEN;
+        // An over-length introspect_cmd (operator typo / garbage) is treated as
+        // unset, exactly like a blank string: resolution falls through to `kind`.
+        let huge = "x".repeat(MAX_INTROSPECT_CMD_LEN + 1);
+        let u = unit("asr.service", Some("ollama"), Some(&huge));
+        assert_eq!(u.introspection(), Introspection::Ollama);
+        // ...and to the name heuristic when kind is also unset.
+        let u2 = unit("ollama.service", None, Some(&huge));
+        assert_eq!(u2.introspection(), Introspection::Ollama);
+        let u3 = unit("plain.service", None, Some(&huge));
+        assert_eq!(u3.introspection(), Introspection::None);
+        // Exactly at the limit is still accepted (boundary: `<=`).
+        let at_limit = "x".repeat(MAX_INTROSPECT_CMD_LEN);
+        let u4 = unit("plain.service", None, Some(&at_limit));
+        assert_eq!(u4.introspection(), Introspection::Command(at_limit));
+    }
+
+    #[test]
     fn introspection_kind_ollama_selects_ollama() {
         let u = unit("anything.service", Some("ollama"), None);
         assert_eq!(u.introspection(), Introspection::Ollama);

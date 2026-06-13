@@ -34,6 +34,17 @@ fn default_true() -> bool {
     true
 }
 
+/// Maximum accepted length (in bytes) of an [`ManagedUnit::introspect_cmd`]. A
+/// value longer than this is treated as **unset** (resolution falls through to the
+/// next precedence level, just like a blank string), never run.
+///
+/// This is a footgun guard, not a security control: the config is root-owned and
+/// the daemon runs as root, so there's no untrusted input path. The bound exists
+/// purely so an operator *typo* producing a giant string can't silently overrun
+/// the OS argv limit (`ARG_MAX`, ~128 KiB) and fail in a confusing way. A real
+/// argv is far below 1 KiB.
+pub const MAX_INTROSPECT_CMD_LEN: usize = 1024;
+
 /// How a [`ManagedUnit`]'s loaded-model list (for `/status` `models[]`) is
 /// obtained. Resolved purely from the unit's config — see
 /// [`ManagedUnit::introspection`].
@@ -87,6 +98,11 @@ pub struct ManagedUnit {
     /// dropped — become the reported names verbatim. When set, it takes precedence
     /// over `kind` and the name heuristic. Best-effort: a missing binary, non-zero
     /// exit, or empty argv yields no models (never an error).
+    ///
+    /// Capped at [`MAX_INTROSPECT_CMD_LEN`] (1024) bytes: a blank/whitespace-only
+    /// **or** over-length value is treated as unset (falls through to the next
+    /// precedence level) — a footgun guard against an operator typo overrunning
+    /// the OS argv limit.
     #[serde(default)]
     pub introspect_cmd: Option<String>,
 }
@@ -95,7 +111,8 @@ impl ManagedUnit {
     /// Resolve which introspection backend supplies this unit's `/status`
     /// `models[]` list. Pure — unit-tested. Precedence:
     ///
-    /// 1. `introspect_cmd` set (non-blank) → [`Introspection::Command`].
+    /// 1. `introspect_cmd` set, non-blank, and `<= MAX_INTROSPECT_CMD_LEN` →
+    ///    [`Introspection::Command`].
     /// 2. else `kind == "ollama"` → [`Introspection::Ollama`].
     /// 3. else `kind` unset **and** the `unit` name contains `ollama`
     ///    (case-insensitive back-compat heuristic) → [`Introspection::Ollama`].
@@ -104,9 +121,14 @@ impl ManagedUnit {
     /// A `kind` that is `Some(non-"ollama")` deliberately suppresses the name
     /// heuristic (an explicit non-Ollama kind means "no Ollama introspection"),
     /// reporting [`Introspection::None`].
+    ///
+    /// A blank/whitespace-only **or** over-length (`> MAX_INTROSPECT_CMD_LEN`)
+    /// `introspect_cmd` is treated as unset — resolution falls through to `kind`
+    /// and the name heuristic rather than running a bogus command.
     pub fn introspection(&self) -> Introspection {
         if let Some(cmd) = &self.introspect_cmd
             && !cmd.trim().is_empty()
+            && cmd.len() <= MAX_INTROSPECT_CMD_LEN
         {
             return Introspection::Command(cmd.clone());
         }

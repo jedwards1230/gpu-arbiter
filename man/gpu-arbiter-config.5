@@ -177,9 +177,12 @@ name containing
 (case\-insensitive) is then treated as
 .BR """ollama""" .
 .B kind
-is ignored entirely when
+is bypassed entirely when
 .B introspect_cmd
-is set.
+is non\-blank \(em the precedence short\-circuits at
+.B introspect_cmd
+and never evaluates
+.BR kind .
 .TP
 .B introspect_cmd
 String. Default: none. An explicit command whose standard output lists the
@@ -191,18 +194,35 @@ an
 and run
 .B shell\-free
 (no shell, no quoting, no globbing, no variable expansion): the first token is
-the program, the rest are arguments. When set to a non\-blank value, it
+the program, the rest are arguments.
+.B Warning:
+because parsing is plain whitespace splitting with no quoting, an argument that
+.B contains a space cannot be represented
+\(em a path such as
+.I "/path/with spaces/file"
+is split into the two separate tokens
+.I /path/with
+and
+.I spaces/file
+and the command will fail. Do not use embedded spaces in the program path or any
+argument.
+.PP
+When set to a non\-blank value within the length limit, it
 .B takes precedence
 over
 .B kind
 and the name heuristic. A
-.B blank or whitespace\-only
-value is treated as
+.B blank, whitespace\-only, or over\-length
+value (longer than
+.B 1024
+bytes) is treated as
 .B unset
 and falls through to the next precedence level
 .RB ( kind ,
-then the name heuristic). Best\-effort: a missing binary, a non\-zero exit, an
-empty argv, or a query timeout yields no models (never an error). The command is
+then the name heuristic). The 1024\-byte cap is a footgun guard against an
+operator typo overrunning the OS argv limit; a real command is far shorter.
+Best\-effort: a missing binary, a non\-zero exit, an empty argv, or a query timeout
+yields no models (never an error). The command is
 .B bounded to 10 seconds
 (the shared
 .I SYSTEMCTL_TIMEOUT );
