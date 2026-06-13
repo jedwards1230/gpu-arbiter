@@ -1,0 +1,146 @@
+.TH GPU-ARBITER 1 "June 2026" "gpu-arbiter" "User Commands"
+.SH NAME
+gpu\-arbiter \- gaming\-first GPU arbiter daemon
+.SH SYNOPSIS
+.B gpu\-arbiter
+.RB [ \-\-version | \-V ]
+.RB [ \-\-help | \-h ]
+.SH DESCRIPTION
+.B gpu\-arbiter
+is a Linux root daemon for a workstation that is a
+.B gaming PC first, AI workstation second.
+It detects game launches and instantly evicts GPU tenants (such as Ollama and
+other managed systemd units) from the GPU so the game has the card to itself,
+then restores those tenants when gaming ends. An HTTP
+.B /status
+endpoint lets other machines tell whether the box is currently free for AI work.
+.PP
+The daemon takes
+.B no runtime arguments
+beyond the informational flags below. It reads all of its settings from a TOML
+config file (see
+.BR gpu-arbiter-config (5) );
+a missing file yields built\-in defaults, so the daemon is usable with zero
+configuration.
+.SH OPTIONS
+.TP
+.BR \-\-version ", " \-V
+Print the program name and version (the
+.B CARGO_PKG_VERSION
+baked from the git tag at release build time) to standard output and exit 0.
+Handled before any runtime setup, so it works even on the non\-Linux stub build.
+.TP
+.BR \-\-help ", " \-h
+Print a short usage summary \(em including the config path and the fact that the
+daemon takes no runtime arguments \(em to standard output and exit 0.
+.SH DETECTION AND EVICTION MODEL
+Control is
+.B level\-triggered reconciliation
+(the Kubernetes controller pattern): a reconcile pass observes ground truth (a
+.I /proc
+scan plus, optionally, the GPU's compute processes), recomputes the set of game
+"claims", and drives the managed units accordingly. State is never
+delta\-maintained, so it self\-heals across crashes, restarts, and dropped events.
+.PP
+Reconcile passes are driven by three sources:
+.TP
+.B cn_proc events
+The kernel process\-event connector (netlink) reports fork/exec/exit. A launch
+fires a debounced reconcile within milliseconds. Locally launched and
+Moonlight\-streamed games are both just local processes, so both are detected.
+.TP
+.B A periodic backstop timer
+A slow interval (default 30 s) reconciles regardless, covering any dropped
+netlink events.
+.TP
+.B Startup
+A synchronous reconcile runs before anything else can drive the managed units,
+so a daemon restart or host boot never starts a GPU tenant into a live game.
+.PP
+Detection rules: every Steam game runs under
+.I "reaper SteamLaunch AppId=<id>"
+and yields a
+.I steam:<appid>
+claim (zero config, covers all Steam games). Non\-Steam launchers are matched by
+configured cmdline substrings
+.RI ( game_patterns ).
+An opt\-in VRAM heuristic can additionally flag heavy, non\-allowlisted
+.B graphics
+GPU processes as games.
+.PP
+Eviction of each managed unit runs the same bounded loop, in the configured
+order:
+.B systemctl stop
+the unit, then poll
+.B nvidia-smi
+until VRAM\-used drops below the free threshold (graceful release) or the
+eviction timeout elapses. On timeout, if the unit is already inactive its VRAM
+is already released and the release is treated as graceful; otherwise the unit
+is force\-killed with
+.B "systemctl kill -s SIGKILL"
+and the daemon proceeds regardless \(em gaming wins the GPU unconditionally and a
+game launch must never hang waiting on a tenant.
+.SH HTTP CONTROL SURFACE
+A single HTTP port (default 48750) is bound on 0.0.0.0 and restricted to the LAN
+by a firewalld rich rule. The override endpoints under
+.I /units/*
+(and the
+.I /ollama/*
+back\-compat alias) are additionally localhost\-only.
+.TP
+.B GET /status
+Full state snapshot: overall state
+.RI ( gaming " | " available " | " evicting ),
+active claims, a per\-managed\-unit array (running flag, reported
+.B models[]
+list, attributed VRAM), an
+.I ollama
+back\-compat alias block, and total GPU memory.
+.TP
+.B GET /metrics
+Prometheus text\-format exposition.
+.TP
+.B GET /healthz
+Liveness probe.
+.TP
+.B "POST /units/{unit}/start, /units/{unit}/stop"
+Manual override for debugging.
+.I {unit}
+must be one of the configured managed units; an unknown unit is rejected with
+404. Localhost\-only.
+.TP
+.B "POST /ollama/start, /ollama/stop"
+Back\-compat alias for the first managed unit. Localhost\-only.
+.SH FILES
+.TP
+.I /etc/gpu-arbiter/config.toml
+Daemon configuration. Missing file \(rA built\-in defaults. See
+.BR gpu-arbiter-config (5).
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Tracing/log filter (e.g.\&
+.IR info ", " debug ).
+Defaults to
+.I info
+when unset.
+.SH EXIT STATUS
+.TP
+.B 0
+Normal: informational flag handled, or
+.B enabled = false
+in config (the daemon logs and exits cleanly).
+.TP
+.B 1
+Run on a non\-Linux host (the daemon requires the cn_proc netlink connector,
+.IR /proc ", " nvidia-smi ", and " systemctl ).
+.PP
+SIGTERM (systemd stop) and SIGINT (Ctrl\-C) trigger a graceful shutdown.
+.SH NOTES
+The daemon runs only on Linux. The crate still builds and unit\-tests on any host
+(including macOS) via a library/stub split; the pure decision logic is
+cross\-platform and tested with literal inputs.
+.SH SEE ALSO
+.BR gpu-arbiter-config (5),
+.BR systemctl (1),
+.BR nvidia-smi (1)

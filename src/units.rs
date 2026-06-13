@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::config::{Config, Introspection, ManagedUnit};
 use crate::gpu::{self, GpuMemory};
 
 /// Managed-unit control errors.
@@ -145,13 +145,68 @@ pub async fn is_running(unit: &str) -> Result<bool, UnitError> {
     Ok(out.status.success())
 }
 
-/// Best-effort list of loaded Ollama model names (for `/status`).
+/// Best-effort list of loaded model/process names for a managed unit (for the
+/// `/status` `models[]` field).
 ///
-/// Ollama-specific (`ollama ps`); the reconcile loop only calls this for units
-/// it recognizes as Ollama. Returns an empty vec when Ollama is not running, the
-/// `ollama` CLI is absent, or the query fails — never an error (purely
-/// informational, must not break a `/status` response).
-pub async fn ollama_loaded_models() -> Vec<String> {
+/// Generic over the tenant: the backend is resolved purely from the unit's config
+/// (see [`ManagedUnit::introspection`]):
+///
+/// - [`Introspection::Command`] → run the configured `introspect_cmd` as a
+///   shell-free argv and turn each non-empty trimmed stdout line into a name.
+/// - [`Introspection::Ollama`] → run `ollama ps` and parse it with
+///   [`parse_ollama_ps`] (the original Ollama behavior, preserved as the default
+///   for an `ollama`-kinded or `ollama`-named unit).
+/// - [`Introspection::None`] → empty vec (no model reporting for this unit).
+///
+/// Best-effort + bounded throughout: a missing binary, failed/empty query,
+/// non-zero exit, or non-systemd host yields an empty vec — **never** an error or
+/// panic (purely informational, must not break a `/status` response).
+pub async fn loaded_models(unit: &ManagedUnit) -> Vec<String> {
+    match unit.introspection() {
+        Introspection::Command(cmd) => run_introspect_cmd(&cmd).await,
+        Introspection::Ollama => ollama_loaded_models().await,
+        Introspection::None => Vec::new(),
+    }
+}
+
+/// Run a configured `introspect_cmd` and parse each non-empty trimmed stdout line
+/// as a reported name. The command string is split on whitespace into an argv and
+/// run **shell-free** (no shell, no quoting, no expansion) — the first token is
+/// the program, the rest are arguments. Best-effort + bounded: a blank command, a
+/// spawn failure, or a non-zero exit all yield an empty vec. The call is bounded
+/// to `SYSTEMCTL_TIMEOUT` (10s) — a custom introspection command that runs longer
+/// is killed and silently yields an empty vec, so it must be fast (it runs on the
+/// `/status` refresh path under the reconcile task).
+async fn run_introspect_cmd(cmd: &str) -> Vec<String> {
+    let mut argv = cmd.split_whitespace();
+    let Some(program) = argv.next() else {
+        return Vec::new();
+    };
+    let fut = tokio::process::Command::new(program).args(argv).output();
+    match tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut).await {
+        Ok(Ok(out)) if out.status.success() => {
+            parse_model_lines(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Parse generic `introspect_cmd` stdout into names: one name per non-empty line,
+/// trimmed, empties dropped. Pure — unit-tested.
+pub fn parse_model_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Best-effort list of loaded Ollama model names via `ollama ps`.
+///
+/// Returns an empty vec when Ollama is not running, the `ollama` CLI is absent,
+/// or the query fails — never an error. Used by [`loaded_models`] for the Ollama
+/// introspection backend.
+async fn ollama_loaded_models() -> Vec<String> {
     let fut = tokio::process::Command::new("ollama").arg("ps").output();
     // Best-effort + bounded: a hung `ollama ps` must not stall the reconcile.
     match tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut).await {
@@ -405,10 +460,110 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         assert!(r.is_ok() || matches!(r, Err(UnitError::Systemctl { .. })));
     }
 
+    fn unit(name: &str, kind: Option<&str>, introspect_cmd: Option<&str>) -> ManagedUnit {
+        ManagedUnit {
+            unit: name.to_string(),
+            eager_restart: true,
+            vram_match: None,
+            kind: kind.map(str::to_string),
+            introspect_cmd: introspect_cmd.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn introspection_command_takes_precedence() {
+        // An explicit introspect_cmd wins over kind and the name heuristic.
+        let u = unit("ollama.service", Some("ollama"), Some("my-cli list"));
+        assert_eq!(
+            u.introspection(),
+            Introspection::Command("my-cli list".to_string())
+        );
+    }
+
+    #[test]
+    fn introspection_blank_command_falls_through() {
+        // A whitespace-only introspect_cmd is ignored; resolution falls back to kind.
+        let u = unit("asr.service", Some("ollama"), Some("   "));
+        assert_eq!(u.introspection(), Introspection::Ollama);
+    }
+
+    #[test]
+    fn introspection_overlong_command_falls_through() {
+        use crate::config::MAX_INTROSPECT_CMD_LEN;
+        // An over-length introspect_cmd (operator typo / garbage) is treated as
+        // unset, exactly like a blank string: resolution falls through to `kind`.
+        let huge = "x".repeat(MAX_INTROSPECT_CMD_LEN + 1);
+        let u = unit("asr.service", Some("ollama"), Some(&huge));
+        assert_eq!(u.introspection(), Introspection::Ollama);
+        // ...and to the name heuristic when kind is also unset.
+        let u2 = unit("ollama.service", None, Some(&huge));
+        assert_eq!(u2.introspection(), Introspection::Ollama);
+        let u3 = unit("plain.service", None, Some(&huge));
+        assert_eq!(u3.introspection(), Introspection::None);
+        // Exactly at the limit is still accepted (boundary: `<=`).
+        let at_limit = "x".repeat(MAX_INTROSPECT_CMD_LEN);
+        let u4 = unit("plain.service", None, Some(&at_limit));
+        assert_eq!(u4.introspection(), Introspection::Command(at_limit));
+    }
+
+    #[test]
+    fn introspection_kind_ollama_selects_ollama() {
+        let u = unit("anything.service", Some("ollama"), None);
+        assert_eq!(u.introspection(), Introspection::Ollama);
+    }
+
+    #[test]
+    fn introspection_other_kind_suppresses_name_heuristic() {
+        // An explicit non-ollama kind means "no ollama introspection", even if the
+        // unit name contains "ollama".
+        let u = unit("ollama.service", Some("vllm"), None);
+        assert_eq!(u.introspection(), Introspection::None);
+    }
+
+    #[test]
+    fn introspection_name_heuristic_when_kind_unset() {
+        // Back-compat: no kind, but the unit name contains "ollama".
+        assert_eq!(
+            unit("ollama.service", None, None).introspection(),
+            Introspection::Ollama
+        );
+        assert_eq!(
+            unit("My-Ollama-Runner.service", None, None).introspection(),
+            Introspection::Ollama
+        );
+    }
+
+    #[test]
+    fn introspection_none_for_plain_unit() {
+        assert_eq!(
+            unit("asr-runner.service", None, None).introspection(),
+            Introspection::None
+        );
+    }
+
+    #[test]
+    fn parse_model_lines_trims_and_drops_empties() {
+        let out = "  model-a  \n\nmodel-b\n   \nmodel-c\n";
+        assert_eq!(
+            parse_model_lines(out),
+            vec!["model-a", "model-b", "model-c"]
+        );
+        assert!(parse_model_lines("").is_empty());
+        assert!(parse_model_lines("\n  \n").is_empty());
+    }
+
     #[tokio::test]
-    async fn ollama_loaded_models_never_errors_without_ollama() {
-        // ollama_loaded_models is best-effort: no `ollama` binary → empty vec, no
-        // panic.
-        let _ = ollama_loaded_models().await; // must not panic
+    async fn loaded_models_never_errors_without_backends() {
+        // loaded_models is best-effort across all backends: no `ollama` binary, a
+        // missing introspect_cmd binary, or a None unit → empty vec, no panic.
+        let _ = loaded_models(&unit("ollama.service", Some("ollama"), None)).await;
+        let _ = loaded_models(&unit(
+            "x.service",
+            None,
+            Some("definitely-not-a-real-binary-xyz"),
+        ))
+        .await;
+        let none = loaded_models(&unit("x.service", None, None)).await;
+        assert!(none.is_empty()); // Introspection::None → always empty
     }
 }

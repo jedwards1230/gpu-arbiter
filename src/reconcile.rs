@@ -265,10 +265,11 @@ async fn refresh_substate(
     let mut unit_statuses = Vec::new();
     for u in cfg.resolved_units() {
         let running = units::is_running(&u.unit).await.unwrap_or(false);
-        // Model listing is Ollama-specific (`ollama ps`); only meaningful for the
-        // Ollama unit.
-        let models = if running && u.unit.contains("ollama") {
-            units::ollama_loaded_models().await
+        // Model listing is generic per-tenant: the introspection backend
+        // (`introspect_cmd` / `kind == "ollama"` / `ollama`-named fallback) is
+        // resolved from the unit's config. Only queried while the unit is running.
+        let models = if running {
+            units::loaded_models(&u).await
         } else {
             Vec::new()
         };

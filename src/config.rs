@@ -34,6 +34,31 @@ fn default_true() -> bool {
     true
 }
 
+/// Maximum accepted length (in bytes) of an [`ManagedUnit::introspect_cmd`]. A
+/// value longer than this is treated as **unset** (resolution falls through to the
+/// next precedence level, just like a blank string), never run.
+///
+/// This is a footgun guard, not a security control: the config is root-owned and
+/// the daemon runs as root, so there's no untrusted input path. The bound exists
+/// purely so an operator *typo* producing a giant string can't silently overrun
+/// the OS argv limit (`ARG_MAX`, ~128 KiB) and fail in a confusing way. A real
+/// argv is far below 1 KiB.
+pub const MAX_INTROSPECT_CMD_LEN: usize = 1024;
+
+/// How a [`ManagedUnit`]'s loaded-model list (for `/status` `models[]`) is
+/// obtained. Resolved purely from the unit's config — see
+/// [`ManagedUnit::introspection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Introspection {
+    /// Run the given argv (whitespace-split, shell-free); each non-empty trimmed
+    /// stdout line is a reported name. Carries the raw command string.
+    Command(String),
+    /// Run `ollama ps` and parse it with the Ollama table parser.
+    Ollama,
+    /// No introspection — report an empty `models[]`.
+    None,
+}
+
 /// One systemd unit the arbiter owns and evicts from the GPU when a game
 /// launches (stop → poll-VRAM-free → SIGKILL, the same loop the single Ollama
 /// unit used to get).
@@ -44,6 +69,8 @@ fn default_true() -> bool {
 /// unit = "ollama.service"
 /// eager_restart = true     # restart this unit when gaming ends
 /// vram_match = "ollama"    # substring for /status VRAM attribution (optional)
+/// kind = "ollama"          # introspection backend for /status models[] (optional)
+/// introspect_cmd = "ollama ps"  # explicit model-list command (optional, overrides kind)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ManagedUnit {
@@ -57,6 +84,66 @@ pub struct ManagedUnit {
     /// reported for the unit (the field is omitted rather than reported as 0).
     #[serde(default)]
     pub vram_match: Option<String>,
+    /// Introspection backend selector for the `/status` `models[]` list. The only
+    /// recognized value is `"ollama"` (→ run `ollama ps`). Any other value (and,
+    /// when both are unset, a `unit` name that doesn't contain `ollama`) reports no
+    /// models. Ignored when `introspect_cmd` is set. `None` falls back to the
+    /// back-compat name heuristic (a `unit` containing `ollama` is treated as
+    /// `kind = "ollama"`).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Explicit model/process-list command for the `/status` `models[]` list,
+    /// parsed shell-free as an argv (whitespace-split; no shell metacharacters,
+    /// quoting, or expansion). Its stdout lines — each trimmed, with empties
+    /// dropped — become the reported names verbatim. When set, it takes precedence
+    /// over `kind` and the name heuristic. Best-effort: a missing binary, non-zero
+    /// exit, or empty argv yields no models (never an error).
+    ///
+    /// Capped at [`MAX_INTROSPECT_CMD_LEN`] (1024) bytes: a blank/whitespace-only
+    /// **or** over-length value is treated as unset (falls through to the next
+    /// precedence level) — a footgun guard against an operator typo overrunning
+    /// the OS argv limit.
+    #[serde(default)]
+    pub introspect_cmd: Option<String>,
+}
+
+impl ManagedUnit {
+    /// Resolve which introspection backend supplies this unit's `/status`
+    /// `models[]` list. Pure — unit-tested. Precedence:
+    ///
+    /// 1. `introspect_cmd` set, non-blank, and `<= MAX_INTROSPECT_CMD_LEN` →
+    ///    [`Introspection::Command`].
+    /// 2. else `kind == "ollama"` → [`Introspection::Ollama`].
+    /// 3. else `kind` unset **and** the `unit` name contains `ollama`
+    ///    (case-insensitive back-compat heuristic) → [`Introspection::Ollama`].
+    /// 4. else → [`Introspection::None`].
+    ///
+    /// A `kind` that is `Some(non-"ollama")` deliberately suppresses the name
+    /// heuristic (an explicit non-Ollama kind means "no Ollama introspection"),
+    /// reporting [`Introspection::None`].
+    ///
+    /// A blank/whitespace-only **or** over-length (`> MAX_INTROSPECT_CMD_LEN`)
+    /// `introspect_cmd` is treated as unset — resolution falls through to `kind`
+    /// and the name heuristic rather than running a bogus command.
+    pub fn introspection(&self) -> Introspection {
+        if let Some(cmd) = &self.introspect_cmd
+            && !cmd.trim().is_empty()
+            && cmd.len() <= MAX_INTROSPECT_CMD_LEN
+        {
+            return Introspection::Command(cmd.clone());
+        }
+        match self.kind.as_deref() {
+            Some("ollama") => Introspection::Ollama,
+            Some(_) => Introspection::None,
+            None => {
+                if self.unit.to_ascii_lowercase().contains("ollama") {
+                    Introspection::Ollama
+                } else {
+                    Introspection::None
+                }
+            }
+        }
+    }
 }
 
 /// The full daemon configuration. Field names are the TOML keys.
@@ -189,6 +276,8 @@ impl Config {
                 unit: self.ollama_unit.clone(),
                 eager_restart: self.eager_ollama,
                 vram_match: Some("ollama".to_string()),
+                kind: Some("ollama".to_string()),
+                introspect_cmd: None,
             }]
         } else {
             self.managed_units.clone()
