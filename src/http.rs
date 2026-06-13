@@ -524,7 +524,7 @@ mod tests {
         // Legacy fallback: only the synthesized Ollama unit is managed.
         let cfg = Config::default();
         assert!(is_managed(&cfg, "ollama.service"));
-        assert!(!is_managed(&cfg, "asr-runner.service"));
+        assert!(!is_managed(&cfg, "vllm.service"));
 
         // Explicit list: exactly the configured units, nothing else.
         let cfg = Config::from_toml(
@@ -532,12 +532,12 @@ mod tests {
             [[managed_units]]
             unit = "ollama.service"
             [[managed_units]]
-            unit = "asr-runner.service"
+            unit = "vllm.service"
             "#,
         )
         .unwrap();
         assert!(is_managed(&cfg, "ollama.service"));
-        assert!(is_managed(&cfg, "asr-runner.service"));
+        assert!(is_managed(&cfg, "vllm.service"));
         // A unit the daemon doesn't own can't be driven via /units/*.
         assert!(!is_managed(&cfg, "sshd.service"));
     }
@@ -549,7 +549,7 @@ mod tests {
             [[managed_units]]
             unit = "ollama.service"
             [[managed_units]]
-            unit = "asr-runner.service"
+            unit = "vllm.service"
             "#,
         )
         .unwrap();

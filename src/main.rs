@@ -2,10 +2,10 @@
 //!
 //! Treats the host as a gaming PC first, AI workstation second: a kernel
 //! `cn_proc` listener detects game launches (local *or* Moonlight-streamed —
-//! both are just local processes), a level-triggered reconcile loop evicts
-//! Ollama from the GPU when a game starts and restores it when gaming ends, and
-//! an axum HTTP `/status` endpoint lets remote machines tell whether the box is
-//! free for AI work.
+//! both are just local processes), a level-triggered reconcile loop evicts the
+//! configured GPU tenants (Ollama by default) when a game starts and restores
+//! them when gaming ends, and an axum HTTP `/status` endpoint lets remote
+//! machines tell whether the box is free for AI work.
 //!
 //! All daemon logic lives in the library crate (`gpu_arbiter`); this binary only
 //! wires the modules together (lib + thin-main split — see `lib.rs` — so the

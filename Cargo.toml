@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "GPU arbiter daemon: evicts Ollama from the GPU when a game launches (kernel cn_proc detection), restores it when gaming ends, exposes an HTTP /status endpoint for remote AI-routing decisions"
+description = "GPU arbiter daemon: evicts GPU compute tenants (e.g. Ollama) when a game launches (kernel cn_proc detection), restores them when gaming ends, exposes an HTTP /status endpoint for remote AI-routing decisions"
 repository = "https://github.com/jedwards1230/gpu-arbiter"
 
 [[bin]]

@@ -4,9 +4,10 @@ A small root daemon for a Linux gaming workstation that also doubles as an AI
 compute box — it treats the machine as a **gaming PC first, AI workstation
 second**. It detects game launches via the kernel process-event connector
 (`cn_proc`) — local *or* Moonlight-streamed, both are just local processes —
-instantly evicts Ollama from the GPU when a game starts, restores it when gaming
-ends, and exposes an HTTP `/status` endpoint so other machines can tell whether
-the box is free for AI work.
+instantly evicts GPU compute tenants (Ollama by default, plus any configured
+managed unit) from the GPU when a game starts, restores them when gaming ends,
+and exposes an HTTP `/status` endpoint so other machines can tell whether the
+box is free for AI work.
 
 ## Requirements
 
@@ -33,7 +34,7 @@ The crate builds and tests on any host (including macOS) — Linux-only edges ar
 The daemon is the **only** thing that starts/stops `ollama.service` (systemd
 keeps it `disabled`). Control is **level-triggered reconciliation** — the K8s
 controller pattern: `reconcile()` observes ground truth (`/proc` scan, optional
-GPU procs), recomputes the claim set, and drives Ollama. State is never
+GPU procs), recomputes the claim set, and drives the managed units. State is never
 delta-maintained, so it self-heals across crashes, restarts, and dropped events.
 
 - **cn_proc events** trigger a debounced reconcile (millisecond reaction).
@@ -72,7 +73,7 @@ rejected with `404`, so the endpoint can't drive arbitrary systemd units.
   "claims": ["steam:440"],
   "units": [
     { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
-    { "unit": "asr-runner.service", "running": false, "models": [] }
+    { "unit": "vllm.service", "running": false, "models": [] }
   ],
   "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
   "gpu_vram_used_mb": 21500,
@@ -146,8 +147,8 @@ Claims:  steam:440
 GPU:     21500 / 32768 MiB VRAM used
 Units:
   ollama.service: stopped
-  asr-runner.service: stopped
-Daemon:  v0.1.0
+  vllm.service: stopped
+Daemon:  v0.7.2
 ```
 
 ## Configuration
@@ -187,6 +188,8 @@ SIGKILL` loop, in order) and restores when gaming ends. Each entry:
 | `unit` | _(required)_ | systemd unit the daemon owns (or a free-form label when command overrides are set) |
 | `eager_restart` | `true` | Restart this unit when gaming ends |
 | `vram_match` | _(none)_ | Substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution |
+| `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (runs `ollama ps`); any other value reports no models and suppresses the name heuristic |
+| `introspect_cmd` | _(none)_ | Explicit command (shell-free argv) whose stdout lists loaded model/process names, one per line. Takes precedence over `kind` and the name heuristic |
 | `stop_cmd` | _(none)_ | Override: command to stop/evict the tenant (`None` → `systemctl stop`) |
 | `start_cmd` | _(none)_ | Override: command to start the tenant (`None` → `systemctl start`) |
 | `is_active_cmd` | _(none)_ | Override: command whose **exit 0 = running** (`None` → `systemctl is-active`) |
@@ -230,9 +233,9 @@ eager_restart = true
 vram_match = "ollama"
 
 [[managed_units]]
-unit = "asr-runner.service"
+unit = "vllm.service"
 eager_restart = true
-vram_match = "parakeet"
+vram_match = "vllm"
 
 [[game_patterns]]
 name = "heroic"
@@ -262,12 +265,13 @@ artifact; your deployment tooling (e.g. Ansible) can fetch it by version (on-hos
 
 Reference manuals live under [`man/`](man):
 
-- [`gpu-arbiter.1`](man/gpu-arbiter.1) — daemon usage, the cn_proc/eviction model,
-  and the `--version`/`--help`/config-path behavior.
+- [`gpu-arbiter.8`](man/gpu-arbiter.8) — daemon usage, the cn_proc/eviction model,
+  the `status` / `--check-config` / `--config` CLI, and the `--version`/`--help`
+  behavior.
 - [`gpu-arbiter-config.5`](man/gpu-arbiter-config.5) — every config key, including
   the per-unit `kind` / `introspect_cmd` introspection backends.
 
-Render locally with `man ./man/gpu-arbiter.1` and `man ./man/gpu-arbiter-config.5`.
+Render locally with `man ./man/gpu-arbiter.8` and `man ./man/gpu-arbiter-config.5`.
 
 ## License
 

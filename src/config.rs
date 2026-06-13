@@ -528,8 +528,8 @@ mod tests {
             vram_match = "ollama"
 
             [[managed_units]]
-            unit = "asr-runner.service"
-            vram_match = "parakeet"
+            unit = "vllm.service"
+            vram_match = "vllm"
 
             [[managed_units]]
             unit = "no-restart.service"
@@ -541,14 +541,14 @@ mod tests {
         assert_eq!(units.len(), 3);
         // Order is preserved (eviction runs in this order).
         assert_eq!(units[0].unit, "ollama.service");
-        assert_eq!(units[1].unit, "asr-runner.service");
+        assert_eq!(units[1].unit, "vllm.service");
         assert_eq!(units[2].unit, "no-restart.service");
         // eager_restart defaults to true when omitted.
         assert!(units[1].eager_restart);
         assert!(!units[2].eager_restart);
         // vram_match is optional.
         assert_eq!(units[0].vram_match.as_deref(), Some("ollama"));
-        assert_eq!(units[1].vram_match.as_deref(), Some("parakeet"));
+        assert_eq!(units[1].vram_match.as_deref(), Some("vllm"));
         assert_eq!(units[2].vram_match, None);
     }
 

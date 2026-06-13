@@ -538,7 +538,7 @@ mod tests {
             "claims": ["steam:440"],
             "units": [
                 { "unit": "ollama.service", "running": false, "models": [], "vram_mb": 0 },
-                { "unit": "asr-runner.service", "running": false, "models": [] }
+                { "unit": "vllm.service", "running": false, "models": [] }
             ],
             "ollama": { "unit": "ollama.service", "running": false, "models": [] },
             "gpu_vram_used_mb": 21500,
@@ -554,7 +554,7 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("ollama.service: stopped"), "{out}");
-        assert!(out.contains("asr-runner.service: stopped"), "{out}");
+        assert!(out.contains("vllm.service: stopped"), "{out}");
         assert!(out.contains("Daemon:  v1.2.3"), "{out}");
     }
 

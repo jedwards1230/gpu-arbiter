@@ -694,7 +694,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
     #[test]
     fn introspection_none_for_plain_unit() {
         assert_eq!(
-            unit("asr-runner.service", None, None).introspection(),
+            unit("vllm.service", None, None).introspection(),
             Introspection::None
         );
     }
