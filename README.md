@@ -107,9 +107,47 @@ remote stream. `input_monitor_up = false` means presence is **unknown** (fail-sa
 `gpu_arbiter_input_monitor_up`) is the signal an "abandoned game left running"
 alert should key off — so it stops false-firing during local at-desk play.
 
+## Command-line usage
+
+```text
+gpu-arbiter [--config <PATH>] [--check-config]   Run the daemon (Linux), or validate config
+gpu-arbiter status [--config <PATH>] [--json]    Query the running daemon's /status
+gpu-arbiter --version | --help
+```
+
+| Flag / subcommand | Purpose |
+|---|---|
+| `-c, --config <PATH>` | Config file path (precedence below) |
+| `--check-config` | Load + validate the resolved config, print `OK: <path>` or the typed error, exit 0/1 |
+| `status` | Read the config for the port, GET `http://127.0.0.1:<port>/status`, print a human summary |
+| `status --json` | Print the raw `/status` JSON instead of the summary |
+| `-V, --version` / `-h, --help` | Print version / help and exit |
+
+**Config-path precedence** (highest first): `--config`/`-c` → `GPU_ARBITER_CONFIG`
+env var → `/etc/gpu-arbiter/config.toml` (the default). A missing file is not an
+error — the daemon falls back to built-in defaults.
+
+The daemon itself takes no required arguments; the existing systemd unit and
+`/etc/gpu-arbiter/config.toml` keep working unchanged (these flags are additive).
+`status` is a plain localhost HTTP client (no TLS), so it runs on any host that
+can reach the port. Example:
+
+```text
+$ gpu-arbiter status
+State:   gaming
+Since:   2026-06-13T18:00:00Z
+Claims:  steam:440
+GPU:     21500 / 32768 MiB VRAM used
+Units:
+  ollama.service: stopped
+  asr-runner.service: stopped
+Daemon:  v0.1.0
+```
+
 ## Configuration
 
-Loaded from a TOML file (e.g. rendered by your deployment tooling). Every
+Loaded from a TOML file (e.g. rendered by your deployment tooling). The path is
+resolved as above (`--config` → `GPU_ARBITER_CONFIG` → default). Every
 key is optional; a missing file yields the defaults below. Keys mirror the
 `gpu_arbiter_*` variable names minus the prefix.
 
