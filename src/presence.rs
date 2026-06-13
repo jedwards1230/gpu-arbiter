@@ -14,8 +14,8 @@
 //! `/sys/devices/virtual/…` in sysfs, while a real USB keyboard/mouse resolves
 //! under `…/usbN/…`. Canonicalizing `/sys/class/input/eventX` and rejecting the
 //! `/sys/devices/virtual/` prefix excludes the streamed pads/kb/mouse
-//! **deterministically**, independent of what they claim to be. (Verified live on
-//! desktop-1: real Logitech KB/mouse resolve under a `usb` path; Sunshine
+//! **deterministically**, independent of what they claim to be. (Verified live:
+//! a real USB keyboard/mouse resolves under a `usb` path; Sunshine
 //! "Mouse/Keyboard passthrough" nodes resolve under `/sys/devices/virtual/input/`.)
 //!
 //! ## Why also filter by capability

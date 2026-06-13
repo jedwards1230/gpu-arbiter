@@ -405,7 +405,7 @@ mod tests {
         let mut s = ArbiterState::new();
         s.units = vec![
             UnitStatus {
-                unit: "asr-runner.service".into(),
+                unit: "vllm.service".into(),
                 running: true,
                 models: vec![],
                 vram_mb: Some(8000),
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(snap.ollama.unit, "ollama.service");
         assert_eq!(snap.ollama.vram_mb, Some(21000));
         // order of `units` is preserved (eviction order).
-        assert_eq!(snap.units[0].unit, "asr-runner.service");
+        assert_eq!(snap.units[0].unit, "vllm.service");
     }
 
     #[test]
@@ -431,13 +431,13 @@ mod tests {
         // No ollama-named unit → alias is the first managed unit.
         let mut s = ArbiterState::new();
         s.units = vec![UnitStatus {
-            unit: "asr-runner.service".into(),
+            unit: "vllm.service".into(),
             running: false,
             models: vec![],
             vram_mb: None,
         }];
         let snap = s.snapshot();
-        assert_eq!(snap.ollama.unit, "asr-runner.service");
+        assert_eq!(snap.ollama.unit, "vllm.service");
     }
 
     #[test]

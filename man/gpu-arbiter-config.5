@@ -1,10 +1,10 @@
 .TH GPU-ARBITER-CONFIG 5 "June 2026" "gpu-arbiter" "File Formats"
 .SH NAME
-gpu\-arbiter\-config \- configuration file for gpu\-arbiter(1)
+gpu\-arbiter\-config \- configuration file for gpu\-arbiter(8)
 .SH SYNOPSIS
 .I /etc/gpu-arbiter/config.toml
 .SH DESCRIPTION
-.BR gpu-arbiter (1)
+.BR gpu-arbiter (8)
 reads its configuration from a TOML file (by default
 .IR /etc/gpu-arbiter/config.toml ,
 typically rendered by deployment tooling such as Ansible). A
@@ -116,6 +116,53 @@ Array of strings. Default
 .BR "[""ollama"", ""kwin_wayland"", ""plasmashell"", ""Xwayland""]" .
 Sanctioned GPU tenants, used by the heuristic (and a sanity log line) to avoid
 flagging known\-good processes as games.
+.TP
+.B gpu_backend
+String. Default
+.BR """auto""" .
+Selects the GPU backend used to read VRAM and (on NVIDIA) per\-process compute
+usage. One of
+.BR """auto""" ,
+.BR """nvidia""" ,
+or
+.BR """amd""" .
+.B auto
+probes for
+.B nvidia-smi
+on
+.I PATH
+and uses the NVIDIA backend if present, otherwise falls back to the AMD
+.I amdgpu
+sysfs backend
+.RI ( /sys/class/drm/card*/device/mem_info_vram_* ),
+and finally to NVIDIA if neither can be detected.
+.B nvidia
+and
+.B amd
+force the respective backend. On AMD there is no per\-process VRAM via sysfs, so
+the opt\-in VRAM heuristic and per\-unit
+.I /status
+VRAM attribution degrade to empty (never an error); eviction itself is identical.
+.TP
+.B presence_detection
+Boolean. Default
+.BR true .
+Watch
+.B physical
+human\-input devices (keyboard/mouse/gamepad) to report local at\-desk presence in
+.I /status
+and
+.IR /metrics .
+Virtual devices injected by Moonlight/Sunshine streaming are excluded by sysfs
+parentage. When
+.BR false ,
+presence is not tracked and reported as unknown.
+.TP
+.B presence_idle_threshold_s
+Integer (seconds). Default
+.BR 600 .
+Physical\-input silence after which local presence is reported as absent
+.RB ( local_present " = 0)."
 .SH MANAGED UNIT FIELDS
 Each
 .B [[managed_units]]
@@ -124,14 +171,58 @@ table accepts:
 .B unit
 String,
 .BR required .
-The systemd unit the daemon exclusively owns (kept
+By default the systemd unit the daemon exclusively owns (kept
 .I disabled
-so systemd never races the daemon).
+so systemd never races the daemon). When the
+.B *_cmd
+overrides below are set, this is instead a
+.B free\-form label
+for the tenant \(em not necessarily a systemd unit \(em used in
+.I /status
+and log lines.
 .TP
 .B eager_restart
 Boolean. Default
 .BR true .
 Restart this unit when gaming ends (eager warm\-up).
+.TP
+.B stop_cmd
+String or array of strings. Default: none. Override for stopping/evicting the
+tenant. When unset, the daemon runs
+.BR "systemctl stop <unit>" .
+.TP
+.B start_cmd
+String or array of strings. Default: none. Override for starting the tenant.
+When unset, the daemon runs
+.BR "systemctl start <unit>" .
+.TP
+.B is_active_cmd
+String or array of strings. Default: none. Override for the liveness check; its
+.B exit 0 means running.
+When unset, the daemon runs
+.BR "systemctl is-active <unit>" .
+.TP
+.B kill_cmd
+String or array of strings. Default: none. Override for the SIGKILL escalation
+step. When unset off systemd it re\-runs
+.B stop_cmd
+as a best\-effort second teardown; under systemd the escalation is
+.BR "systemctl kill -s SIGKILL <unit>" .
+.PP
+The
+.B *_cmd
+overrides let the daemon drive a tenant on a host without systemd (OpenRC,
+runit, or plain processes). Like
+.BR introspect_cmd ,
+each command is
+.B shell\-free
+\(em an explicit argv split on whitespace and spawned directly (never
+.BR "sh -c" ),
+so a unit name or path cannot inject. An argument that contains a space cannot
+be represented. When
+.B all
+.B *_cmd
+are unset for a unit it is systemd\-driven exactly as before.
 .TP
 .B vram_match
 String. Default: none. Substring matched case\-insensitively against
@@ -282,8 +373,8 @@ tenant report a model/process list via
 .B kind
 opt out of Ollama introspection entirely (step 3).
 .SH EXAMPLES
-A two\-tenant config where Ollama and an ASR runner both yield to gaming, the ASR
-runner reporting its own process list via an explicit command:
+A two\-tenant config where Ollama and a vLLM server both yield to gaming, the
+vLLM server reporting its own loaded\-model list via an explicit command:
 .PP
 .RS
 .nf
@@ -296,10 +387,10 @@ vram_match = "ollama"
 kind = "ollama"
 
 [[managed_units]]
-unit = "asr-runner.service"
+unit = "vllm.service"
 eager_restart = true
-vram_match = "parakeet"
-introspect_cmd = "asr-cli list-models"
+vram_match = "vllm"
+introspect_cmd = "vllm-cli list-models"
 
 [[game_patterns]]
 name = "heroic"
@@ -307,4 +398,4 @@ match = "Heroic"
 .fi
 .RE
 .SH SEE ALSO
-.BR gpu-arbiter (1)
+.BR gpu-arbiter (8)

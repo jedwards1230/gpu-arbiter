@@ -473,8 +473,8 @@ mod tests {
             vram_match = "ollama"
 
             [[managed_units]]
-            unit = "asr-runner.service"
-            vram_match = "parakeet"
+            unit = "vllm.service"
+            vram_match = "vllm"
             "#,
         )
         .unwrap();
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(g.units.len(), 2);
         // Order matches the configured (eviction) order.
         assert_eq!(g.units[0].unit, "ollama.service");
-        assert_eq!(g.units[1].unit, "asr-runner.service");
+        assert_eq!(g.units[1].unit, "vllm.service");
     }
 
     #[tokio::test]

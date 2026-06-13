@@ -1,7 +1,17 @@
-.TH GPU-ARBITER 1 "June 2026" "gpu-arbiter" "User Commands"
+.TH GPU-ARBITER 8 "June 2026" "gpu-arbiter" "System Administration"
 .SH NAME
 gpu\-arbiter \- gaming\-first GPU arbiter daemon
 .SH SYNOPSIS
+.B gpu\-arbiter
+.RB [ \-\-config | \-c
+.IR PATH ]
+.RB [ \-\-check\-config ]
+.br
+.B gpu\-arbiter status
+.RB [ \-\-config | \-c
+.IR PATH ]
+.RB [ \-\-json ]
+.br
 .B gpu\-arbiter
 .RB [ \-\-version | \-V ]
 .RB [ \-\-help | \-h ]
@@ -9,20 +19,58 @@ gpu\-arbiter \- gaming\-first GPU arbiter daemon
 .B gpu\-arbiter
 is a Linux root daemon for a workstation that is a
 .B gaming PC first, AI workstation second.
-It detects game launches and instantly evicts GPU tenants (such as Ollama and
-other managed systemd units) from the GPU so the game has the card to itself,
-then restores those tenants when gaming ends. An HTTP
+It detects game launches and instantly evicts the configured GPU compute tenants
+(Ollama by default, plus any managed unit) from the GPU so the game has the card
+to itself, then restores those tenants when gaming ends. Tenants are driven
+through systemd by default, or through per\-unit command overrides on hosts
+without systemd (see
+.BR gpu-arbiter-config (5)).
+An HTTP
 .B /status
 endpoint lets other machines tell whether the box is currently free for AI work.
 .PP
-The daemon takes
-.B no runtime arguments
-beyond the informational flags below. It reads all of its settings from a TOML
-config file (see
+Run with no subcommand, the daemon takes
+.B no required arguments
+beyond the optional config\-path flags below. It reads all of its settings from a
+TOML config file (see
 .BR gpu-arbiter-config (5) );
 a missing file yields built\-in defaults, so the daemon is usable with zero
-configuration.
+configuration. The
+.B status
+subcommand and the
+.B \-\-check\-config
+flag are additive helpers that do not change the existing systemd\-unit\-driven
+deployment.
 .SH OPTIONS
+.TP
+.BR \-\-config ", " \-c " " \fIPATH\fR
+Path to the TOML config file. Precedence, highest first:
+.BR \-\-config / \-c ,
+then the
+.B GPU_ARBITER_CONFIG
+environment variable, then the default
+.IR /etc/gpu-arbiter/config.toml .
+A missing file is not an error \(em the daemon falls back to built\-in defaults.
+Applies both to the daemon and to the
+.B status
+subcommand (which reads it only for the port). See
+.BR gpu-arbiter-config (5).
+.TP
+.B \-\-check\-config
+Load and validate the resolved config, print
+.BI "OK: " <path>
+(or the typed validation error) and exit 0 on success / 1 on error, without
+starting the daemon. Cross\-platform \(em works on the non\-Linux stub build.
+.TP
+.BR status " [" \-\-json ]
+Query a running daemon: read the config for the port, issue
+.B "GET http://127.0.0.1:<port>/status"
+and print a human\-readable summary.
+.B \-\-json
+prints the raw
+.I /status
+JSON instead. A plain localhost HTTP client (no TLS), so it runs on any host that
+can reach the port \(em including the non\-Linux stub build.
 .TP
 .BR \-\-version ", " \-V
 Print the program name and version (the
@@ -31,8 +79,8 @@ baked from the git tag at release build time) to standard output and exit 0.
 Handled before any runtime setup, so it works even on the non\-Linux stub build.
 .TP
 .BR \-\-help ", " \-h
-Print a short usage summary \(em including the config path and the fact that the
-daemon takes no runtime arguments \(em to standard output and exit 0.
+Print a short usage summary \(em including the config path and the available
+subcommands \(em to standard output and exit 0.
 .SH DETECTION AND EVICTION MODEL
 Control is
 .B level\-triggered reconciliation
@@ -69,15 +117,15 @@ An opt\-in VRAM heuristic can additionally flag heavy, non\-allowlisted
 GPU processes as games.
 .PP
 Eviction of each managed unit runs the same bounded loop, in the configured
-order:
-.B systemctl stop
-the unit, then poll
-.B nvidia-smi
+order: stop the unit via its supervisor
+.RB ( systemctl " stop, or the per-unit " stop_cmd " override),"
+then poll the GPU backend
+.RB ( nvidia-smi " or the " amdgpu " sysfs reader, per " gpu_backend )
 until VRAM\-used drops below the free threshold (graceful release) or the
 eviction timeout elapses. On timeout, if the unit is already inactive its VRAM
 is already released and the release is treated as graceful; otherwise the unit
-is force\-killed with
-.B "systemctl kill -s SIGKILL"
+is force\-killed via its supervisor
+.RB ( "systemctl kill -s SIGKILL" ", or the per-unit " kill_cmd )
 and the daemon proceeds regardless \(em gaming wins the GPU unconditionally and a
 game launch must never hang waiting on a tenant.
 .SH HTTP CONTROL SURFACE
@@ -132,8 +180,22 @@ Normal: informational flag handled, or
 in config (the daemon logs and exits cleanly).
 .TP
 .B 1
-Run on a non\-Linux host (the daemon requires the cn_proc netlink connector,
-.IR /proc ", " nvidia-smi ", and " systemctl ).
+Run as the daemon on a non\-Linux host (it requires the cn_proc netlink
+connector and
+.IR /proc ,
+plus a GPU backend \(em
+.B nvidia-smi
+or the
+.B amdgpu
+sysfs reader \(em and a unit supervisor:
+.B systemctl
+or the per\-unit
+.B *_cmd
+overrides). Also returned by
+.B \-\-check\-config
+on an invalid config, and by
+.B status
+when the running daemon cannot be reached.
 .PP
 SIGTERM (systemd stop) and SIGINT (Ctrl\-C) trigger a graceful shutdown.
 .SH NOTES

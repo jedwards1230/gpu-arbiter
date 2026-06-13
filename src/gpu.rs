@@ -375,7 +375,7 @@ mod amd {
 /// Best-effort VRAM (MiB) attributed to a managed unit, summed across the compute
 /// processes whose name contains `needle` (case-insensitive) — `nvidia-smi`
 /// reports the full binary path, e.g. `/usr/local/bin/ollama` or an
-/// `ollama runner` subprocess, so a substring like `"ollama"` or `"parakeet"`
+/// `ollama runner` subprocess, so a substring like `"ollama"` or `"vllm"`
 /// matches. Pure helper over an observed compute-proc list, driven by each unit's
 /// configured `vram_match`.
 ///
@@ -541,8 +541,8 @@ mod tests {
 
     #[test]
     fn vram_matching_is_case_insensitive() {
-        let procs = parse_graphics_procs_csv("111, /opt/ASR/Parakeet, 8000\n");
-        assert_eq!(vram_mb_matching(&procs, "parakeet"), Some(8000));
+        let procs = parse_graphics_procs_csv("111, /opt/VLLM/Server, 8000\n");
+        assert_eq!(vram_mb_matching(&procs, "vllm"), Some(8000));
     }
 
     #[test]
