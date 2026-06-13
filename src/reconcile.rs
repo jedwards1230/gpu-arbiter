@@ -179,6 +179,7 @@ pub async fn observe(_cfg: &Config) -> anyhow::Result<ProcSnapshot> {
 pub async fn reconcile(
     state: &Arc<Mutex<ArbiterState>>,
     cfg: &Config,
+    presence: &crate::presence::PresenceMonitor,
     trigger: ReconcileTrigger,
 ) -> anyhow::Result<()> {
     // Slow, off-lock: scan /proc (+ optional GPU procs).
@@ -241,7 +242,7 @@ pub async fn reconcile(
         }
     }
 
-    refresh_substate(state, cfg).await;
+    refresh_substate(state, cfg, presence).await;
     Ok(())
 }
 
@@ -251,7 +252,11 @@ pub async fn reconcile(
 ///
 /// The shell-outs run with the lock **dropped**; only the final field write takes
 /// it briefly, so `/status` never blocks on `systemctl is-active`/`nvidia-smi`.
-async fn refresh_substate(state: &Arc<Mutex<ArbiterState>>, cfg: &Config) {
+async fn refresh_substate(
+    state: &Arc<Mutex<ArbiterState>>,
+    cfg: &Config,
+    presence: &crate::presence::PresenceMonitor,
+) {
     // One compute-proc query feeds every unit's VRAM attribution. Best-effort: a
     // failed/absent query leaves each `vram_mb` as None so `/status` omits it
     // rather than lying with a 0.
@@ -281,8 +286,17 @@ async fn refresh_substate(state: &Arc<Mutex<ArbiterState>>, cfg: &Config) {
     }
     let mem = gpu::query_memory().await.ok();
 
+    // Snapshot the lock-free presence monitor into the embedded view so `/status`
+    // and `/metrics` read a coherent, point-in-time presence record.
+    let presence_view = crate::state::Presence {
+        last_input_unix: presence.last_input_unix(),
+        devices: presence.device_count(),
+        monitor_up: presence.healthy(),
+    };
+
     let mut guard = state.lock().await;
     guard.units = unit_statuses;
+    guard.presence = presence_view;
     if let Some(mem) = mem {
         guard.gpu_vram_used_mb = mem.used_mb;
         guard.gpu_vram_total_mb = mem.total_mb;
@@ -429,7 +443,8 @@ mod tests {
         let mut s = ArbiterState::new();
         s.state = State::Gaming;
         let state = shared(s);
-        reconcile(&state, &cfg, ReconcileTrigger::Timer)
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
             .await
             .unwrap();
         let g = state.lock().await;
@@ -456,7 +471,8 @@ mod tests {
         )
         .unwrap();
         let state = shared(ArbiterState::new());
-        reconcile(&state, &cfg, ReconcileTrigger::Timer)
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
             .await
             .unwrap();
         let g = state.lock().await;
@@ -464,6 +480,24 @@ mod tests {
         // Order matches the configured (eviction) order.
         assert_eq!(g.units[0].unit, "ollama.service");
         assert_eq!(g.units[1].unit, "asr-runner.service");
+    }
+
+    #[tokio::test]
+    async fn reconcile_snapshots_presence_into_state() {
+        // The lock-free presence monitor's view is copied into ArbiterState each
+        // reconcile so /status + /metrics read a coherent record. A monitor seeded
+        // with a recent input + marked-up surfaces those values.
+        let cfg = Config::default();
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(1_700_000_000);
+        presence.record_input(1_700_000_500);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
+            .await
+            .unwrap();
+        let g = state.lock().await;
+        assert_eq!(g.presence.last_input_unix, 1_700_000_500);
+        // A fresh monitor that never enumerated is unhealthy (fail-safe default).
+        assert!(!g.presence.monitor_up);
     }
 
     #[test]

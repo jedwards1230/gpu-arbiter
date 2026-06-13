@@ -58,3 +58,15 @@ neli = { version = "0.7", features = ["async"] }
 ksni = "0.3"
 # Default features = zbus (pure Rust). Do NOT enable `d`/`dbus` (the libdbus FFI path).
 notify-rust = "4"
+# Local-presence detection (Linux-only — evdev/inotify are Linux kernel
+# interfaces). All three are pure-Rust over raw libc syscalls (no external C lib,
+# no TLS), so they stay musl-clean like the existing libc/neli deps:
+#  - evdev: raw evdev ioctls (NOT libevdev FFI); `tokio` feature → async
+#    `into_event_stream()` for zero-CPU epoll waiting between input events.
+#  - inotify: thin libc inotify_* syscall wrapper (inotify-sys); `stream` feature
+#    → async hotplug watch on /dev/input. (libc-only FFI is fine; libdbus-style
+#    external C libs are what we avoid.)
+#  - tokio-stream: pure-Rust `StreamExt` to drive the inotify event stream.
+evdev = { version = "0.13", features = ["tokio"] }
+inotify = { version = "0.11", default-features = false, features = ["stream"] }
+tokio-stream = "0.1"

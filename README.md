@@ -71,7 +71,10 @@ rejected with `404`, so the endpoint can't drive arbitrary systemd units.
   "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
   "gpu_vram_used_mb": 21500,
   "gpu_vram_total_mb": 32768,
-  "since": "2026-06-07T20:00:00Z"
+  "since": "2026-06-07T20:00:00Z",
+  "local_input_last_unix": 1717790400,
+  "physical_input_devices": 2,
+  "input_monitor_up": true
 }
 ```
 
@@ -80,6 +83,29 @@ rejected with `404`, so the endpoint can't drive arbitrary systemd units.
 none is named `ollama`), so consumers written against the old singular block keep
 working. `state` is `gaming` | `available` | `evicting` (the transient kill
 window — remote consumers treat `evicting` as busy).
+
+`local_input_last_unix` / `physical_input_devices` / `input_monitor_up` report
+**local human presence**: the daemon watches *physical* input devices (keyboard /
+mouse / gamepad) and tracks input recency. Virtual devices injected by
+Moonlight/Sunshine streaming are excluded by sysfs parentage (they live under
+`/sys/devices/virtual/`), so "someone at the desk" is distinguishable from a
+remote stream. `input_monitor_up = false` means presence is **unknown** (fail-safe
+— don't suppress an "abandoned game" alert on a down monitor).
+
+### Metrics
+
+`/metrics` exposes the same state as Prometheus gauges, including the presence set:
+
+| Metric | Meaning |
+|---|---|
+| `gpu_arbiter_local_present` | `1` if a human is at the desk (recent physical input AND monitor up) |
+| `gpu_arbiter_local_input_last_seconds` | Unix time of the most recent physical human input |
+| `gpu_arbiter_physical_input_devices` | Count of watched physical input devices (virtual excluded) |
+| `gpu_arbiter_input_monitor_up` | `1` if presence detection is healthy (else presence is unknown) |
+
+`gpu_arbiter_gaming AND NOT gpu_arbiter_local_present` (gated on
+`gpu_arbiter_input_monitor_up`) is the signal an "abandoned game left running"
+alert should key off — so it stops false-firing during local at-desk play.
 
 ## Configuration
 
@@ -102,6 +128,8 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 | `vram_heuristic` | `false` | Opt-in: heavy non-allowlisted graphics procs = games |
 | `vram_game_threshold_mb` | `4000` | Threshold for the heuristic |
 | `gpu_allowlist` | `["ollama", "kwin_wayland", "plasmashell", "Xwayland"]` | Sanctioned tenants |
+| `presence_detection` | `true` | Watch physical input devices for local-presence reporting |
+| `presence_idle_threshold_s` | `600` | Physical-input silence after which `local_present = 0` |
 
 ### Managed units
 

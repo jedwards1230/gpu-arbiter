@@ -49,3 +49,9 @@ pub mod http;
 // netlink is a Linux kernel interface. A non-Linux stub keeps the crate
 // compiling on macOS.
 pub mod procmon;
+
+// Local physical-human-presence detection: watch physical (non-virtual) human
+// input devices via evdev and track input recency, so the daemon can report
+// whether someone is at the desk. The classifiers are pure & cross-platform; the
+// evdev watcher is Linux-gated with a non-Linux stub.
+pub mod presence;
