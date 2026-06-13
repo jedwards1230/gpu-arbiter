@@ -1,0 +1,55 @@
+# Maintainer: Justin Edwards <justinedwards1230@gmail.com>
+# shellcheck shell=bash disable=SC2034,SC2154
+
+_pkgname=gpu-arbiter
+pkgname=gpu-arbiter-bin
+# pkgver is the version this PR's merge will cut. The release automation
+# reconciles pkgver to the published git tag (vX.Y.Z) at publish time.
+pkgver=0.8.0
+pkgrel=1
+pkgdesc="Gaming-first GPU arbiter daemon: evicts GPU compute tenants (e.g. Ollama) when a game launches (prebuilt static musl binary)"
+arch=('x86_64')
+url="https://github.com/jedwards1230/gpu-arbiter"
+license=('MIT')
+provides=('gpu-arbiter')
+conflicts=('gpu-arbiter')
+optdepends=('ollama: default managed GPU tenant'
+            'nvidia-utils: nvidia-smi for the NVIDIA GPU backend'
+            'systemd: default unit supervisor')
+backup=('etc/gpu-arbiter/config.toml')
+# The non-binary files (service, config, man pages, LICENSE) come from the
+# GitHub source archive at the tag; the daemon itself is the prebuilt release
+# musl asset, fetched separately.
+source=("$_pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "$_pkgname-bin-$pkgver::$url/releases/download/v$pkgver/gpu-arbiter-x86_64-unknown-linux-musl")
+# sha256sums are SKIP because the v0.8.0 release assets do not exist until this
+# PR merges and the release Action publishes them. Real sums are filled in at
+# publish time by `updpkgsums` (or the release Action) before the AUR push.
+sha256sums=('SKIP'
+            'SKIP')
+
+package() {
+    cd "$srcdir"
+
+    # Prebuilt daemon binary (the separately-fetched release asset).
+    install -Dm0755 "$_pkgname-bin-$pkgver" "$pkgdir/usr/bin/gpu-arbiter"
+
+    # Everything else from the extracted source archive.
+    cd "$_pkgname-$pkgver"
+
+    # systemd unit.
+    install -Dm0644 packaging/gpu-arbiter.service \
+        "$pkgdir/usr/lib/systemd/system/gpu-arbiter.service"
+
+    # Example config (registered in backup() so pacman preserves operator edits).
+    install -Dm0644 packaging/config.example.toml \
+        "$pkgdir/etc/gpu-arbiter/config.toml"
+
+    # Man pages.
+    install -Dm0644 man/gpu-arbiter.8 "$pkgdir/usr/share/man/man8/gpu-arbiter.8"
+    install -Dm0644 man/gpu-arbiter-config.5 \
+        "$pkgdir/usr/share/man/man5/gpu-arbiter-config.5"
+
+    # License.
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE"
+}
