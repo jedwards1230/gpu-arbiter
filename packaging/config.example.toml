@@ -1,0 +1,110 @@
+# gpu-arbiter daemon configuration — /etc/gpu-arbiter/config.toml
+#
+# Every key below is OPTIONAL. Each is serde-defaulted, so a sparse file
+# overrides only the keys it names — and a MISSING file yields the full built-in
+# defaults (the daemon is fully usable with zero configuration). The commented
+# values shown are the defaults; uncomment and edit only what you want to change.
+#
+# Keys map 1:1 to the serde Config struct in src/config.rs. See
+# gpu-arbiter-config(5) for the authoritative reference.
+
+# Master enable. When false, the daemon logs that it is disabled and exits
+# cleanly (a quick disable without touching systemd).
+#enabled = true
+
+# HTTP listen port, bound on 0.0.0.0 and LAN-restricted by firewalld.
+#port = 48750
+
+# Seconds to wait for a graceful tenant teardown (VRAM dropping below
+# vram_free_threshold_mb) before escalating to SIGKILL.
+#eviction_timeout_s = 5
+
+# VRAM-used (MiB) strictly below this value means the GPU is considered "freed"
+# after eviction.
+#vram_free_threshold_mb = 2000
+
+# Slow backstop reconcile interval (seconds). Detection itself is event-driven
+# (cn_proc); this only covers dropped netlink events.
+#reconcile_interval_s = 30
+
+# GPU vendor backend: "auto" (nvidia-smi if present, else amdgpu sysfs, else
+# nvidia), "nvidia", or "amd".
+#gpu_backend = "auto"
+
+# --- detection ---------------------------------------------------------------
+
+# Match "SteamLaunch AppId=" in exec'd cmdlines (covers all Steam games).
+#detect_steam = true
+
+# Opt-in: treat heavy, non-allowlisted *graphics* GPU processes as games.
+# (It cannot see Ollama, which is a compute process.)
+#vram_heuristic = false
+
+# VRAM threshold (MiB) for the opt-in vram_heuristic.
+#vram_game_threshold_mb = 4000
+
+# Sanctioned GPU tenants, used by the heuristic (and a sanity log line) to avoid
+# flagging known-good processes as games.
+#gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
+
+# Cmdline-substring patterns for non-Steam launchers. Repeat the table per
+# launcher. `name` becomes the claim `pattern:<name>`; `match` is the substring
+# matched against a process cmdline.
+#[[game_patterns]]
+#name = "heroic"
+#match = "Heroic"
+
+# --- presence ----------------------------------------------------------------
+
+# Watch physical input devices (keyboard/mouse/gamepad) to report local at-desk
+# presence in /status and /metrics. Virtual devices injected by
+# Moonlight/Sunshine streaming are excluded by sysfs parentage. When false,
+# presence is not tracked and reported as unknown.
+#presence_detection = true
+
+# Seconds of physical-input silence after which local presence is reported as
+# absent (local_present = 0).
+#presence_idle_threshold_s = 600
+
+# --- managed units -----------------------------------------------------------
+#
+# Ordered list of GPU tenants the arbiter evicts from the GPU on a game launch
+# (each runs the same stop → poll-VRAM-free → SIGKILL loop, in order) and
+# restores when gaming ends.
+#
+# If `managed_units` is omitted entirely, a single Ollama entry is synthesized
+# from the legacy `ollama_unit` / `eager_ollama` keys (default
+# "ollama.service", eager_restart = true, vram_match = "ollama"), so an
+# unconfigured daemon evicts Ollama exactly as before.
+#
+# Tenant 1 — Ollama, driven by systemd (the default supervisor):
+#[[managed_units]]
+#unit = "ollama.service"        # systemd unit the daemon exclusively owns
+#eager_restart = true           # restart this unit when gaming ends
+#vram_match = "ollama"          # substring for /status VRAM attribution (optional)
+#kind = "ollama"                # introspection backend for /status models[] (optional; only "ollama" recognized)
+#introspect_cmd = "ollama ps"   # explicit model-list command, overrides kind (optional)
+
+# Tenant 2 — a second GPU server, also systemd-driven:
+#[[managed_units]]
+#unit = "vllm.service"
+#eager_restart = true
+#vram_match = "vllm"
+#introspect_cmd = "vllm-cli list-models"
+
+# Non-systemd supervisor overrides (OpenRC / runit / plain processes).
+# When ALL four *_cmd overrides are absent, the tenant is driven byte-for-byte by
+# systemd (systemctl stop|start|is-active|kill). Set the overrides to drive a
+# tenant without systemd. `unit` then becomes a free-form label, not a real unit.
+#
+# Each *_cmd is a SHELL-FREE argv — spawned directly, never via `sh -c`, so a
+# unit name or path can't inject. Two equivalent spellings: a string array, or a
+# single string split on ASCII whitespace (no quoting/escaping — use the array
+# form if an argument must contain a space).
+#[[managed_units]]
+#unit = "ollama"                              # label only; not a systemd unit
+#vram_match = "ollama"
+#stop_cmd = ["rc-service", "ollama", "stop"]  # None → `systemctl stop`
+#start_cmd = ["rc-service", "ollama", "start"] # None → `systemctl start`
+#is_active_cmd = "rc-service ollama status"   # exit 0 = active; None → `systemctl is-active`
+#kill_cmd = ["pkill", "-9", "ollama"]         # SIGKILL escalation; None off systemd re-runs stop_cmd

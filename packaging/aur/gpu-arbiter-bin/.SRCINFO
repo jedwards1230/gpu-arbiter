@@ -1,0 +1,19 @@
+pkgbase = gpu-arbiter-bin
+	pkgdesc = Gaming-first GPU arbiter daemon: evicts GPU compute tenants (e.g. Ollama) when a game launches (prebuilt static musl binary)
+	pkgver = 0.8.0
+	pkgrel = 1
+	url = https://github.com/jedwards1230/gpu-arbiter
+	arch = x86_64
+	license = MIT
+	optdepends = ollama: default managed GPU tenant
+	optdepends = nvidia-utils: nvidia-smi for the NVIDIA GPU backend
+	optdepends = systemd: default unit supervisor
+	provides = gpu-arbiter
+	conflicts = gpu-arbiter
+	backup = etc/gpu-arbiter/config.toml
+	source = gpu-arbiter-0.8.0.tar.gz::https://github.com/jedwards1230/gpu-arbiter/archive/refs/tags/v0.8.0.tar.gz
+	source = gpu-arbiter-bin-0.8.0::https://github.com/jedwards1230/gpu-arbiter/releases/download/v0.8.0/gpu-arbiter-x86_64-unknown-linux-musl
+	sha256sums = SKIP
+	sha256sums = SKIP
+
+pkgname = gpu-arbiter-bin

@@ -1,0 +1,53 @@
+[Unit]
+Description=GPU Arbiter — evicts GPU compute tenants when a game launches
+Documentation=https://github.com/jedwards1230/gpu-arbiter
+# The daemon binds a local HTTP port and shells out to systemctl/nvidia-smi over
+# local sockets — none of which need the network to be *online*. network.target
+# (interfaces configured) is enough; network-online.target would needlessly delay
+# startup behind slow DHCP/NFS.
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gpu-arbiter
+Restart=always
+RestartSec=5
+# Log level is overridable without editing this unit via a drop-in, e.g.
+# /etc/systemd/system/gpu-arbiter.service.d/debug.conf → Environment=RUST_LOG=debug
+Environment=RUST_LOG=info
+
+# Runs as root: needs the cn_proc netlink multicast socket (CAP_NET_ADMIN),
+# nvidia-smi, and systemctl control of the managed units. Hardening is kept to the
+# subset that doesn't break those three.
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN
+# Root already holds CAP_NET_ADMIN, so no AmbientCapabilities is needed. Keep
+# NoNewPrivileges=true so the daemon's children (systemctl, nvidia-smi) can never
+# escalate via setuid/setcap bits.
+NoNewPrivileges=true
+# Mount/namespace hardening — read-only system tree, private tmp. ProtectSystem
+# stays at full (not strict) so the daemon can still drive systemctl over D-Bus;
+# /etc/gpu-arbiter is read-only config, no writable state is needed.
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+# The daemon needs exactly: AF_NETLINK (cn_proc connector), AF_INET (HTTP), and
+# AF_UNIX (D-Bus to systemd). Restrict to those.
+RestrictAddressFamilies=AF_NETLINK AF_INET AF_UNIX
+LockPersonality=true
+# NOTE: MemoryDenyWriteExecute is deliberately NOT set. On musl + the tokio
+# multi-threaded runtime it can SIGSYS the process at startup on some
+# kernel/libc combinations (notably CachyOS's patched kernel); the safety win
+# doesn't justify that risk for a static binary with no JIT.
+# Logs to the journal under this identifier.
+SyslogIdentifier=gpu-arbiter
+
+[Install]
+WantedBy=multi-user.target
