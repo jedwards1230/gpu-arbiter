@@ -11,7 +11,11 @@ the box is free for AI work.
 ## Requirements
 
 - **Linux** (the `cn_proc` netlink connector and `/proc` scanning are Linux-only)
-- An **NVIDIA GPU** with `nvidia-smi` on `PATH`
+- A **GPU**: NVIDIA (`nvidia-smi` on `PATH`, the default) or AMD (VRAM read from
+  `/sys/class/drm/card*/device/mem_info_vram_*`). The backend auto-detects; see
+  `gpu_backend` below. On AMD there is no per-process VRAM via sysfs, so the
+  opt-in VRAM heuristic and `/status` per-unit VRAM attribution degrade to
+  empty (they never error) — eviction itself works identically.
 - **systemd** (`systemctl` controls the Ollama unit; the daemon ships as a
   systemd service)
 - **root** (the `cn_proc` multicast socket needs `CAP_NET_ADMIN`; the daemon
@@ -168,6 +172,7 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 | `gpu_allowlist` | `["ollama", "kwin_wayland", "plasmashell", "Xwayland"]` | Sanctioned tenants |
 | `presence_detection` | `true` | Watch physical input devices for local-presence reporting |
 | `presence_idle_threshold_s` | `600` | Physical-input silence after which `local_present = 0` |
+| `gpu_backend` | `"auto"` | GPU vendor backend: `"auto"` (nvidia-smi if present, else amdgpu sysfs, else nvidia), `"nvidia"`, or `"amd"` |
 
 ### Managed units
 

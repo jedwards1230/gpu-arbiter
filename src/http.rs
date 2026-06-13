@@ -31,6 +31,7 @@ use axum::{Router, response::IntoResponse};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::Config;
+use crate::gpu::GpuBackend;
 use crate::state::{ArbiterState, ReconcileTrigger, StatusSnapshot};
 use crate::units;
 
@@ -417,7 +418,8 @@ async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, Strin
     if let Some(deny) = guard(&app.cfg, peer, unit) {
         return deny;
     }
-    match units::evict(unit, &app.cfg).await {
+    let backend = GpuBackend::resolve(app.cfg.gpu_backend);
+    match units::evict(unit, &app.cfg, backend).await {
         Ok(outcome) => {
             tracing::info!(%unit, ?outcome, "manual unit stop");
             let _ = app.triggers.send(ReconcileTrigger::Manual).await;

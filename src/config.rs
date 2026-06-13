@@ -59,6 +59,29 @@ pub enum Introspection {
     None,
 }
 
+/// Which GPU vendor backend the daemon drives, as configured (`gpu_backend` TOML
+/// key). Resolved into a concrete [`crate::gpu::GpuBackend`] at startup.
+///
+/// Renders in TOML as a bare string: `gpu_backend = "auto"`.
+///
+/// - `auto` (default): probe the host — `nvidia-smi` on `PATH` → NVIDIA, else an
+///   `amdgpu` DRM card → AMD, else default NVIDIA. Existing hosts (and the dev
+///   box) keep the historical NVIDIA path.
+/// - `nvidia`: force the `nvidia-smi` backend.
+/// - `amd`: force the sysfs (`/sys/class/drm/card*/device/mem_info_vram_*`) backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuBackendKind {
+    /// Auto-detect (default): NVIDIA if `nvidia-smi` present, else AMD if an
+    /// amdgpu card is present, else NVIDIA.
+    #[default]
+    Auto,
+    /// Force the NVIDIA `nvidia-smi` backend.
+    Nvidia,
+    /// Force the AMD sysfs backend.
+    Amd,
+}
+
 /// One systemd unit the arbiter owns and evicts from the GPU when a game
 /// launches (stop → poll-VRAM-free → SIGKILL, the same loop the single Ollama
 /// unit used to get).
@@ -167,6 +190,7 @@ impl ManagedUnit {
 /// | `gpu_allowlist` | `gpu_arbiter_gpu_allowlist` |
 /// | `presence_detection` | `gpu_arbiter_presence_detection` |
 /// | `presence_idle_threshold_s` | `gpu_arbiter_presence_idle_threshold_s` |
+/// | `gpu_backend` | `gpu_arbiter_gpu_backend` |
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -215,6 +239,11 @@ pub struct Config {
     /// Seconds of physical-input silence after which the box is considered
     /// unattended (`now - last_input >= threshold` ⇒ `local_present = 0`).
     pub presence_idle_threshold_s: u64,
+
+    // ── gpu vendor ───────────────────────────────────────────────────────────
+    /// Which GPU vendor backend to drive: `"auto"` (default), `"nvidia"`, or
+    /// `"amd"`. `auto` keeps existing NVIDIA hosts on the `nvidia-smi` path.
+    pub gpu_backend: GpuBackendKind,
 }
 
 impl Default for Config {
@@ -240,6 +269,7 @@ impl Default for Config {
             ],
             presence_detection: true,
             presence_idle_threshold_s: 600,
+            gpu_backend: GpuBackendKind::Auto,
         }
     }
 }
@@ -444,6 +474,43 @@ mod tests {
         let units = c.resolved_units();
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].unit, "only.service");
+    }
+
+    #[test]
+    fn gpu_backend_defaults_to_auto_and_parses_each_variant() {
+        // Omitted → Auto (the `#[serde(default)]` on the struct supplies it, so a
+        // config without the key — like the rendered Ansible template — still
+        // parses).
+        assert_eq!(Config::default().gpu_backend, GpuBackendKind::Auto);
+        assert_eq!(
+            Config::from_toml("").unwrap().gpu_backend,
+            GpuBackendKind::Auto
+        );
+        // Each lowercase string maps to its variant.
+        assert_eq!(
+            Config::from_toml("gpu_backend = \"auto\"")
+                .unwrap()
+                .gpu_backend,
+            GpuBackendKind::Auto
+        );
+        assert_eq!(
+            Config::from_toml("gpu_backend = \"nvidia\"")
+                .unwrap()
+                .gpu_backend,
+            GpuBackendKind::Nvidia
+        );
+        assert_eq!(
+            Config::from_toml("gpu_backend = \"amd\"")
+                .unwrap()
+                .gpu_backend,
+            GpuBackendKind::Amd
+        );
+        // An unknown vendor is a typed parse error (fail fast, don't silently
+        // default).
+        assert!(matches!(
+            Config::from_toml("gpu_backend = \"intel\"").unwrap_err(),
+            ConfigError::Parse(_)
+        ));
     }
 
     #[test]

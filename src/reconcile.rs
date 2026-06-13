@@ -14,8 +14,9 @@ use tokio::sync::Mutex;
 
 use crate::classify::{self, GpuGraphicsProc};
 use crate::config::Config;
+use crate::gpu::{self, GpuBackend};
 use crate::state::{ArbiterState, Claim, ReconcileTrigger, State, UnitStatus};
-use crate::{gpu, units};
+use crate::units;
 
 /// One observed process: its pid and full cmdline (NUL-joined `/proc/<pid>/cmdline`
 /// flattened to spaces). The unit the pure classifier consumes.
@@ -85,13 +86,13 @@ pub fn flatten_cmdline(raw: &[u8]) -> String {
 /// graphics-proc query (only when the VRAM heuristic is on) is an async
 /// `tokio::process` shell-out and stays on the runtime.
 #[cfg(target_os = "linux")]
-pub async fn observe(cfg: &Config) -> anyhow::Result<ProcSnapshot> {
+pub async fn observe(cfg: &Config, backend: GpuBackend) -> anyhow::Result<ProcSnapshot> {
     // Blocking /proc walk off the runtime threads.
     let procs = tokio::task::spawn_blocking(scan_proc).await??;
 
     // Only pay for the GPU graphics query when the heuristic actually needs it.
     let gpu_graphics = if cfg.vram_heuristic {
-        gpu::query_graphics_procs().await.unwrap_or_else(|e| {
+        backend.query_graphics_procs().await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "graphics-proc query failed; heuristic sees nothing this pass");
             Vec::new()
         })
@@ -145,7 +146,7 @@ fn scan_proc() -> anyhow::Result<Vec<ProcInfo>> {
 /// Non-Linux stub: there is no `/proc`. Returns an empty snapshot so the crate
 /// compiles and the reconcile loop is exercisable in tests on macOS.
 #[cfg(not(target_os = "linux"))]
-pub async fn observe(_cfg: &Config) -> anyhow::Result<ProcSnapshot> {
+pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> anyhow::Result<ProcSnapshot> {
     Ok(ProcSnapshot::default())
 }
 
@@ -182,8 +183,12 @@ pub async fn reconcile(
     presence: &crate::presence::PresenceMonitor,
     trigger: ReconcileTrigger,
 ) -> anyhow::Result<()> {
+    // Resolve the GPU vendor backend once per pass (a cheap Copy probe). Threaded
+    // through every GPU query so the whole pass talks to one vendor.
+    let backend = GpuBackend::resolve(cfg.gpu_backend);
+
     // Slow, off-lock: scan /proc (+ optional GPU procs).
-    let snap = observe(cfg).await?;
+    let snap = observe(cfg, backend).await?;
     let claims = claim_set(&snap, cfg);
 
     // Brief lock: decide, record the fresh claim set, snapshot the current state
@@ -211,7 +216,7 @@ pub async fn reconcile(
             // window. Gaming wins unconditionally even if one unit errors.
             state.lock().await.set_state(State::Evicting);
             for u in cfg.resolved_units() {
-                match units::evict(&u.unit, cfg).await {
+                match units::evict(&u.unit, cfg, backend).await {
                     Ok(outcome) => {
                         tracing::info!(unit = %u.unit, ?outcome, "evicted unit for gaming")
                     }
@@ -242,7 +247,7 @@ pub async fn reconcile(
         }
     }
 
-    refresh_substate(state, cfg, presence).await;
+    refresh_substate(state, cfg, presence, backend).await;
     Ok(())
 }
 
@@ -256,11 +261,13 @@ async fn refresh_substate(
     state: &Arc<Mutex<ArbiterState>>,
     cfg: &Config,
     presence: &crate::presence::PresenceMonitor,
+    backend: GpuBackend,
 ) {
     // One compute-proc query feeds every unit's VRAM attribution. Best-effort: a
     // failed/absent query leaves each `vram_mb` as None so `/status` omits it
-    // rather than lying with a 0.
-    let compute = gpu::query_compute_procs().await.ok();
+    // rather than lying with a 0. (AMD returns an empty list, so attribution is
+    // simply omitted there — it must not error.)
+    let compute = backend.query_compute_procs().await.ok();
 
     let mut unit_statuses = Vec::new();
     for u in cfg.resolved_units() {
@@ -285,7 +292,7 @@ async fn refresh_substate(
             vram_mb,
         });
     }
-    let mem = gpu::query_memory().await.ok();
+    let mem = backend.query_memory().await.ok();
 
     // Snapshot the lock-free presence monitor into the embedded view so `/status`
     // and `/metrics` read a coherent, point-in-time presence record.
