@@ -16,8 +16,10 @@ the box is free for AI work.
   `gpu_backend` below. On AMD there is no per-process VRAM via sysfs, so the
   opt-in VRAM heuristic and `/status` per-unit VRAM attribution degrade to
   empty (they never error) — eviction itself works identically.
-- **systemd** (`systemctl` controls the Ollama unit; the daemon ships as a
-  systemd service)
+- **systemd** by default (`systemctl` controls the managed units; the daemon
+  ships as a systemd service). Non-systemd hosts (OpenRC/runit/plain processes)
+  are supported via per-unit `*_cmd` overrides — see [Init systems other than
+  systemd](#init-systems-other-than-systemd)
 - **root** (the `cn_proc` multicast socket needs `CAP_NET_ADMIN`; the daemon
   also drives `systemctl` and `nvidia-smi`)
 - **Ollama** installed as a systemd unit (kept `disabled` — the daemon owns its
@@ -182,13 +184,40 @@ SIGKILL` loop, in order) and restores when gaming ends. Each entry:
 
 | Field | Default | Purpose |
 |---|---|---|
-| `unit` | _(required)_ | systemd unit the daemon owns |
+| `unit` | _(required)_ | systemd unit the daemon owns (or a free-form label when command overrides are set) |
 | `eager_restart` | `true` | Restart this unit when gaming ends |
 | `vram_match` | _(none)_ | Substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution |
+| `stop_cmd` | _(none)_ | Override: command to stop/evict the tenant (`None` → `systemctl stop`) |
+| `start_cmd` | _(none)_ | Override: command to start the tenant (`None` → `systemctl start`) |
+| `is_active_cmd` | _(none)_ | Override: command whose **exit 0 = running** (`None` → `systemctl is-active`) |
+| `kill_cmd` | _(none)_ | Override: SIGKILL-escalation command (`None` → re-run `stop_cmd`) |
 
 If `managed_units` is omitted, a single entry is synthesized from the legacy
 `ollama_unit` / `eager_ollama` fields (with `vram_match = "ollama"`), so an
 unconfigured daemon behaves exactly as before.
+
+### Init systems other than systemd
+
+By default each tenant is driven by **systemd** (`systemctl stop|start|
+is-active|kill`) — that path is byte-for-byte unchanged. To run the daemon on a
+host without systemd (OpenRC on Gentoo/Artix/Alpine, runit on Void, or plain
+processes), set the per-unit `*_cmd` overrides. Commands are **shell-free** — an
+explicit argv, spawned directly (never `sh -c`), so a unit name or path can't
+inject. Each is a TOML string array, or a single string split on whitespace:
+
+```toml
+[[managed_units]]
+unit = "ollama"                              # label only; not a systemd unit
+vram_match = "ollama"
+stop_cmd = ["rc-service", "ollama", "stop"]
+start_cmd = ["rc-service", "ollama", "start"]
+is_active_cmd = "rc-service ollama status"   # exit 0 = active
+# kill_cmd optional; if omitted, SIGKILL escalation re-runs stop_cmd
+```
+
+When **all** `*_cmd` are absent for a unit it is systemd-driven exactly as
+before. There is no generic SIGKILL off systemd: without `kill_cmd`, the
+escalation step re-runs `stop_cmd` as a best-effort second teardown.
 
 Example — two GPU tenants that both yield to gaming:
 

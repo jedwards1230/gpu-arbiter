@@ -393,12 +393,21 @@ pub async fn ollama_stop(
     do_stop(&app, peer.ip(), &unit).await
 }
 
-/// Shared start logic: loopback gate → managed-unit gate → `systemctl start`.
+/// Shared start logic: loopback gate → managed-unit gate → start (via the
+/// unit's supervisor — systemd by default, command-driven if configured).
 async fn do_start(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
     if let Some(deny) = guard(&app.cfg, peer, unit) {
         return deny;
     }
-    match units::start(unit).await {
+    let Some(managed) = managed_unit(&app.cfg, unit) else {
+        // guard() already verified the unit is managed, so this is unreachable;
+        // a 404 is the safe degenerate response.
+        return (
+            StatusCode::NOT_FOUND,
+            format!("'{unit}' is not a managed unit"),
+        );
+    };
+    match units::start(&managed).await {
         Ok(()) => {
             let _ = app.triggers.send(ReconcileTrigger::Manual).await;
             (StatusCode::OK, format!("{unit} start requested"))
@@ -413,13 +422,20 @@ async fn do_start(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, Stri
     }
 }
 
-/// Shared stop logic: loopback gate → managed-unit gate → evict.
+/// Shared stop logic: loopback gate → managed-unit gate → evict (via the unit's
+/// supervisor).
 async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
     if let Some(deny) = guard(&app.cfg, peer, unit) {
         return deny;
     }
+    let Some(managed) = managed_unit(&app.cfg, unit) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("'{unit}' is not a managed unit"),
+        );
+    };
     let backend = GpuBackend::resolve(app.cfg.gpu_backend);
-    match units::evict(unit, &app.cfg, backend).await {
+    match units::evict(&managed, &app.cfg, backend).await {
         Ok(outcome) => {
             tracing::info!(%unit, ?outcome, "manual unit stop");
             let _ = app.triggers.send(ReconcileTrigger::Manual).await;
@@ -470,6 +486,14 @@ fn first_managed_unit(cfg: &Config) -> String {
 /// `/units/*`). Pure — unit-tested.
 pub fn is_managed(cfg: &Config, unit: &str) -> bool {
     cfg.resolved_units().iter().any(|u| u.unit == unit)
+}
+
+/// Resolve a unit *name* to its full [`crate::config::ManagedUnit`] (carrying any
+/// command-override fields), so the manual `/units/*` controls drive it through
+/// the same [`crate::units::Supervisor`] the reconcile loop uses. `None` when the
+/// name isn't managed. Pure.
+fn managed_unit(cfg: &Config, unit: &str) -> Option<crate::config::ManagedUnit> {
+    cfg.resolved_units().into_iter().find(|u| u.unit == unit)
 }
 
 /// Whether a peer IP is permitted to call the `/units/*` handlers (loopback

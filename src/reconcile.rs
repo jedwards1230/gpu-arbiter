@@ -216,7 +216,7 @@ pub async fn reconcile(
             // window. Gaming wins unconditionally even if one unit errors.
             state.lock().await.set_state(State::Evicting);
             for u in cfg.resolved_units() {
-                match units::evict(&u.unit, cfg, backend).await {
+                match units::evict(&u, cfg, backend).await {
                     Ok(outcome) => {
                         tracing::info!(unit = %u.unit, ?outcome, "evicted unit for gaming")
                     }
@@ -234,7 +234,7 @@ pub async fn reconcile(
             state.lock().await.set_state(State::Available);
             for u in cfg.resolved_units() {
                 if u.eager_restart
-                    && let Err(e) = units::start(&u.unit).await
+                    && let Err(e) = units::start(&u).await
                 {
                     tracing::error!(unit = %u.unit, error = %e, "eager unit restart failed");
                 }
@@ -271,7 +271,7 @@ async fn refresh_substate(
 
     let mut unit_statuses = Vec::new();
     for u in cfg.resolved_units() {
-        let running = units::is_running(&u.unit).await.unwrap_or(false);
+        let running = units::is_running(&u).await.unwrap_or(false);
         // Model listing is generic per-tenant: the introspection backend
         // (`introspect_cmd` / `kind == "ollama"` / `ollama`-named fallback) is
         // resolved from the unit's config. Only queried while the unit is running.
