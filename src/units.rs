@@ -1,16 +1,29 @@
-//! Managed-unit lifecycle: `systemctl` stop/start + `nvidia-smi` VRAM-free wait +
-//! SIGKILL escalation. The daemon is the **only** thing that starts/stops the
-//! units it manages (each is kept `disabled` so systemd never races it).
+//! Managed-unit lifecycle: stop/start + `nvidia-smi` VRAM-free wait + SIGKILL
+//! escalation. The daemon is the **only** thing that starts/stops the units it
+//! manages (each is kept `disabled` so the init system never races it).
 //!
-//! Every function is keyed off a `unit: &str` (an entry from
+//! ## Init-system abstraction
+//!
+//! Each tenant is driven through a [`Supervisor`], resolved (purely) from its
+//! [`ManagedUnit`] config:
+//!
+//! - [`Supervisor::Systemd`] (the **default** — used whenever no `*_cmd`
+//!   override is configured) runs `systemctl stop|start|is-active|kill`
+//!   verbatim, byte-for-byte the daemon's historical behavior.
+//! - [`Supervisor::Command`] runs explicit, **shell-free** argv (OpenRC, runit,
+//!   plain processes). `is_active` exit 0 = running. When no `kill` argv is
+//!   given, SIGKILL escalation falls back to re-running `stop` (there's no
+//!   generic SIGKILL without systemd).
+//!
+//! Every function is keyed off a [`ManagedUnit`] (an entry from
 //! [`crate::config::Config::resolved_units`]) rather than a single hardcoded
-//! Ollama unit, so an arbitrary ordered set of GPU tenants gets the identical
-//! `stop → poll-VRAM-free → SIGKILL` eviction.
+//! Ollama unit, so an arbitrary ordered set of GPU tenants — under any init
+//! system — gets the identical `stop → poll-VRAM-free → SIGKILL` eviction.
 //!
 //! The shell-outs use async `tokio::process::Command`. The *decisions*
-//! (whether VRAM is freed, whether to escalate) are pure helpers, unit-tested
-//! on macOS; the process invocations are thin and integration-tested on a live
-//! Linux + NVIDIA host.
+//! (resolving a [`Supervisor`], whether VRAM is freed, whether to escalate) are
+//! pure helpers, unit-tested on macOS; the process invocations are thin and
+//! integration-tested on a live Linux + NVIDIA host.
 
 use std::time::Duration;
 
@@ -20,10 +33,10 @@ use crate::gpu::{GpuBackend, GpuMemory};
 /// Managed-unit control errors.
 #[derive(Debug, thiserror::Error)]
 pub enum UnitError {
-    /// A `systemctl` invocation failed.
-    #[error("systemctl {action} {unit} failed: {detail}")]
+    /// A process-control invocation (systemd or command-driven) failed.
+    #[error("{action} {unit} failed: {detail}")]
     Systemctl {
-        /// The systemctl verb (start/stop/kill/is-active).
+        /// The control verb (start/stop/kill/is-active).
         action: String,
         /// The unit name.
         unit: String,
@@ -33,6 +46,61 @@ pub enum UnitError {
     /// The GPU query during the eviction wait failed.
     #[error("gpu query during eviction: {0}")]
     Gpu(#[from] crate::gpu::GpuError),
+}
+
+/// How a single tenant's process is controlled. Resolved purely from a
+/// [`ManagedUnit`] via [`Supervisor::resolve`].
+///
+/// `Systemd` is the default and runs the exact `systemctl` verbs the daemon
+/// always used. `Command` drives arbitrary **shell-free** argv for non-systemd
+/// init systems (OpenRC/runit) or plain processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Supervisor {
+    /// systemd-driven (default): `systemctl <verb> <unit>`.
+    Systemd,
+    /// Command-driven: explicit argv per verb (spawned directly, never `sh -c`).
+    ///
+    /// `is_active` exit 0 = running. `kill` is the SIGKILL-escalation argv; when
+    /// `None`, escalation re-runs `stop` (no generic SIGKILL off systemd).
+    Command {
+        /// argv to stop/evict the tenant.
+        stop: Vec<String>,
+        /// argv to start the tenant.
+        start: Vec<String>,
+        /// argv whose exit 0 means "active/running".
+        is_active: Vec<String>,
+        /// Optional argv to force-kill; `None` → re-run `stop`.
+        kill: Option<Vec<String>>,
+    },
+}
+
+impl Supervisor {
+    /// Resolve a tenant's [`Supervisor`] from its config. **Pure** — unit-tested.
+    ///
+    /// If **any** `*_cmd` override is present the tenant is `Command`-driven
+    /// (a missing `stop_cmd`/`start_cmd`/`is_active_cmd` becomes an empty argv,
+    /// which the runner treats as a no-op rather than silently falling back to
+    /// systemd — mixing init systems for one tenant would be a config error, not
+    /// a feature). If **none** are present the tenant is `Systemd` — the
+    /// unchanged default.
+    pub fn resolve(u: &ManagedUnit) -> Supervisor {
+        let any_override = u.stop_cmd.is_some()
+            || u.start_cmd.is_some()
+            || u.is_active_cmd.is_some()
+            || u.kill_cmd.is_some();
+        if !any_override {
+            return Supervisor::Systemd;
+        }
+        let argv = |c: &Option<crate::config::ArgvCmd>| {
+            c.as_ref().map(|a| a.argv().to_vec()).unwrap_or_default()
+        };
+        Supervisor::Command {
+            stop: argv(&u.stop_cmd),
+            start: argv(&u.start_cmd),
+            is_active: argv(&u.is_active_cmd),
+            kill: u.kill_cmd.as_ref().map(|a| a.argv().to_vec()),
+        }
+    }
 }
 
 /// Outcome of an eviction attempt — surfaced for logging/metrics.
@@ -114,13 +182,48 @@ pub fn parse_ollama_ps(out: &str) -> Vec<String> {
 }
 
 /// Run `systemctl <action> <unit>`; map a non-zero exit / spawn failure into a
-/// typed [`UnitError::Systemctl`]. Async.
+/// typed [`UnitError::Systemctl`]. Async. The systemd default path.
 async fn systemctl(action: &str, unit: &str) -> Result<std::process::Output, UnitError> {
-    let fut = tokio::process::Command::new("systemctl")
-        .arg(action)
-        .arg(unit)
-        .output();
-    // A wedged systemd must never hang the reconcile task — bound it.
+    run_argv(
+        action,
+        unit,
+        &["systemctl".to_string(), action.to_string()],
+        unit,
+    )
+    .await
+}
+
+/// Spawn a shell-free argv (`prog argv...`) plus a final `unit_arg`, bound by
+/// [`SYSTEMCTL_TIMEOUT`]; map a spawn failure / timeout into a typed
+/// [`UnitError::Systemctl`]. **Never** routes through a shell.
+///
+/// `action`/`unit` only label the error. The systemd path passes
+/// `["systemctl", "<verb>"]` + the unit as `unit_arg`; the command path passes
+/// the configured argv with `unit_arg` empty (the unit is already baked into the
+/// argv).
+async fn run_argv(
+    action: &str,
+    unit: &str,
+    argv: &[String],
+    unit_arg: &str,
+) -> Result<std::process::Output, UnitError> {
+    let Some((prog, rest)) = argv.split_first() else {
+        // Empty argv (e.g. a Command supervisor missing this verb) — nothing to
+        // run. Surface as a typed error so callers don't silently no-op a
+        // start/stop they expected to happen.
+        return Err(UnitError::Systemctl {
+            action: action.to_string(),
+            unit: unit.to_string(),
+            detail: "empty command (no override configured for this verb)".to_string(),
+        });
+    };
+    let mut cmd = tokio::process::Command::new(prog);
+    cmd.args(rest);
+    if !unit_arg.is_empty() {
+        cmd.arg(unit_arg);
+    }
+    let fut = cmd.output();
+    // A wedged init system / hung command must never hang the reconcile task.
     tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut)
         .await
         .map_err(|_| UnitError::Systemctl {
@@ -135,13 +238,19 @@ async fn systemctl(action: &str, unit: &str) -> Result<std::process::Output, Uni
         })
 }
 
-/// Query whether `unit` is currently active.
+/// Query whether `u` is currently active, via its resolved [`Supervisor`].
 ///
-/// `systemctl is-active <unit>` exits 0 (stdout `active`) when running and
-/// non-zero otherwise — a non-zero exit here is **not** an error, it's the
-/// "inactive" answer. Only a spawn failure surfaces as [`UnitError`].
-pub async fn is_running(unit: &str) -> Result<bool, UnitError> {
-    let out = systemctl("is-active", unit).await?;
+/// Both `systemctl is-active <unit>` and a configured `is_active_cmd` follow the
+/// same convention: **exit 0 = active/running**, non-zero = inactive (not an
+/// error — it's the "inactive" answer). Only a spawn failure surfaces as
+/// [`UnitError`].
+pub async fn is_running(u: &ManagedUnit) -> Result<bool, UnitError> {
+    let out = match Supervisor::resolve(u) {
+        Supervisor::Systemd => systemctl("is-active", &u.unit).await?,
+        Supervisor::Command { is_active, .. } => {
+            run_argv("is-active", &u.unit, &is_active, "").await?
+        }
+    };
     Ok(out.status.success())
 }
 
@@ -217,16 +326,19 @@ async fn ollama_loaded_models() -> Vec<String> {
     }
 }
 
-/// Start `unit` (eager warm-up after a verified `gaming → available`
-/// transition). A non-zero `systemctl start` exit is a real failure.
-pub async fn start(unit: &str) -> Result<(), UnitError> {
-    let out = systemctl("start", unit).await?;
+/// Start `u` (eager warm-up after a verified `gaming → available` transition),
+/// via its resolved [`Supervisor`]. A non-zero start exit is a real failure.
+pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
+    let out = match Supervisor::resolve(u) {
+        Supervisor::Systemd => systemctl("start", &u.unit).await?,
+        Supervisor::Command { start, .. } => run_argv("start", &u.unit, &start, "").await?,
+    };
     if out.status.success() {
         Ok(())
     } else {
         Err(UnitError::Systemctl {
             action: "start".to_string(),
-            unit: unit.to_string(),
+            unit: u.unit.clone(),
             detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         })
     }
@@ -255,22 +367,24 @@ pub async fn start(unit: &str) -> Result<(), UnitError> {
 /// The GPU poll failing is non-fatal: a missing/erroring `nvidia-smi` reading is
 /// treated as "not yet free", so the worst case is escalation, never a stall.
 pub async fn evict(
-    unit: &str,
+    u: &ManagedUnit,
     cfg: &Config,
     backend: GpuBackend,
 ) -> Result<EvictionOutcome, UnitError> {
+    let sup = Supervisor::resolve(u);
+
     // Nothing to do if the unit isn't running.
-    if !is_running(unit).await? {
+    if !is_running(u).await? {
         return Ok(EvictionOutcome::AlreadyClear);
     }
 
     // Graceful teardown: SIGTERM frees the CUDA context in ~1s. An in-flight
     // request dying is accepted by design.
-    let stop = systemctl("stop", unit).await?;
+    let stop = stop_unit(&sup, &u.unit).await?;
     if !stop.status.success() {
         return Err(UnitError::Systemctl {
             action: "stop".to_string(),
-            unit: unit.to_string(),
+            unit: u.unit.clone(),
             detail: String::from_utf8_lossy(&stop.stderr).trim().to_string(),
         });
     }
@@ -287,19 +401,19 @@ pub async fn evict(
         match eviction_step(mem, start.elapsed(), cfg) {
             EvictionStep::Freed => return Ok(EvictionOutcome::Freed),
             EvictionStep::Escalate => {
-                // Timed out on VRAM — but `systemctl stop` already reaped the
-                // unit synchronously, so the only way we're here is either real
+                // Timed out on VRAM — but the stop already reaped the unit
+                // synchronously, so the only way we're here is either real
                 // VRAM pressure OR a flaky `nvidia-smi` (read as u64::MAX → never
                 // "free"). VRAM free *or PID gone* gate: if the unit
                 // is already inactive, the process is gone and its CUDA context
                 // (hence VRAM) released — SIGKILL would hit nothing. Treat that as
                 // a graceful release instead of a misleading `Escalated`.
-                if !is_running(unit).await.unwrap_or(true) {
+                if !is_running(u).await.unwrap_or(true) {
                     return Ok(EvictionOutcome::Freed);
                 }
                 // Unit genuinely still up (orphaned runner outside the cgroup,
                 // wedged teardown): force-kill and proceed — gaming wins the GPU.
-                let _ = systemctl_kill(unit).await;
+                let _ = kill_unit(&sup, &u.unit).await;
                 return Ok(EvictionOutcome::Escalated);
             }
             EvictionStep::KeepWaiting => {
@@ -309,25 +423,45 @@ pub async fn evict(
     }
 }
 
-/// SIGKILL a unit's processes (`systemctl kill -s SIGKILL <unit>`).
-/// Best-effort escalation — the caller proceeds regardless of the result.
-async fn systemctl_kill(unit: &str) -> Result<(), UnitError> {
-    let fut = tokio::process::Command::new("systemctl")
-        .args(["kill", "-s", "SIGKILL"])
-        .arg(unit)
-        .output();
-    let out = tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut)
-        .await
-        .map_err(|_| UnitError::Systemctl {
-            action: "kill".to_string(),
-            unit: unit.to_string(),
-            detail: format!("timed out after {SYSTEMCTL_TIMEOUT:?}"),
-        })?
-        .map_err(|e| UnitError::Systemctl {
-            action: "kill".to_string(),
-            unit: unit.to_string(),
-            detail: format!("spawn failed: {e}"),
-        })?;
+/// Stop a unit via its supervisor (`systemctl stop` or the `stop` argv).
+async fn stop_unit(sup: &Supervisor, unit: &str) -> Result<std::process::Output, UnitError> {
+    match sup {
+        Supervisor::Systemd => systemctl("stop", unit).await,
+        Supervisor::Command { stop, .. } => run_argv("stop", unit, stop, "").await,
+    }
+}
+
+/// SIGKILL a unit's processes — best-effort escalation, the caller proceeds
+/// regardless of the result.
+///
+/// - `Systemd`: `systemctl kill -s SIGKILL <unit>`.
+/// - `Command` with a `kill` argv: run it.
+/// - `Command` without a `kill` argv: there's no generic SIGKILL off systemd, so
+///   fall back to re-running `stop` (best-effort second teardown attempt).
+async fn kill_unit(sup: &Supervisor, unit: &str) -> Result<(), UnitError> {
+    let out = match sup {
+        Supervisor::Systemd => {
+            run_argv(
+                "kill",
+                unit,
+                &[
+                    "systemctl".to_string(),
+                    "kill".to_string(),
+                    "-s".to_string(),
+                    "SIGKILL".to_string(),
+                ],
+                unit,
+            )
+            .await?
+        }
+        Supervisor::Command {
+            kill: Some(kill), ..
+        } => run_argv("kill", unit, kill, "").await?,
+        // No kill argv: re-run stop (no generic SIGKILL without systemd).
+        Supervisor::Command {
+            kill: None, stop, ..
+        } => run_argv("kill", unit, stop, "").await?,
+    };
     if out.status.success() {
         Ok(())
     } else {
@@ -455,12 +589,28 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         assert!(parse_ollama_ps("\n\n").is_empty());
     }
 
+    /// A bare systemd-driven managed unit (no command overrides) — the default
+    /// supervisor path.
+    fn systemd_unit(name: &str) -> ManagedUnit {
+        ManagedUnit {
+            unit: name.to_string(),
+            eager_restart: true,
+            vram_match: None,
+            kind: None,
+            introspect_cmd: None,
+            stop_cmd: None,
+            start_cmd: None,
+            is_active_cmd: None,
+            kill_cmd: None,
+        }
+    }
+
     #[tokio::test]
     async fn is_running_false_when_systemctl_absent() {
         // On macOS / CI there is typically no systemctl; spawn failure surfaces
         // as a typed error rather than a panic. On a systemd host this returns a
-        // real bool. Either way: not a panic.
-        let r = is_running("ollama.service").await;
+        // real bool. Either way: not a panic. (Default supervisor = Systemd.)
+        let r = is_running(&systemd_unit("ollama.service")).await;
         assert!(r.is_ok() || matches!(r, Err(UnitError::Systemctl { .. })));
     }
 
@@ -471,6 +621,10 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             vram_match: None,
             kind: kind.map(str::to_string),
             introspect_cmd: introspect_cmd.map(str::to_string),
+            stop_cmd: None,
+            start_cmd: None,
+            is_active_cmd: None,
+            kill_cmd: None,
         }
     }
 
@@ -569,5 +723,95 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         .await;
         let none = loaded_models(&unit("x.service", None, None)).await;
         assert!(none.is_empty()); // Introspection::None → always empty
+    }
+
+    // ── Supervisor resolution (pure decision) ──────────────────────────────
+
+    #[test]
+    fn resolve_no_overrides_is_systemd() {
+        // The byte-for-byte default contract: a unit with zero `*_cmd` keys is
+        // systemd-driven.
+        assert_eq!(
+            Supervisor::resolve(&systemd_unit("ollama.service")),
+            Supervisor::Systemd
+        );
+    }
+
+    #[test]
+    fn resolve_with_overrides_is_command() {
+        // Any override flips the tenant to Command-driven, carrying the argv
+        // through. Mirrors a parsed OpenRC config.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama"
+            stop_cmd = ["rc-service", "ollama", "stop"]
+            start_cmd = ["rc-service", "ollama", "start"]
+            is_active_cmd = "rc-service ollama status"
+            kill_cmd = ["pkill", "-9", "ollama"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            Supervisor::resolve(&cfg.managed_units[0]),
+            Supervisor::Command {
+                stop: vec!["rc-service".into(), "ollama".into(), "stop".into()],
+                start: vec!["rc-service".into(), "ollama".into(), "start".into()],
+                is_active: vec!["rc-service".into(), "ollama".into(), "status".into()],
+                kill: Some(vec!["pkill".into(), "-9".into(), "ollama".into()]),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_command_without_kill_leaves_kill_none() {
+        // No kill_cmd → kill is None; the runner falls back to re-running stop.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "asr"
+            stop_cmd = "sv down asr"
+            start_cmd = "sv up asr"
+            is_active_cmd = "sv status asr"
+            "#,
+        )
+        .unwrap();
+        let sup = Supervisor::resolve(&cfg.managed_units[0]);
+        match sup {
+            Supervisor::Command { kill, stop, .. } => {
+                assert_eq!(kill, None);
+                // The stop argv is what the kill fallback would re-run.
+                assert_eq!(
+                    stop,
+                    vec!["sv".to_string(), "down".to_string(), "asr".to_string()]
+                );
+            }
+            Supervisor::Systemd => panic!("expected Command supervisor"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_is_running_uses_exit_status() {
+        // exit 0 = active. `true`/`false` are POSIX binaries present on macOS &
+        // Linux, so this exercises the Command is-active path without systemd.
+        let mut active = systemd_unit("dummy");
+        active.is_active_cmd = Some(crate::config::ArgvCmd(vec!["true".to_string()]));
+        assert!(is_running(&active).await.unwrap());
+
+        let mut inactive = systemd_unit("dummy");
+        inactive.is_active_cmd = Some(crate::config::ArgvCmd(vec!["false".to_string()]));
+        assert!(!is_running(&inactive).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn command_is_running_empty_argv_is_typed_error() {
+        // A Command supervisor whose is_active argv is empty (override present on
+        // another verb but not this one) surfaces a typed error, never a panic.
+        let mut u = systemd_unit("dummy");
+        u.is_active_cmd = Some(crate::config::ArgvCmd(vec![]));
+        // Force Command resolution by also setting another override.
+        u.stop_cmd = Some(crate::config::ArgvCmd(vec!["true".to_string()]));
+        let r = is_running(&u).await;
+        assert!(matches!(r, Err(UnitError::Systemctl { .. })));
     }
 }

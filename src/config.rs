@@ -82,11 +82,30 @@ pub enum GpuBackendKind {
     Amd,
 }
 
-/// One systemd unit the arbiter owns and evicts from the GPU when a game
-/// launches (stop → poll-VRAM-free → SIGKILL, the same loop the single Ollama
-/// unit used to get).
+/// One GPU tenant the arbiter owns and evicts from the GPU when a game launches
+/// (stop → poll-VRAM-free → SIGKILL, the same loop the single Ollama unit used
+/// to get).
 ///
-/// Renders in TOML as:
+/// By default the tenant is driven by **systemd** (`systemctl stop|start|
+/// is-active|kill`), exactly as the daemon has always behaved. The optional
+/// `*_cmd` fields override that with arbitrary process-control commands so the
+/// daemon can drive OpenRC (Gentoo/Artix/Alpine), runit (Void), or plain
+/// processes — see [`crate::units::Supervisor`]. When **all** `*_cmd` overrides
+/// are absent the tenant is byte-for-byte systemd-driven.
+///
+/// ## Command form — shell-free argv (no injection surface)
+///
+/// Each `*_cmd` is parsed as an explicit argv list, **never** through a shell
+/// (no `sh -c`), so a unit name or path with a space/quote/`$`/`;` can't break
+/// out and inject arbitrary commands. Two equivalent TOML spellings are
+/// accepted (see [`ArgvCmd`]):
+///
+/// - a string array — `stop_cmd = ["rc-service", "ollama", "stop"]`
+/// - a single string split on ASCII whitespace —
+///   `stop_cmd = "rc-service ollama stop"` (convenience; no quoting/escaping —
+///   if an argument must contain a space, use the array form).
+///
+/// Renders in TOML as (systemd default — no overrides):
 /// ```toml
 /// [[managed_units]]
 /// unit = "ollama.service"
@@ -95,9 +114,21 @@ pub enum GpuBackendKind {
 /// kind = "ollama"          # introspection backend for /status models[] (optional)
 /// introspect_cmd = "ollama ps"  # explicit model-list command (optional, overrides kind)
 /// ```
+///
+/// Or, command-driven (OpenRC example):
+/// ```toml
+/// [[managed_units]]
+/// unit = "ollama"                              # label only; not a systemd unit
+/// vram_match = "ollama"
+/// stop_cmd = ["rc-service", "ollama", "stop"]
+/// start_cmd = ["rc-service", "ollama", "start"]
+/// is_active_cmd = "rc-service ollama status"   # exit 0 = active
+/// # kill_cmd optional; if omitted, escalation re-runs stop_cmd
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ManagedUnit {
-    /// systemd unit the daemon exclusively owns.
+    /// systemd unit the daemon exclusively owns — or, when `*_cmd` overrides are
+    /// set, a free-form label for `/status` and logging.
     pub unit: String,
     /// Restart this unit when gaming ends (eager warm-up). Defaults to `true`.
     #[serde(default = "default_true")]
@@ -128,6 +159,22 @@ pub struct ManagedUnit {
     /// the OS argv limit.
     #[serde(default)]
     pub introspect_cmd: Option<String>,
+    /// Override: argv to stop/evict the tenant. `None` → `systemctl stop`.
+    #[serde(default)]
+    pub stop_cmd: Option<ArgvCmd>,
+    /// Override: argv to start the tenant. `None` → `systemctl start`.
+    #[serde(default)]
+    pub start_cmd: Option<ArgvCmd>,
+    /// Override: argv whose **exit 0 = active/running**. `None` →
+    /// `systemctl is-active`.
+    #[serde(default)]
+    pub is_active_cmd: Option<ArgvCmd>,
+    /// Override: argv to force-kill (SIGKILL escalation). `None` for a
+    /// command-driven tenant falls back to re-running `stop_cmd` (there's no
+    /// generic SIGKILL without systemd). Ignored under systemd
+    /// (`systemctl kill -s SIGKILL` is used).
+    #[serde(default)]
+    pub kill_cmd: Option<ArgvCmd>,
 }
 
 impl ManagedUnit {
@@ -166,6 +213,47 @@ impl ManagedUnit {
                 }
             }
         }
+    }
+}
+
+/// A shell-free command: an explicit argv (`argv[0]` is the program, the rest
+/// are arguments). Spawned directly via `tokio::process::Command` — **never**
+/// `sh -c` — so no metacharacter in a unit name/path is ever interpreted.
+///
+/// Deserializes from either a TOML string array (each element a literal arg) or
+/// a single string (split on ASCII whitespace into args). The whitespace-split
+/// form is a convenience for the common no-spaces-in-args case; use the array
+/// form when an argument must contain a space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArgvCmd(pub Vec<String>);
+
+impl ArgvCmd {
+    /// The argv as a slice. `argv()[0]` is the program; the rest are args.
+    /// Empty only if a config supplied an empty array / blank string (callers
+    /// treat that as a no-op).
+    pub fn argv(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ArgvCmd {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Accept both spellings via an untagged shim.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            List(Vec<String>),
+            Str(String),
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::List(v) => ArgvCmd(v),
+            // Split on ASCII whitespace (shell-free): collapses runs, drops
+            // empties — no quoting/escaping is interpreted.
+            Raw::Str(s) => ArgvCmd(s.split_whitespace().map(str::to_string).collect()),
+        })
     }
 }
 
@@ -308,6 +396,11 @@ impl Config {
                 vram_match: Some("ollama".to_string()),
                 kind: Some("ollama".to_string()),
                 introspect_cmd: None,
+                // Legacy synthesized unit is always systemd-driven (no overrides).
+                stop_cmd: None,
+                start_cmd: None,
+                is_active_cmd: None,
+                kill_cmd: None,
             }]
         } else {
             self.managed_units.clone()
@@ -511,6 +604,93 @@ mod tests {
             Config::from_toml("gpu_backend = \"intel\"").unwrap_err(),
             ConfigError::Parse(_)
         ));
+    }
+
+    #[test]
+    fn managed_unit_defaults_have_no_command_overrides() {
+        // A unit with no `*_cmd` keys stays systemd-driven (all overrides None) —
+        // the byte-for-byte-unchanged-default contract.
+        let c = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama.service"
+            "#,
+        )
+        .unwrap();
+        let u = &c.managed_units[0];
+        assert_eq!(u.stop_cmd, None);
+        assert_eq!(u.start_cmd, None);
+        assert_eq!(u.is_active_cmd, None);
+        assert_eq!(u.kill_cmd, None);
+    }
+
+    #[test]
+    fn argv_cmd_parses_string_array_form() {
+        // Array form: each element is a literal argv entry (spaces preserved).
+        let c = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama"
+            stop_cmd = ["rc-service", "ollama", "stop"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.managed_units[0].stop_cmd.as_ref().unwrap().argv(),
+            ["rc-service", "ollama", "stop"]
+        );
+    }
+
+    #[test]
+    fn argv_cmd_parses_single_string_split_on_whitespace() {
+        // String form: split on ASCII whitespace, collapsing runs — shell-free,
+        // no quoting interpreted.
+        let c = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama"
+            is_active_cmd = "rc-service   ollama status"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.managed_units[0].is_active_cmd.as_ref().unwrap().argv(),
+            ["rc-service", "ollama", "status"]
+        );
+    }
+
+    #[test]
+    fn argv_cmd_all_four_overrides_parse() {
+        // The full command-driven (e.g. OpenRC) tenant: stop/start/is_active/kill.
+        let c = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama"
+            vram_match = "ollama"
+            stop_cmd = ["rc-service", "ollama", "stop"]
+            start_cmd = ["rc-service", "ollama", "start"]
+            is_active_cmd = "rc-service ollama status"
+            kill_cmd = ["pkill", "-9", "ollama"]
+            "#,
+        )
+        .unwrap();
+        let u = &c.managed_units[0];
+        assert_eq!(
+            u.stop_cmd.as_ref().unwrap().argv(),
+            ["rc-service", "ollama", "stop"]
+        );
+        assert_eq!(
+            u.start_cmd.as_ref().unwrap().argv(),
+            ["rc-service", "ollama", "start"]
+        );
+        assert_eq!(
+            u.is_active_cmd.as_ref().unwrap().argv(),
+            ["rc-service", "ollama", "status"]
+        );
+        assert_eq!(
+            u.kill_cmd.as_ref().unwrap().argv(),
+            ["pkill", "-9", "ollama"]
+        );
     }
 
     #[test]
