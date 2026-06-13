@@ -82,12 +82,19 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     drop(guard);
+    // `now`/threshold are read HERE (impure edge) and passed into the pure
+    // renderer, exactly like `since_unix`, so `render_metrics` reads no clocks.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let threshold_s = app.cfg.presence_idle_threshold_s as i64;
     (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        render_metrics(&snap, since_unix),
+        render_metrics(&snap, since_unix, now_unix, threshold_s),
     )
 }
 
@@ -109,7 +116,24 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
 /// - `gpu_arbiter_vram_used_mib` / `gpu_arbiter_vram_total_mib` — total GPU VRAM.
 /// - `gpu_arbiter_unit_running{unit}` — `1` if a managed unit is active.
 /// - `gpu_arbiter_unit_vram_mib{unit}` — VRAM attributed to a managed unit.
-pub fn render_metrics(snap: &StatusSnapshot, since_unix: u64) -> String {
+/// - `gpu_arbiter_local_input_last_seconds` — unix time of the most recent
+///   physical human input (keyboard/mouse/gamepad).
+/// - `gpu_arbiter_local_present` — `1` if a human is at the desk (recent physical
+///   input AND the monitor is up); `0` otherwise. **Down monitor ⇒ 0 here**, but
+///   `gpu_arbiter_input_monitor_up` distinguishes "absent" from "unknown" so an
+///   alert can refuse to suppress on `input_monitor_up == 0`.
+/// - `gpu_arbiter_physical_input_devices` — count of watched physical input
+///   devices (virtual streamed devices excluded).
+/// - `gpu_arbiter_input_monitor_up` — `1` if presence detection is healthy.
+///
+/// `now_unix` and `presence_threshold_s` are passed in (not read from a clock)
+/// so the renderer stays pure — same discipline as `since_unix`.
+pub fn render_metrics(
+    snap: &StatusSnapshot,
+    since_unix: u64,
+    now_unix: i64,
+    presence_threshold_s: i64,
+) -> String {
     use std::fmt::Write as _;
     let mut o = String::with_capacity(1024);
 
@@ -219,6 +243,54 @@ pub fn render_metrics(snap: &StatusSnapshot, since_unix: u64) -> String {
             );
         }
     }
+
+    // ── local presence ──────────────────────────────────────────────────────
+    let present = crate::presence::is_local_present(
+        snap.local_input_last_unix,
+        now_unix,
+        presence_threshold_s,
+        snap.input_monitor_up,
+    );
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_local_input_last_seconds Unix time of the most recent physical human input."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_local_input_last_seconds gauge");
+    let _ = writeln!(
+        o,
+        "gpu_arbiter_local_input_last_seconds {}",
+        snap.local_input_last_unix
+    );
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_local_present 1 if a human is locally present (recent physical input, monitor up)."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_local_present gauge");
+    let _ = writeln!(o, "gpu_arbiter_local_present {}", u8::from(present));
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_physical_input_devices Count of watched physical human-input devices."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_physical_input_devices gauge");
+    let _ = writeln!(
+        o,
+        "gpu_arbiter_physical_input_devices {}",
+        snap.physical_input_devices
+    );
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_input_monitor_up 1 if presence detection is healthy (else presence is unknown)."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_input_monitor_up gauge");
+    let _ = writeln!(
+        o,
+        "gpu_arbiter_input_monitor_up {}",
+        u8::from(snap.input_monitor_up)
+    );
 
     o
 }
@@ -499,8 +571,13 @@ mod tests {
             gpu_vram_used_mb: 21500,
             gpu_vram_total_mb: 32768,
             since: "2023-11-14T22:13:20Z".into(),
+            // A human is at the desk: physical input 30s ago, monitor up, 2 devices.
+            local_input_last_unix: 1_699_999_970,
+            physical_input_devices: 2,
+            input_monitor_up: true,
         };
-        let out = render_metrics(&snap, 1_700_000_000);
+        // now = last_input + 30s, threshold 600s → present.
+        let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
 
         assert!(out.contains("gpu_arbiter_up 1"));
         assert!(out.contains("gpu_arbiter_build_info{version=\"1.2.3\"} 1"));
@@ -516,6 +593,11 @@ mod tests {
         assert!(out.contains("gpu_arbiter_vram_total_mib 32768"));
         // No VRAM attributed to the unit (vram_mb None) → no per-unit vram line.
         assert!(!out.contains("gpu_arbiter_unit_vram_mib{unit=\"ollama.service\"}"));
+        // Presence: recent physical input + monitor up → present, with device count.
+        assert!(out.contains("gpu_arbiter_local_present 1"));
+        assert!(out.contains("gpu_arbiter_local_input_last_seconds 1699999970"));
+        assert!(out.contains("gpu_arbiter_physical_input_devices 2"));
+        assert!(out.contains("gpu_arbiter_input_monitor_up 1"));
     }
 
     /// An available snapshot with Ollama running: `gaming` is 0, no claim series
@@ -536,8 +618,13 @@ mod tests {
             gpu_vram_used_mb: 21000,
             gpu_vram_total_mb: 32768,
             since: "2023-11-14T22:13:20Z".into(),
+            // Nobody at the desk: last physical input was 1h ago, monitor up.
+            local_input_last_unix: 1_699_996_400,
+            physical_input_devices: 3,
+            input_monitor_up: true,
         };
-        let out = render_metrics(&snap, 1_700_000_000);
+        // now = last_input + 3600s, threshold 600s → absent.
+        let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
 
         assert!(out.contains("gpu_arbiter_gaming 0"));
         assert!(out.contains("gpu_arbiter_state{state=\"available\"} 1"));
@@ -546,6 +633,36 @@ mod tests {
         assert!(!out.contains("gpu_arbiter_claim{"));
         assert!(out.contains("gpu_arbiter_unit_running{unit=\"ollama.service\"} 1"));
         assert!(out.contains("gpu_arbiter_unit_vram_mib{unit=\"ollama.service\"} 21000"));
+        // Presence: stale input (1h) beyond the 600s threshold → absent, but the
+        // monitor is up so this is a confident "absent", not "unknown".
+        assert!(out.contains("gpu_arbiter_local_present 0"));
+        assert!(out.contains("gpu_arbiter_input_monitor_up 1"));
+        assert!(out.contains("gpu_arbiter_physical_input_devices 3"));
+    }
+
+    /// Monitor-down fail-safe: even with a recent input timestamp, an unhealthy
+    /// monitor renders `local_present 0` AND `input_monitor_up 0`, so an alert can
+    /// tell "absent" from "unknown" and refuse to suppress on a down monitor.
+    #[test]
+    fn render_metrics_monitor_down_is_unknown() {
+        let snap = StatusSnapshot {
+            version: "1.2.3".into(),
+            state: State::Available,
+            claims: vec![],
+            units: vec![],
+            ollama: UnitStatus::default(),
+            gpu_vram_used_mb: 0,
+            gpu_vram_total_mb: 0,
+            since: "2023-11-14T22:13:20Z".into(),
+            // Recent timestamp, but the monitor is DOWN → presence unknown.
+            local_input_last_unix: 1_699_999_990,
+            physical_input_devices: 0,
+            input_monitor_up: false,
+        };
+        let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
+        assert!(out.contains("gpu_arbiter_local_present 0"));
+        assert!(out.contains("gpu_arbiter_input_monitor_up 0"));
+        assert!(out.contains("gpu_arbiter_physical_input_devices 0"));
     }
 
     /// Every emitted sample line is preceded by its `# TYPE`, and each metric
@@ -561,8 +678,11 @@ mod tests {
             gpu_vram_used_mb: 0,
             gpu_vram_total_mb: 0,
             since: "1970-01-01T00:00:00Z".into(),
+            local_input_last_unix: 0,
+            physical_input_devices: 1,
+            input_monitor_up: true,
         };
-        let out = render_metrics(&snap, 0);
+        let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
         for line in out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
             // "metric_name[{labels}] value" — split on the LAST space.
             let (name, value) = line.rsplit_once(' ').expect("sample line has a value");

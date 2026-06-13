@@ -65,6 +65,7 @@ mod linux {
 
     use gpu_arbiter::config::Config;
     use gpu_arbiter::http::{self, AppState};
+    use gpu_arbiter::presence::{self, PresenceMonitor};
     use gpu_arbiter::procmon;
     use gpu_arbiter::reconcile;
     use gpu_arbiter::state::{ArbiterState, ReconcileTrigger};
@@ -126,11 +127,22 @@ mod linux {
         let state = Arc::new(Mutex::new(ArbiterState::new()));
         let (triggers_tx, triggers_rx) = mpsc::channel::<ReconcileTrigger>(TRIGGER_CHANNEL_DEPTH);
 
+        // 2b. Local-presence monitor. Seed `last_input` to NOW (the startup bias)
+        //     so a fresh boot doesn't instantly look "abandoned" before any real
+        //     input arrives. It's a lock-free shared signal; reconcile snapshots it
+        //     into ArbiterState each pass for /status + /metrics.
+        let start_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let presence = PresenceMonitor::new(start_unix);
+
         // 3. STARTUP reconcile BEFORE anything else can drive Ollama: a daemon
         //    restart or boot must never start Ollama into a live game. Run one
         //    synchronous pass here; nothing else touches Ollama until it returns
         //    (the reconcile task and HTTP server aren't spawned yet).
-        if let Err(e) = reconcile::reconcile(&state, &cfg, ReconcileTrigger::Timer).await {
+        if let Err(e) = reconcile::reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer).await
+        {
             // A failed startup reconcile is non-fatal: we log and continue —
             // the periodic backstop will retry. We do NOT start Ollama on
             // our own here; reconcile is the only thing that does.
@@ -138,9 +150,27 @@ mod linux {
         }
         tracing::info!(state = ?state.lock().await.state, "startup reconcile complete");
 
+        // 3b. Presence watcher: epoll-watch physical input devices, re-enumerate on
+        //     hotplug + the reconcile cadence backstop. Gated on the config toggle —
+        //     when off, the monitor stays down and presence reports unknown.
+        let presence_handle = if cfg.presence_detection {
+            let monitor = presence.clone();
+            let interval = Duration::from_secs(cfg.reconcile_interval_s.max(1));
+            Some(tokio::spawn(async move {
+                presence::run(monitor, interval).await
+            }))
+        } else {
+            tracing::info!("presence detection disabled in config; presence reported unknown");
+            None
+        };
+
         // 4. The single reconcile task that owns state mutation going forward.
-        let reconcile_handle =
-            tokio::spawn(reconcile_task(state.clone(), cfg.clone(), triggers_rx));
+        let reconcile_handle = tokio::spawn(reconcile_task(
+            state.clone(),
+            cfg.clone(),
+            presence.clone(),
+            triggers_rx,
+        ));
 
         // 5. cn_proc netlink listener → ProcEvent triggers.
         let procmon_handle = tokio::spawn({
@@ -176,6 +206,9 @@ mod linux {
         reconcile_handle.abort();
         procmon_handle.abort();
         http_handle.abort();
+        if let Some(h) = presence_handle {
+            h.abort();
+        }
 
         Ok(())
     }
@@ -194,6 +227,7 @@ mod linux {
     async fn reconcile_task(
         state: Arc<Mutex<ArbiterState>>,
         cfg: Arc<Config>,
+        presence: PresenceMonitor,
         mut triggers: mpsc::Receiver<ReconcileTrigger>,
     ) {
         let mut interval =
@@ -225,7 +259,7 @@ mod linux {
             // reconcile() manages the state lock internally — it holds it only
             // for brief mutations and DROPS it across the slow eviction/shell-out
             // window so `/status` never blocks (see reconcile docs).
-            if let Err(e) = reconcile::reconcile(&state, &cfg, effective).await {
+            if let Err(e) = reconcile::reconcile(&state, &cfg, &presence, effective).await {
                 tracing::error!(error = %e, "reconcile pass failed");
             }
         }

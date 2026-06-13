@@ -130,6 +130,19 @@ pub struct StatusSnapshot {
     pub gpu_vram_total_mb: u64,
     /// RFC 3339 timestamp the current state was entered.
     pub since: String,
+
+    // ── local presence ───────────────────────────────────────────────────────
+    /// Unix seconds of the most recent **physical** human input (keyboard/mouse/
+    /// gamepad), used to tell whether someone is at the desk. The daemon seeds
+    /// this to its start time at boot (so a fresh boot isn't instantly
+    /// "abandoned"); `0` only if presence detection never ran.
+    pub local_input_last_unix: i64,
+    /// Count of physical human-input devices currently watched (virtual
+    /// inputtino/Sunshine devices are excluded).
+    pub physical_input_devices: u32,
+    /// Whether the input monitor is healthy. `false` ⇒ presence is **unknown**
+    /// (fail-safe: an alert must not suppress on a down monitor).
+    pub input_monitor_up: bool,
 }
 
 impl StatusSnapshot {
@@ -164,6 +177,26 @@ pub struct ArbiterState {
     pub gpu_vram_total_mb: u64,
     /// When the current `state` was entered.
     pub since: SystemTime,
+    /// Last refreshed local-presence view (read from the [`crate::presence`]
+    /// monitor each reconcile). Cross-platform; on non-Linux it stays at its
+    /// "monitor down" default.
+    pub presence: Presence,
+}
+
+/// The local-presence view embedded in [`ArbiterState`] / [`StatusSnapshot`],
+/// refreshed each reconcile from the lock-free [`crate::presence::PresenceMonitor`].
+/// Pure data — cross-platform.
+///
+/// The `Default` (all-zero / `monitor_up = false`) is the cross-platform /
+/// pre-enumeration state: monitor down, nothing observed ⇒ presence unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Presence {
+    /// Unix seconds of the most recent physical input event (0 if never observed).
+    pub last_input_unix: i64,
+    /// Count of watched physical human-input devices.
+    pub devices: u32,
+    /// Whether the input monitor is healthy (false ⇒ presence unknown).
+    pub monitor_up: bool,
 }
 
 impl Default for ArbiterState {
@@ -175,6 +208,7 @@ impl Default for ArbiterState {
             gpu_vram_used_mb: 0,
             gpu_vram_total_mb: 0,
             since: SystemTime::now(),
+            presence: Presence::default(),
         }
     }
 }
@@ -218,6 +252,9 @@ impl ArbiterState {
             gpu_vram_used_mb: self.gpu_vram_used_mb,
             gpu_vram_total_mb: self.gpu_vram_total_mb,
             since: format_rfc3339(self.since),
+            local_input_last_unix: self.presence.last_input_unix,
+            physical_input_devices: self.presence.devices,
+            input_monitor_up: self.presence.monitor_up,
         }
     }
 }

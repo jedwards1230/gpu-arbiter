@@ -78,6 +78,8 @@ pub struct ManagedUnit {
 /// | `vram_heuristic` | `gpu_arbiter_vram_heuristic` |
 /// | `vram_game_threshold_mb` | `gpu_arbiter_vram_game_threshold_mb` |
 /// | `gpu_allowlist` | `gpu_arbiter_gpu_allowlist` |
+/// | `presence_detection` | `gpu_arbiter_presence_detection` |
+/// | `presence_idle_threshold_s` | `gpu_arbiter_presence_idle_threshold_s` |
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -117,6 +119,15 @@ pub struct Config {
     pub vram_game_threshold_mb: u64,
     /// Sanctioned GPU tenants (for the heuristic + a sanity log line).
     pub gpu_allowlist: Vec<String>,
+
+    // ── presence ─────────────────────────────────────────────────────────────
+    /// Watch physical (non-virtual) human-input devices to report whether a human
+    /// is locally present (`gpu_arbiter_local_present`). On by default; disabling
+    /// it leaves the monitor down and presence reported unknown.
+    pub presence_detection: bool,
+    /// Seconds of physical-input silence after which the box is considered
+    /// unattended (`now - last_input >= threshold` ⇒ `local_present = 0`).
+    pub presence_idle_threshold_s: u64,
 }
 
 impl Default for Config {
@@ -140,6 +151,8 @@ impl Default for Config {
                 "plasmashell".to_string(),
                 "Xwayland".to_string(),
             ],
+            presence_detection: true,
+            presence_idle_threshold_s: 600,
         }
     }
 }
@@ -212,6 +225,22 @@ mod tests {
         assert_eq!(c.port, 48750);
         assert!(c.detect_steam);
         assert!(!c.vram_heuristic);
+        // Presence defaults: on, 10-minute idle threshold.
+        assert!(c.presence_detection);
+        assert_eq!(c.presence_idle_threshold_s, 600);
+    }
+
+    #[test]
+    fn presence_keys_override() {
+        let c = Config::from_toml(
+            r#"
+            presence_detection = false
+            presence_idle_threshold_s = 120
+            "#,
+        )
+        .unwrap();
+        assert!(!c.presence_detection);
+        assert_eq!(c.presence_idle_threshold_s, 120);
     }
 
     #[test]
