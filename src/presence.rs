@@ -305,17 +305,27 @@ mod linux {
             }
         }
 
-        // Drop devices that vanished (unplugged) — abort their pump task.
+        // Prune entries that should no longer be counted as live watches:
+        //  - the device node vanished (unplugged) → abort its pump, drop it;
+        //  - the pump task already finished (the stream errored/closed, or it
+        //    panicked and tokio caught it) → drop it so the device is re-evaluated
+        //    below and either re-watched or no longer counted. Without this, a dead
+        //    pump would keep the device in the count while silently delivering no
+        //    events ("monitor up, device counted, but blind").
         watched.retain(|path, w| {
-            let still_here = present.contains(path);
-            if !still_here {
+            if !present.contains(path) {
                 w.handle.abort();
                 tracing::debug!(device = %path.display(), "input device removed; stopped watching");
+                return false;
             }
-            still_here
+            if w.handle.is_finished() {
+                tracing::warn!(device = %path.display(), "input pump exited; will re-watch on this pass");
+                return false;
+            }
+            true
         });
 
-        // Add newly-appeared kept devices.
+        // Add newly-appeared (or just-pruned-and-still-present) kept devices.
         for path in present {
             if watched.contains_key(&path) {
                 continue;
