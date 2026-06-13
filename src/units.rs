@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use crate::config::{Config, Introspection, ManagedUnit};
-use crate::gpu::{self, GpuMemory};
+use crate::gpu::{GpuBackend, GpuMemory};
 
 /// Managed-unit control errors.
 #[derive(Debug, thiserror::Error)]
@@ -254,7 +254,11 @@ pub async fn start(unit: &str) -> Result<(), UnitError> {
 ///
 /// The GPU poll failing is non-fatal: a missing/erroring `nvidia-smi` reading is
 /// treated as "not yet free", so the worst case is escalation, never a stall.
-pub async fn evict(unit: &str, cfg: &Config) -> Result<EvictionOutcome, UnitError> {
+pub async fn evict(
+    unit: &str,
+    cfg: &Config,
+    backend: GpuBackend,
+) -> Result<EvictionOutcome, UnitError> {
     // Nothing to do if the unit isn't running.
     if !is_running(unit).await? {
         return Ok(EvictionOutcome::AlreadyClear);
@@ -276,7 +280,7 @@ pub async fn evict(unit: &str, cfg: &Config) -> Result<EvictionOutcome, UnitErro
     loop {
         // A failed GPU read counts as "not yet free" (never stalls; at worst we
         // escalate).
-        let mem = gpu::query_memory().await.unwrap_or(GpuMemory {
+        let mem = backend.query_memory().await.unwrap_or(GpuMemory {
             used_mb: u64::MAX,
             total_mb: 0,
         });
