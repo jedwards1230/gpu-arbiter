@@ -49,6 +49,7 @@ rich rule. `/units/*` (and the `/ollama/*` alias) are additionally localhost-onl
 | Method | Path | Bind | Purpose |
 |---|---|---|---|
 | GET | `/status` | LAN | Full state snapshot (below) |
+| GET | `/metrics` | LAN | Prometheus text-format exposition (below) |
 | GET | `/healthz` | LAN | Liveness |
 | POST | `/units/{unit}/start`, `/units/{unit}/stop` | localhost | Manual override (debugging) |
 | POST | `/ollama/start`, `/ollama/stop` | localhost | Back-compat alias for the first managed unit |

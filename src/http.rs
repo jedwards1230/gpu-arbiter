@@ -3,6 +3,7 @@
 //! | Method | Path | Bind | Purpose |
 //! |---|---|---|---|
 //! | GET | `/status` | LAN | Full [`StatusSnapshot`] for remote machines + dashboards |
+//! | GET | `/metrics` | LAN | Prometheus text-format exposition of the current state |
 //! | GET | `/healthz` | LAN | Liveness |
 //! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | localhost-only | Manual override (debugging) |
 //! | POST | `/ollama/start`,`/ollama/stop` | localhost-only | Back-compat alias for the first managed unit |
@@ -24,7 +25,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Router, response::IntoResponse};
 use tokio::sync::{Mutex, mpsc};
@@ -54,6 +55,7 @@ pub struct AppState {
 pub fn router(app: AppState) -> Router {
     Router::new()
         .route("/status", get(status))
+        .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .route("/units/{unit}/start", post(unit_start))
         .route("/units/{unit}/stop", post(unit_stop))
@@ -61,6 +63,192 @@ pub fn router(app: AppState) -> Router {
         .route("/ollama/start", post(ollama_start))
         .route("/ollama/stop", post(ollama_stop))
         .with_state(app)
+}
+
+/// `GET /metrics` — Prometheus text-format exposition of the live arbiter state.
+///
+/// LAN-exposed exactly like `/status` (no secrets — state, claim tokens, VRAM
+/// counts), so no loopback gate. The body is produced by the pure
+/// [`render_metrics`] so it unit-tests on the macOS dev host.
+pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
+    let guard = app.state.lock().await;
+    let snap = guard.snapshot();
+    // Read the state-entered instant straight off live state as whole unix
+    // seconds — avoids round-tripping the `/status` RFC-3339 string back to a
+    // timestamp. Pre-epoch (never produced) clamps to 0.
+    let since_unix = guard
+        .since
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    drop(guard);
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        render_metrics(&snap, since_unix),
+    )
+}
+
+/// Render the Prometheus text-exposition body from a [`StatusSnapshot`] plus the
+/// unix timestamp (whole seconds) the current state was entered.
+///
+/// Pure & cross-platform — unit-tested on macOS. Every metric is a gauge:
+///
+/// - `gpu_arbiter_up` — always `1` (the daemon answered the scrape).
+/// - `gpu_arbiter_build_info{version}` — constant `1`; build in the label.
+/// - `gpu_arbiter_state{state}` — `1` for the active state, `0` for the others.
+/// - `gpu_arbiter_gaming` — `1` while a game holds the GPU (`state == gaming`).
+///   This is the signal a "game left running, not being streamed" warn keys off
+///   (it is `0` for legitimate Ollama/ASR GPU use, which never sets `gaming`).
+/// - `gpu_arbiter_state_since_seconds` — unix time the current state was entered.
+/// - `gpu_arbiter_claims` — count of active gaming claims.
+/// - `gpu_arbiter_claim{token,kind,id}` — `1` per active claim; the series
+///   appearing/disappearing over time is the game launch/close record.
+/// - `gpu_arbiter_vram_used_mib` / `gpu_arbiter_vram_total_mib` — total GPU VRAM.
+/// - `gpu_arbiter_unit_running{unit}` — `1` if a managed unit is active.
+/// - `gpu_arbiter_unit_vram_mib{unit}` — VRAM attributed to a managed unit.
+pub fn render_metrics(snap: &StatusSnapshot, since_unix: u64) -> String {
+    use std::fmt::Write as _;
+    let mut o = String::with_capacity(1024);
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_up 1 if the gpu-arbiter daemon is serving."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_up gauge");
+    let _ = writeln!(o, "gpu_arbiter_up 1");
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_build_info Build metadata; constant 1, version in the label."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_build_info gauge");
+    let _ = writeln!(
+        o,
+        "gpu_arbiter_build_info{{version=\"{}\"}} 1",
+        esc(&snap.version)
+    );
+
+    let cur = state_label(snap.state);
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_state Current arbiter state (1 for the active state)."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_state gauge");
+    for s in ["gaming", "available", "evicting"] {
+        let _ = writeln!(
+            o,
+            "gpu_arbiter_state{{state=\"{s}\"}} {}",
+            u8::from(s == cur)
+        );
+    }
+
+    let _ = writeln!(o, "# HELP gpu_arbiter_gaming 1 while a game holds the GPU.");
+    let _ = writeln!(o, "# TYPE gpu_arbiter_gaming gauge");
+    let _ = writeln!(o, "gpu_arbiter_gaming {}", u8::from(cur == "gaming"));
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_state_since_seconds Unix time the current state was entered."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_state_since_seconds gauge");
+    let _ = writeln!(o, "gpu_arbiter_state_since_seconds {since_unix}");
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_claims Number of active gaming claims."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_claims gauge");
+    let _ = writeln!(o, "gpu_arbiter_claims {}", snap.claims.len());
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_claim Active gaming claim; presence over time = launch/close."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_claim gauge");
+    for token in &snap.claims {
+        let (kind, id) = token.split_once(':').unwrap_or((token.as_str(), ""));
+        let _ = writeln!(
+            o,
+            "gpu_arbiter_claim{{token=\"{}\",kind=\"{}\",id=\"{}\"}} 1",
+            esc(token),
+            esc(kind),
+            esc(id)
+        );
+    }
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_vram_used_mib Total GPU VRAM in use (MiB), all tenants."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_vram_used_mib gauge");
+    let _ = writeln!(o, "gpu_arbiter_vram_used_mib {}", snap.gpu_vram_used_mb);
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_vram_total_mib Total GPU VRAM capacity (MiB)."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_vram_total_mib gauge");
+    let _ = writeln!(o, "gpu_arbiter_vram_total_mib {}", snap.gpu_vram_total_mb);
+
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_unit_running 1 if a managed unit is active."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_unit_running gauge");
+    for u in &snap.units {
+        let _ = writeln!(
+            o,
+            "gpu_arbiter_unit_running{{unit=\"{}\"}} {}",
+            esc(&u.unit),
+            u8::from(u.running)
+        );
+    }
+    let _ = writeln!(
+        o,
+        "# HELP gpu_arbiter_unit_vram_mib VRAM attributed to a managed unit (MiB)."
+    );
+    let _ = writeln!(o, "# TYPE gpu_arbiter_unit_vram_mib gauge");
+    for u in &snap.units {
+        if let Some(v) = u.vram_mb {
+            let _ = writeln!(
+                o,
+                "gpu_arbiter_unit_vram_mib{{unit=\"{}\"}} {v}",
+                esc(&u.unit)
+            );
+        }
+    }
+
+    o
+}
+
+/// The lowercase `/status` token for a [`State`] — also the `gpu_arbiter_state`
+/// label value. Kept in sync with the `#[serde(rename_all = "lowercase")]` on
+/// [`State`].
+fn state_label(s: crate::state::State) -> &'static str {
+    use crate::state::State;
+    match s {
+        State::Gaming => "gaming",
+        State::Available => "available",
+        State::Evicting => "evicting",
+    }
+}
+
+/// Escape a Prometheus label value (`\`, `"`, newline) per the text-exposition
+/// format. Borrows unchanged when no escaping is needed (the common case —
+/// `steam:440`, unit names). Pattern claim tokens come from operator config, so
+/// this is belt-and-suspenders against an odd character.
+fn esc(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.bytes().any(|b| b == b'\\' || b == b'"' || b == b'\n') {
+        std::borrow::Cow::Owned(
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n"),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
 }
 
 /// Serve the axum HTTP control surface on `addr` until the process exits.
@@ -288,5 +476,115 @@ mod tests {
         );
         // Loopback + a managed unit → allowed through (None).
         assert!(guard(&cfg, lo, "ollama.service").is_none());
+    }
+
+    use crate::state::{State, StatusSnapshot, UnitStatus};
+
+    /// A gaming snapshot (one Steam claim, Ollama evicted) renders the full
+    /// gauge surface: active state = 1, others = 0, the claim series, and the
+    /// state-entered timestamp.
+    #[test]
+    fn render_metrics_gaming_snapshot() {
+        let snap = StatusSnapshot {
+            version: "1.2.3".into(),
+            state: State::Gaming,
+            claims: vec!["steam:440".into()],
+            units: vec![UnitStatus {
+                unit: "ollama.service".into(),
+                running: false,
+                models: vec![],
+                vram_mb: None,
+            }],
+            ollama: UnitStatus::default(),
+            gpu_vram_used_mb: 21500,
+            gpu_vram_total_mb: 32768,
+            since: "2023-11-14T22:13:20Z".into(),
+        };
+        let out = render_metrics(&snap, 1_700_000_000);
+
+        assert!(out.contains("gpu_arbiter_up 1"));
+        assert!(out.contains("gpu_arbiter_build_info{version=\"1.2.3\"} 1"));
+        assert!(out.contains("gpu_arbiter_state{state=\"gaming\"} 1"));
+        assert!(out.contains("gpu_arbiter_state{state=\"available\"} 0"));
+        assert!(out.contains("gpu_arbiter_state{state=\"evicting\"} 0"));
+        assert!(out.contains("gpu_arbiter_gaming 1"));
+        assert!(out.contains("gpu_arbiter_state_since_seconds 1700000000"));
+        assert!(out.contains("gpu_arbiter_claims 1"));
+        assert!(out.contains("gpu_arbiter_claim{token=\"steam:440\",kind=\"steam\",id=\"440\"} 1"));
+        assert!(out.contains("gpu_arbiter_unit_running{unit=\"ollama.service\"} 0"));
+        assert!(out.contains("gpu_arbiter_vram_used_mib 21500"));
+        assert!(out.contains("gpu_arbiter_vram_total_mib 32768"));
+        // No VRAM attributed to the unit (vram_mb None) → no per-unit vram line.
+        assert!(!out.contains("gpu_arbiter_unit_vram_mib{unit=\"ollama.service\"}"));
+    }
+
+    /// An available snapshot with Ollama running: `gaming` is 0, no claim series
+    /// is emitted, and the managed unit reports running + its VRAM.
+    #[test]
+    fn render_metrics_available_snapshot() {
+        let snap = StatusSnapshot {
+            version: "1.2.3".into(),
+            state: State::Available,
+            claims: vec![],
+            units: vec![UnitStatus {
+                unit: "ollama.service".into(),
+                running: true,
+                models: vec!["qwen3:30b".into()],
+                vram_mb: Some(21000),
+            }],
+            ollama: UnitStatus::default(),
+            gpu_vram_used_mb: 21000,
+            gpu_vram_total_mb: 32768,
+            since: "2023-11-14T22:13:20Z".into(),
+        };
+        let out = render_metrics(&snap, 1_700_000_000);
+
+        assert!(out.contains("gpu_arbiter_gaming 0"));
+        assert!(out.contains("gpu_arbiter_state{state=\"available\"} 1"));
+        assert!(out.contains("gpu_arbiter_claims 0"));
+        // Ollama on the GPU must NOT look like a game claim.
+        assert!(!out.contains("gpu_arbiter_claim{"));
+        assert!(out.contains("gpu_arbiter_unit_running{unit=\"ollama.service\"} 1"));
+        assert!(out.contains("gpu_arbiter_unit_vram_mib{unit=\"ollama.service\"} 21000"));
+    }
+
+    /// Every emitted sample line is preceded by its `# TYPE`, and each metric
+    /// line is `name{...} value` shaped (a cheap exposition-format sanity check).
+    #[test]
+    fn render_metrics_is_well_formed() {
+        let snap = StatusSnapshot {
+            version: "0.0.0".into(),
+            state: State::Evicting,
+            claims: vec!["pattern:heroic".into()],
+            units: vec![],
+            ollama: UnitStatus::default(),
+            gpu_vram_used_mb: 0,
+            gpu_vram_total_mb: 0,
+            since: "1970-01-01T00:00:00Z".into(),
+        };
+        let out = render_metrics(&snap, 0);
+        for line in out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            // "metric_name[{labels}] value" — split on the LAST space.
+            let (name, value) = line.rsplit_once(' ').expect("sample line has a value");
+            assert!(
+                name.starts_with("gpu_arbiter_"),
+                "unexpected metric: {name}"
+            );
+            assert!(
+                value.parse::<f64>().is_ok(),
+                "non-numeric value in line: {line}"
+            );
+        }
+        assert!(out.contains("gpu_arbiter_state{state=\"evicting\"} 1"));
+        assert!(out.contains(
+            "gpu_arbiter_claim{token=\"pattern:heroic\",kind=\"pattern\",id=\"heroic\"} 1"
+        ));
+    }
+
+    /// Label escaping: backslash/quote are escaped; clean tokens borrow unchanged.
+    #[test]
+    fn esc_escapes_quote_and_backslash() {
+        assert_eq!(esc("steam:440"), "steam:440");
+        assert_eq!(esc(r#"a"b\c"#), r#"a\"b\\c"#);
     }
 }
