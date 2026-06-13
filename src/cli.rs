@@ -92,23 +92,38 @@ where
             "--check-config" => check_config = true,
             "--json" => json = true,
             "--config" | "-c" => {
-                // Consume the next token as the path.
+                // Consume the next token as the path. An empty value is a
+                // mistake (it would resolve to an empty config path), so it's a
+                // usage error — never a silent empty path.
                 match argv.get(i + 1) {
-                    Some(path) => {
+                    Some(path) if !path.is_empty() => {
                         config = Some(path.clone());
                         i += 1;
                     }
-                    None => {
-                        return Command::Error(format!("{arg} requires a <PATH> argument"));
+                    // Present-but-empty (`--config ""`) or missing entirely both
+                    // mean "no path was actually given".
+                    _ => {
+                        return Command::Error(format!("{arg} requires a non-empty <PATH>"));
                     }
                 }
             }
-            // `--config=PATH` / `-c=PATH` long-option form.
+            // `--config=PATH` / `-c=PATH` long-option form. An empty value
+            // (`--config=`) is rejected for the same reason as the space form —
+            // consistent with the env-var branch, which also ignores an empty
+            // value rather than resolving to "".
             _ if arg.starts_with("--config=") => {
-                config = Some(arg["--config=".len()..].to_string());
+                let path = &arg["--config=".len()..];
+                if path.is_empty() {
+                    return Command::Error("--config= requires a non-empty <PATH>".to_string());
+                }
+                config = Some(path.to_string());
             }
             _ if arg.starts_with("-c=") => {
-                config = Some(arg["-c=".len()..].to_string());
+                let path = &arg["-c=".len()..];
+                if path.is_empty() {
+                    return Command::Error("-c= requires a non-empty <PATH>".to_string());
+                }
+                config = Some(path.to_string());
             }
             // An unknown flag is an error (don't silently swallow typos).
             _ if arg.starts_with('-') => {
@@ -359,6 +374,22 @@ mod tests {
     fn config_flag_missing_value_is_error() {
         assert!(matches!(parse_args(["--config"]), Command::Error(_)));
         assert!(matches!(parse_args(["-c"]), Command::Error(_)));
+    }
+
+    #[test]
+    fn config_flag_empty_value_is_error_in_every_form() {
+        // An explicit empty config path is a mistake, not a request for the
+        // default — it must NOT resolve to an empty path. Rejected in all four
+        // spellings (consistent with the env-var branch, which ignores empties).
+        assert!(matches!(parse_args(["--config="]), Command::Error(_)));
+        assert!(matches!(parse_args(["-c="]), Command::Error(_)));
+        assert!(matches!(parse_args(["--config", ""]), Command::Error(_)));
+        assert!(matches!(parse_args(["-c", ""]), Command::Error(_)));
+        // …and the same on the status subcommand.
+        assert!(matches!(
+            parse_args(["status", "--config="]),
+            Command::Error(_)
+        ));
     }
 
     #[test]
