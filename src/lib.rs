@@ -22,6 +22,12 @@
 // Config load + serde/TOML defaults. Pure & cross-platform.
 pub mod config;
 
+// Command-line surface: hand-rolled argv parser, config-path resolution,
+// --check-config validator, and the pure /status renderer. Pure & cross-platform
+// — unit-tested on macOS. The daemon binary and the `status` client both drive
+// off this.
+pub mod cli;
+
 // cmdline → claim classification (Steam SteamLaunch; pattern list; opt-in VRAM
 // heuristic). Pure & cross-platform — unit-tested with literal cmdlines.
 pub mod classify;

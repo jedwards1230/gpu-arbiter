@@ -20,30 +20,101 @@
 //! `spawn_blocking` inside `reconcile`. SIGTERM/SIGINT trigger a graceful
 //! shutdown.
 
-/// Handle `--version`/`-V` and `--help`/`-h` before any runtime setup, printing
-/// to stdout and exiting 0. Kept platform-independent so the version is
-/// reportable even on the non-Linux stub build (and from CI). The version is
-/// `CARGO_PKG_VERSION`, baked from the git tag at release build time.
-fn handle_cli_flags() {
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "--version" | "-V" => {
-                println!("gpu-arbiter {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-            "--help" | "-h" => {
-                println!(
-                    "gpu-arbiter {} — gaming-first GPU arbiter daemon\n\n\
-                     Usage: gpu-arbiter [--version] [--help]\n\n\
-                     The daemon takes no runtime arguments; it reads its config from\n\
-                     /etc/gpu-arbiter/config.toml (missing file → built-in defaults).",
-                    env!("CARGO_PKG_VERSION")
-                );
-                std::process::exit(0);
-            }
-            _ => {}
+use gpu_arbiter::cli::{self, Command};
+
+/// Parse argv and handle every **cross-platform** command (version, help, usage
+/// errors, `--check-config`, and the `status` client) here — they work
+/// identically on the macOS stub build, so they live above the Linux cfg gate.
+///
+/// Returns the resolved config path **only** for [`Command::RunDaemon`] (the one
+/// command that needs the Linux runtime); every other command prints and exits
+/// inside this function. The version is `CARGO_PKG_VERSION`, baked from the git
+/// tag at release build time.
+fn handle_cli_or_get_daemon_config() -> String {
+    let cmd = cli::parse_args(std::env::args().skip(1));
+    match cmd {
+        Command::Version => {
+            println!("gpu-arbiter {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
         }
+        Command::Help => {
+            println!("{}", cli::help_text());
+            std::process::exit(0);
+        }
+        Command::Error(msg) => {
+            eprintln!("gpu-arbiter: {msg}");
+            eprintln!("Try 'gpu-arbiter --help' for usage.");
+            std::process::exit(2);
+        }
+        Command::CheckConfig { config } => {
+            let path = resolve_path(config.as_deref());
+            match cli::check_config(&path) {
+                Ok(line) => {
+                    println!("{line}");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Status { config, json } => {
+            let path = resolve_path(config.as_deref());
+            std::process::exit(run_status(&path, json));
+        }
+        Command::RunDaemon { config } => resolve_path(config.as_deref()),
     }
+}
+
+/// Resolve the config path with the standard precedence
+/// (flag → `GPU_ARBITER_CONFIG` → default), reading the real process env.
+fn resolve_path(flag: Option<&str>) -> String {
+    cli::resolve_config_path(flag, |k| std::env::var(k).ok())
+}
+
+/// The `status` subcommand: a localhost HTTP **client**. Reads the config to find
+/// the port, GETs `http://127.0.0.1:<port>/status` with `ureq` (the same no-TLS
+/// client the tray uses), and prints the rendered summary (or raw JSON). Returns
+/// the process exit code. Cross-platform — runs on any host that can reach the
+/// socket, including the macOS dev box.
+fn run_status(config_path: &str, json: bool) -> i32 {
+    let cfg = match gpu_arbiter::config::Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return 1;
+        }
+    };
+    let url = format!("http://127.0.0.1:{}/status", cfg.port);
+
+    let body = match ureq::get(&url).call() {
+        Ok(mut resp) => match resp.body_mut().read_json::<serde_json::Value>() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("ERROR: reading /status response from {url}: {e}");
+                return 1;
+            }
+        },
+        Err(e) => {
+            eprintln!("ERROR: querying {url}: {e}");
+            eprintln!("Is the gpu-arbiter daemon running?");
+            return 1;
+        }
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&body) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("ERROR: re-serializing /status JSON: {e}");
+                return 1;
+            }
+        }
+    } else {
+        println!("{}", cli::render_status(&body));
+    }
+    0
 }
 
 // Linux is the only runtime target (netlink cn_proc, /proc, nvidia-smi,
@@ -51,8 +122,8 @@ fn handle_cli_flags() {
 // stub below and the cfg-gated/stubbed module internals.
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
-    handle_cli_flags();
-    linux::run()
+    let config_path = handle_cli_or_get_daemon_config();
+    linux::run(config_path)
 }
 
 /// All the Linux runtime wiring, kept in a submodule so the (large) imports and
@@ -71,10 +142,6 @@ mod linux {
     use gpu_arbiter::state::{ArbiterState, ReconcileTrigger};
     use tokio::sync::{Mutex, mpsc};
 
-    /// Where deployment tooling (e.g. Ansible) renders the config. A missing file is fine —
-    /// `Config::load` falls back to full defaults.
-    const CONFIG_PATH: &str = "/etc/gpu-arbiter/config.toml";
-
     /// Debounce window for coalescing `ProcEvent` bursts. A game launch fires a
     /// storm of fork/exec events; we want **one** reconcile shortly after the
     /// burst settles, not one per event. ~150 ms is below human perception yet
@@ -86,18 +153,20 @@ mod linux {
     /// triggers are redundant and safe to drop (`procmon` uses `try_send`).
     const TRIGGER_CHANNEL_DEPTH: usize = 64;
 
-    pub fn run() -> anyhow::Result<()> {
+    pub fn run(config_path: String) -> anyhow::Result<()> {
         init_tracing();
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        rt.block_on(async_main())
+        rt.block_on(async_main(config_path))
     }
 
-    async fn async_main() -> anyhow::Result<()> {
-        // 1. Config (missing file → defaults).
-        let cfg = Arc::new(Config::load(CONFIG_PATH)?);
+    async fn async_main(config_path: String) -> anyhow::Result<()> {
+        // 1. Config (missing file → defaults). Path resolved from
+        //    --config / GPU_ARBITER_CONFIG / the built-in default by the caller.
+        let cfg = Arc::new(Config::load(&config_path)?);
+        tracing::info!(config_path = %config_path, "loaded config");
 
         // Honor the master `enabled` switch: a manual `enabled = false` in the
         // config (a quick disable without touching systemd) exits cleanly instead
@@ -339,7 +408,10 @@ mod linux {
 /// point of the lib/main split.
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    handle_cli_flags();
+    // The cross-platform commands (version, help, --check-config, status) all
+    // handle-and-exit inside this call; only RunDaemon returns — and the daemon
+    // can't run here, so report and exit non-zero.
+    let _config_path = handle_cli_or_get_daemon_config();
     eprintln!(
         "gpu-arbiter only runs on Linux (requires cn_proc netlink, /proc, nvidia-smi, systemctl)."
     );
