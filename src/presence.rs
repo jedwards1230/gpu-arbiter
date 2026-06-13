@@ -359,7 +359,7 @@ mod linux {
     /// return `None` and rely solely on the timer backstop (still correct, just
     /// slower to notice a hotplug). The stream owns its read buffer.
     fn try_inotify_stream() -> Option<inotify::EventStream<Vec<u8>>> {
-        let mut inotify = inotify::Inotify::init().ok()?;
+        let inotify = inotify::Inotify::init().ok()?;
         inotify
             .watches()
             .add(
