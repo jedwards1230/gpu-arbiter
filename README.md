@@ -158,6 +158,17 @@ CI publishes a static `x86_64-unknown-linux-musl` binary as a GitHub release
 artifact; your deployment tooling (e.g. Ansible) can fetch it by version (on-host
 `cargo build` is the fallback) and install it as a root systemd unit.
 
+## Man pages
+
+Reference manuals live under [`man/`](man):
+
+- [`gpu-arbiter.1`](man/gpu-arbiter.1) — daemon usage, the cn_proc/eviction model,
+  and the `--version`/`--help`/config-path behavior.
+- [`gpu-arbiter-config.5`](man/gpu-arbiter-config.5) — every config key, including
+  the per-unit `kind` / `introspect_cmd` introspection backends.
+
+Render locally with `man ./man/gpu-arbiter.1` and `man ./man/gpu-arbiter-config.5`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

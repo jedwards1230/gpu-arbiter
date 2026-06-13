@@ -1,0 +1,243 @@
+.TH GPU-ARBITER-CONFIG 5 "June 2026" "gpu-arbiter" "File Formats"
+.SH NAME
+gpu\-arbiter\-config \- configuration file for gpu\-arbiter(1)
+.SH SYNOPSIS
+.I /etc/gpu-arbiter/config.toml
+.SH DESCRIPTION
+.BR gpu-arbiter (1)
+reads its configuration from a TOML file (by default
+.IR /etc/gpu-arbiter/config.toml ,
+typically rendered by deployment tooling such as Ansible). A
+.B missing file is not an error
+\(em it yields the built\-in defaults, so the daemon is fully usable with zero
+configuration. Every key is optional; a sparse file overrides only the keys it
+names and leaves the rest at their defaults.
+.PP
+TOML keys mirror the deployment variable names minus the
+.I gpu_arbiter_
+prefix.
+.SH TOP-LEVEL KEYS
+.TP
+.B enabled
+Boolean. Default
+.BR true .
+Master enable. When
+.BR false ,
+the daemon logs that it is disabled and exits cleanly (a quick disable without
+touching systemd).
+.TP
+.B port
+Integer (u16). Default
+.BR 48750 .
+HTTP listen port, bound on 0.0.0.0 and LAN\-restricted by firewalld.
+.TP
+.B managed_units
+Array of tables. Default: synthesized from
+.B ollama_unit
+/
+.B eager_ollama
+(a single entry). The ordered list of systemd units the arbiter evicts from the
+GPU on a game launch and restores when gaming ends; eviction runs in array
+order. See
+.B MANAGED UNIT FIELDS
+below.
+.TP
+.B ollama_unit
+String. Default
+.BR """ollama.service""" .
+.B Legacy
+single managed unit, used only when
+.B managed_units
+is unset (then synthesized into a one\-element list with
+.BR "vram_match = ""ollama""" " and " "kind = ""ollama""" ).
+.TP
+.B eager_ollama
+Boolean. Default
+.BR true .
+.B Legacy
+restart\-on\-gaming\-end toggle for the synthesized single unit.
+.TP
+.B eviction_timeout_s
+Integer (seconds). Default
+.BR 5 .
+How long to wait for a graceful teardown (VRAM drop below
+.BR vram_free_threshold_mb )
+before escalating to SIGKILL.
+.TP
+.B vram_free_threshold_mb
+Integer (MiB). Default
+.BR 2000 .
+VRAM\-used strictly below this value means the GPU is considered "freed" after
+eviction.
+.TP
+.B reconcile_interval_s
+Integer (seconds). Default
+.BR 30 .
+Slow backstop reconcile interval. Detection itself is event\-driven (cn_proc);
+this only covers dropped events.
+.TP
+.B detect_steam
+Boolean. Default
+.BR true .
+Match
+.I "SteamLaunch AppId="
+in exec'd cmdlines (covers all Steam games via a
+.I steam:<appid>
+claim).
+.TP
+.B game_patterns
+Array of tables. Default empty. Cmdline\-substring patterns for non\-Steam
+launchers. Each entry has:
+.RS
+.TP
+.B name
+String. Human\-readable claim name (becomes
+.IR pattern:<name> ).
+.TP
+.B match
+String. Substring matched against a process cmdline.
+.RE
+.TP
+.B vram_heuristic
+Boolean. Default
+.BR false .
+Opt\-in: treat heavy, non\-allowlisted
+.B graphics
+GPU processes as games. (It cannot see Ollama, which is a compute process.)
+.TP
+.B vram_game_threshold_mb
+Integer (MiB). Default
+.BR 4000 .
+VRAM threshold for the opt\-in
+.B vram_heuristic.
+.TP
+.B gpu_allowlist
+Array of strings. Default
+.BR "[""ollama"", ""kwin_wayland"", ""plasmashell"", ""Xwayland""]" .
+Sanctioned GPU tenants, used by the heuristic (and a sanity log line) to avoid
+flagging known\-good processes as games.
+.SH MANAGED UNIT FIELDS
+Each
+.B [[managed_units]]
+table accepts:
+.TP
+.B unit
+String,
+.BR required .
+The systemd unit the daemon exclusively owns (kept
+.I disabled
+so systemd never races the daemon).
+.TP
+.B eager_restart
+Boolean. Default
+.BR true .
+Restart this unit when gaming ends (eager warm\-up).
+.TP
+.B vram_match
+String. Default: none. Substring matched case\-insensitively against
+.B nvidia-smi
+compute\-process names to attribute this unit's VRAM in
+.IR /status .
+When unset, no VRAM figure is reported for the unit (the field is omitted, not
+reported as 0).
+.TP
+.B kind
+String. Default: none. Introspection backend selector for the
+.I /status
+.B models[]
+list. The only recognized value is
+.BR """ollama""" ,
+which runs
+.B "ollama ps"
+and parses its table for loaded model names. Any other non\-empty value reports
+no models (an explicit non\-Ollama kind suppresses the name heuristic). When
+.B kind
+is unset
+.B and
+.B introspect_cmd
+is unset, a
+.B back\-compat heuristic
+applies: a
+.B unit
+name containing
+.I ollama
+(case\-insensitive) is treated as
+.BR """ollama""" .
+Ignored when
+.B introspect_cmd
+is set.
+.TP
+.B introspect_cmd
+String. Default: none. An explicit command whose standard output lists the
+unit's loaded model/process names \(em
+.B one name per line,
+each trimmed, with empty lines dropped. The string is split on whitespace into
+an
+.B argv
+and run
+.B shell\-free
+(no shell, no quoting, no globbing, no variable expansion): the first token is
+the program, the rest are arguments. When set, it
+.B takes precedence
+over
+.B kind
+and the name heuristic. Best\-effort: a missing binary, a non\-zero exit, an empty
+command, or a query timeout yields no models (never an error).
+.SH INTROSPECTION RESOLUTION
+For each managed unit, the
+.B models[]
+backend is resolved purely, in this order:
+.IP 1. 4
+.B introspect_cmd
+set and non\-blank \(rA run that argv, one name per stdout line.
+.IP 2. 4
+else
+.B kind
+==
+.B """ollama"""
+\(rA run
+.BR "ollama ps" .
+.IP 3. 4
+else
+.B kind
+unset
+.B and
+.B unit
+name contains
+.I ollama
+\(rA run
+.BR "ollama ps" .
+.IP 4. 4
+else \(rA report no models.
+.PP
+This preserves the original Ollama behavior as the default for an
+Ollama\-kinded or Ollama\-named unit, while letting any other tenant report a
+model/process list via
+.BR introspect_cmd .
+.SH EXAMPLES
+A two\-tenant config where Ollama and an ASR runner both yield to gaming, the ASR
+runner reporting its own process list via an explicit command:
+.PP
+.RS
+.nf
+port = 48750
+
+[[managed_units]]
+unit = "ollama.service"
+eager_restart = true
+vram_match = "ollama"
+kind = "ollama"
+
+[[managed_units]]
+unit = "asr-runner.service"
+eager_restart = true
+vram_match = "parakeet"
+introspect_cmd = "asr-cli list-models"
+
+[[game_patterns]]
+name = "heroic"
+match = "Heroic"
+.fi
+.RE
+.SH SEE ALSO
+.BR gpu-arbiter (1)
