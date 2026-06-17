@@ -5,7 +5,10 @@
 //! Events are the *accelerator*, never the bookkeeper — a malformed/truncated
 //! datagram is **logged-and-skipped** (never a panic or OOB read), and dropped
 //! events cost only latency because the periodic backstop reconcile recomputes
-//! truth.
+//! truth. For the same reason a recoverable `recv` overflow (`ENOBUFS` — the
+//! kernel dropped events under a storm) is **logged-and-continued**, not fatal:
+//! the socket is still alive, so the listener keeps running and the backstop
+//! covers the gap (see [`is_enobufs`]).
 //!
 //! ## Safety of the netlink parse (this is a root daemon)
 //!
@@ -156,10 +159,25 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
         // socket-level error (rare; e.g. the socket died) ends the loop and is
         // returned so `main` can decide. Per-message parse errors are handled
         // inside the iterator and never abort the loop.
-        let (iter, _groups) = socket
-            .recv::<Nlmsg, CnMsg<ProcEventHeader>>()
-            .await
-            .map_err(|e| ProcMonError::Socket(format!("recv: {e}")))?;
+        let (iter, _groups) = match socket.recv::<Nlmsg, CnMsg<ProcEventHeader>>().await {
+            Ok(v) => v,
+            // ENOBUFS is recoverable, NOT fatal: under a process-event storm the
+            // kernel's socket receive buffer overflows and recv() returns ENOBUFS.
+            // It means "you missed some events", not "the socket is dead" — the
+            // socket is still subscribed and usable. Treating it as fatal here is
+            // what made the listener exit and fall back to the slow backstop timer
+            // (the boot-time "cn_proc listener exited" regression). Log and keep
+            // listening; the missed events are covered by the level-triggered
+            // reconcile, which re-derives truth on the next pass / backstop tick.
+            Err(e) if is_enobufs(&e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cn_proc recv overflowed (ENOBUFS); dropped some events, continuing (backstop covers the gap)"
+                );
+                continue;
+            }
+            Err(e) => return Err(ProcMonError::Socket(format!("recv: {e}"))),
+        };
 
         for msg in iter {
             // ── checked parse: a truncated/garbage datagram is logged-and-skipped ──
@@ -198,6 +216,23 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
             }
         }
     }
+}
+
+/// Is this recv error a recoverable `ENOBUFS` (kernel receive-buffer overflow)?
+///
+/// `neli`'s [`SocketError`][neli::err::SocketError] carries the underlying
+/// `std::io::Error` in its `Io` variant; we read its `raw_os_error()` and compare
+/// against `libc::ENOBUFS`. ENOBUFS on a netlink multicast recv means the socket
+/// buffer filled during an event storm and the kernel dropped datagrams — the
+/// socket is still alive and subscribed, so the listener should keep going. Any
+/// other error (or a non-OS error) is treated as fatal by the caller. Linux-only
+/// (the `SocketError` type comes from the Linux-gated neli `async` feature).
+#[cfg(target_os = "linux")]
+fn is_enobufs(err: &neli::err::SocketError) -> bool {
+    matches!(
+        err,
+        neli::err::SocketError::Io(io) if io.raw_os_error() == Some(libc::ENOBUFS)
+    )
 }
 
 /// Map a parsed neli [`ProcEvent`][neli::connector::ProcEvent] to our
