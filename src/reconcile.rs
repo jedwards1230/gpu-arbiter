@@ -229,16 +229,13 @@ pub async fn reconcile(
             state.lock().await.set_state(State::Gaming);
         }
         UnitAction::Restart => {
-            // gaming → available (verified: the snapshot above was clean). Restart
-            // each unit whose `eager_restart` is set, in order.
+            // gaming → available (verified: the snapshot above was clean). Settle
+            // the state; the ensure-running post-step below brings the eager units
+            // back. We no longer start units in this branch — the post-step
+            // subsumes it (the edge is reached only after a clean scan, and the
+            // post-step's `desired == Available` guard is the same "GPU is free"
+            // condition), so both paths share one idempotent code path.
             state.lock().await.set_state(State::Available);
-            for u in cfg.resolved_units() {
-                if u.eager_restart
-                    && let Err(e) = units::start(&u).await
-                {
-                    tracing::error!(unit = %u.unit, error = %e, "eager unit restart failed");
-                }
-            }
         }
         UnitAction::None => {
             // No transition needing a unit action: just settle the state
@@ -247,8 +244,54 @@ pub async fn reconcile(
         }
     }
 
+    // ── Ensure-running post-step (the boot / self-heal path) ──────────────────
+    //
+    // SAFETY INVARIANT: a managed GPU unit must NEVER be started while a game is
+    // running. The eligible set is computed by [`ensure_running_targets`], which is
+    // gated on `desired == State::Available` — the resolved ground truth says there
+    // are zero game claims, so the GPU is free. It is empty for `Gaming` and the
+    // transient `Evicting`, so a daemon restart or boot into a live game (which
+    // resolves to `Gaming` → Evict above) leaves the units stopped. This is what
+    // makes "a restart never starts Ollama into a live game" hold even as we gain a
+    // boot-time start path. The gate is unit-tested in `ensure_running_targets_*`.
+    //
+    // Why this is needed: `unit_action` only acts on the `available↔gaming` edges,
+    // so a clean boot (Available→Available) previously took no unit action and the
+    // eager units stayed stopped until the *next* game came and went. Starting them
+    // here whenever the GPU is free makes them come up at boot and self-heal if one
+    // dies while no game is running. Idempotent: `is_running` skips units already
+    // up, so steady-state passes are no-ops (and don't spam logs).
+    for u in ensure_running_targets(desired, cfg) {
+        if !units::is_running(&u).await.unwrap_or(false) {
+            if let Err(e) = units::start(&u).await {
+                tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
+            } else {
+                tracing::info!(unit = %u.unit, "ensure-running: started eager unit (GPU free)");
+            }
+        }
+    }
+
     refresh_substate(state, cfg, presence, backend).await;
     Ok(())
+}
+
+/// The eager units the ensure-running post-step should bring up this pass. **Pure**
+/// — unit-tested, and the single place the safety gate lives.
+///
+/// Returns the configured `eager_restart` units **only** when `desired` is exactly
+/// [`State::Available`] (the GPU is verified free — zero game claims). For
+/// [`State::Gaming`] and the transient [`State::Evicting`] it returns an empty Vec,
+/// guaranteeing a managed GPU unit is never started into a live game. The caller
+/// still skips any unit already running (idempotence); this function only decides
+/// *which units are eligible*, not whether each is currently up.
+fn ensure_running_targets(desired: State, cfg: &Config) -> Vec<crate::config::ManagedUnit> {
+    if desired != State::Available {
+        return Vec::new();
+    }
+    cfg.resolved_units()
+        .into_iter()
+        .filter(|u| u.eager_restart)
+        .collect()
 }
 
 /// Refresh the per-unit + GPU sub-state embedded in `/status` (best-effort —
@@ -506,6 +549,254 @@ mod tests {
         assert_eq!(g.presence.last_input_unix, 1_700_000_500);
         // A fresh monitor that never enumerated is unhealthy (fail-safe default).
         assert!(!g.presence.monitor_up);
+    }
+
+    // ── ensure-running post-step (boot / self-heal) ───────────────────────────
+    //
+    // These drive the real `units::start` / `units::is_running` seam via the
+    // `Command` supervisor's `*_cmd` overrides (the same mechanism units.rs tests
+    // use): `is_active_cmd` decides "running?" and `start_cmd` is a `touch` of a
+    // unique marker file, so we can assert *whether a start actually fired* without
+    // systemd — on any host, Linux or macOS.
+
+    /// A unique temp path for a start-marker file (created by the unit's
+    /// `start_cmd = touch <path>`). Returned removed/clean.
+    fn marker_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        // pid + thread id + nanos: the thread id keeps paths collision-free across
+        // parallel test threads (same pid + same nanosecond is otherwise possible
+        // under `cargo test --test-threads=N`).
+        let uniq = format!(
+            "gpu-arbiter-ensure-{tag}-{}-{:?}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        p.push(uniq);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Build a single-unit config whose unit is `Command`-driven: `is_active_cmd`
+    /// reports running/stopped and `start_cmd` touches `marker` so a fired start is
+    /// observable. `is_active_cmd` is `true` (running) or `false` (stopped).
+    fn ensure_cfg(running: bool, marker: &std::path::Path, eager: bool) -> Config {
+        let active = if running { "true" } else { "false" };
+        Config::from_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            eager_restart = {eager}
+            start_cmd = ["touch", "{marker}"]
+            stop_cmd = ["true"]
+            is_active_cmd = "{active}"
+            "#,
+            marker = marker.display(),
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ensure_running_starts_stopped_eager_unit_when_available() {
+        // Available steady-state with a stopped eager unit → the post-step starts
+        // it (the boot / self-heal path the bug was missing).
+        let marker = marker_path("starts");
+        let cfg = ensure_cfg(false, &marker, true);
+        // Start already in Available so this is the Available→Available steady
+        // state that previously took NO unit action.
+        let mut s = ArbiterState::new();
+        s.state = State::Available;
+        let state = shared(s);
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
+            .await
+            .unwrap();
+        assert_eq!(state.lock().await.state, State::Available);
+        assert!(
+            marker.exists(),
+            "ensure-running should have started the stopped eager unit"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn ensure_running_skips_already_running_unit() {
+        // An already-running eager unit is NOT redundantly started (idempotent;
+        // the `!is_running` guard avoids the needless shell-out).
+        let marker = marker_path("skip");
+        let cfg = ensure_cfg(true, &marker, true);
+        let mut s = ArbiterState::new();
+        s.state = State::Available;
+        let state = shared(s);
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
+            .await
+            .unwrap();
+        assert!(
+            !marker.exists(),
+            "ensure-running must not start a unit already reported running"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn ensure_running_does_not_start_non_eager_unit() {
+        // A non-eager unit is never auto-started by the post-step even when the GPU
+        // is free (eager_restart is the opt-in).
+        let marker = marker_path("noneager");
+        let cfg = ensure_cfg(false, &marker, false);
+        let mut s = ArbiterState::new();
+        s.state = State::Available;
+        let state = shared(s);
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
+            .await
+            .unwrap();
+        assert!(
+            !marker.exists(),
+            "a non-eager unit must not be auto-started"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn ensure_running_starts_when_is_running_cannot_confirm() {
+        // If is_running() can't determine state (the is_active_cmd spawn fails /
+        // errors), `unwrap_or(false)` treats the unit as stopped and a start is
+        // attempted. Exercises the error arm of `is_running(&u).await.unwrap_or(false)`.
+        let marker = marker_path("isrun-err");
+        let cfg = Config::from_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            eager_restart = true
+            start_cmd = ["touch", "{marker}"]
+            stop_cmd = ["true"]
+            is_active_cmd = "/nonexistent/gpu-arbiter-noexist"
+            "#,
+            marker = marker.display(),
+        ))
+        .unwrap();
+        let mut s = ArbiterState::new();
+        s.state = State::Available;
+        let state = shared(s);
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
+            .await
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "a start should be attempted when is_running can't confirm the unit is up"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn ensure_running_continues_when_start_fails() {
+        // A failing start_cmd is logged but must NOT fail the reconcile pass — the
+        // daemon stays fault-tolerant (a wedged unit can't take down arbitration).
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            eager_restart = true
+            start_cmd = ["false"]
+            stop_cmd = ["true"]
+            is_active_cmd = "false"
+            "#,
+        )
+        .unwrap();
+        let mut s = ArbiterState::new();
+        s.state = State::Available;
+        let state = shared(s);
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
+            .await
+            .expect("reconcile must succeed even when an eager unit's start fails");
+        // State still settles Available — a failed start doesn't corrupt state.
+        assert_eq!(state.lock().await.state, State::Available);
+    }
+
+    #[tokio::test]
+    async fn ensure_running_starts_after_clean_gaming_exit() {
+        // The gaming→available verified-restart path, now served by the unified
+        // post-step: starting from Gaming with an empty (clean) observation resolves
+        // to Available, so the eager unit comes back up. Proves the gate tracks
+        // `desired` (recomputed from observation), not the prior `current` state.
+        let marker = marker_path("from-gaming");
+        let cfg = ensure_cfg(false, &marker, true);
+        let mut s = ArbiterState::new();
+        s.state = State::Gaming;
+        let state = shared(s);
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
+            .await
+            .unwrap();
+        assert_eq!(state.lock().await.state, State::Available);
+        assert!(marker.exists());
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn ensure_running_targets_available_returns_eager_units() {
+        // The GPU-free path: an eager unit is eligible when desired == Available.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama.service"
+            eager_restart = true
+            "#,
+        )
+        .unwrap();
+        let targets = ensure_running_targets(State::Available, &cfg);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].unit, "ollama.service");
+    }
+
+    #[test]
+    fn ensure_running_targets_gaming_and_evicting_are_empty() {
+        // SAFETY INVARIANT (the core of this fix): the eligible set is EMPTY for
+        // both Gaming and the transient Evicting, so a managed GPU unit can never be
+        // started into a live game — regardless of how many eager units are
+        // configured.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama.service"
+            eager_restart = true
+
+            [[managed_units]]
+            unit = "asr.service"
+            eager_restart = true
+            "#,
+        )
+        .unwrap();
+        assert!(ensure_running_targets(State::Gaming, &cfg).is_empty());
+        assert!(ensure_running_targets(State::Evicting, &cfg).is_empty());
+    }
+
+    #[test]
+    fn ensure_running_targets_excludes_non_eager_units() {
+        // Only `eager_restart` units are auto-started; a non-eager unit is never in
+        // the target set even when the GPU is free.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "eager.service"
+            eager_restart = true
+
+            [[managed_units]]
+            unit = "lazy.service"
+            eager_restart = false
+            "#,
+        )
+        .unwrap();
+        let targets = ensure_running_targets(State::Available, &cfg);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].unit, "eager.service");
     }
 
     #[test]
