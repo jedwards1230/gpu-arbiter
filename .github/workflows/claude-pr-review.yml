@@ -20,6 +20,7 @@ jobs:
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     with:
+      draft_on_blocking: true
       focus: |
         gpu-arbiter is a Rust daemon that arbitrates GPU access across clients.
         - Concurrency: races, deadlocks, and lease/lock leaks around GPU device
