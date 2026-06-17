@@ -563,9 +563,13 @@ mod tests {
     /// `start_cmd = touch <path>`). Returned removed/clean.
     fn marker_path(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
+        // pid + thread id + nanos: the thread id keeps paths collision-free across
+        // parallel test threads (same pid + same nanosecond is otherwise possible
+        // under `cargo test --test-threads=N`).
         let uniq = format!(
-            "gpu-arbiter-ensure-{tag}-{}-{:?}",
+            "gpu-arbiter-ensure-{tag}-{}-{:?}-{:?}",
             std::process::id(),
+            std::thread::current().id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -656,6 +660,64 @@ mod tests {
             "a non-eager unit must not be auto-started"
         );
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn ensure_running_starts_when_is_running_cannot_confirm() {
+        // If is_running() can't determine state (the is_active_cmd spawn fails /
+        // errors), `unwrap_or(false)` treats the unit as stopped and a start is
+        // attempted. Exercises the error arm of `is_running(&u).await.unwrap_or(false)`.
+        let marker = marker_path("isrun-err");
+        let cfg = Config::from_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            eager_restart = true
+            start_cmd = ["touch", "{marker}"]
+            stop_cmd = ["true"]
+            is_active_cmd = "/nonexistent/gpu-arbiter-noexist"
+            "#,
+            marker = marker.display(),
+        ))
+        .unwrap();
+        let mut s = ArbiterState::new();
+        s.state = State::Available;
+        let state = shared(s);
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
+            .await
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "a start should be attempted when is_running can't confirm the unit is up"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn ensure_running_continues_when_start_fails() {
+        // A failing start_cmd is logged but must NOT fail the reconcile pass — the
+        // daemon stays fault-tolerant (a wedged unit can't take down arbitration).
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            eager_restart = true
+            start_cmd = ["false"]
+            stop_cmd = ["true"]
+            is_active_cmd = "false"
+            "#,
+        )
+        .unwrap();
+        let mut s = ArbiterState::new();
+        s.state = State::Available;
+        let state = shared(s);
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
+            .await
+            .expect("reconcile must succeed even when an eager unit's start fails");
+        // State still settles Available — a failed start doesn't corrupt state.
+        assert_eq!(state.lock().await.state, State::Available);
     }
 
     #[tokio::test]
