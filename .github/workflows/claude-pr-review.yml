@@ -2,7 +2,7 @@
 # jedwards1230/release-workflows, which runs claude-code-action@v1 in Haiku
 # PR-review mode with the public jedwards1230-plugins marketplace + review-team
 # plugin enabled by default. The focus below is appended to the base prompt.
-name: Claude PR Review
+name: PR Review
 
 on:
   pull_request:
