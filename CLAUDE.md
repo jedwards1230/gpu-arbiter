@@ -31,7 +31,7 @@ The crate is structured as a library (`src/lib.rs`) plus two binaries:
 
 ## Deployed artifact
 
-Build/test/format/lint commands live in [CONTRIBUTING.md](CONTRIBUTING.md). The **deployed** artifact is the static musl binary (what CI ships):
+The **deployed** artifact is the static musl binary (what CI ships):
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
@@ -40,7 +40,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ## Toolchain
 
-Pinned via `rust-toolchain.toml` to `stable`, Rust ≥ 1.88 (edition 2024 — needs let-chains). See [CONTRIBUTING.md](CONTRIBUTING.md#prerequisites) for installation steps.
+Pinned via `rust-toolchain.toml` to `stable`, Rust ≥ 1.88 (edition 2024 — needs let-chains). Components: `rustfmt`, `clippy`.
 
 ## CI workflows (`.github/workflows/`)
 
