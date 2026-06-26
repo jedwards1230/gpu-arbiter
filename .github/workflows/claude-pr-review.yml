@@ -21,6 +21,8 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     with:
       draft_on_blocking: true
+      extra_plugins: |
+        rust-quality@jedwards1230-plugins
       focus: |
         gpu-arbiter is a Rust daemon that arbitrates GPU access across clients.
         - Concurrency: races, deadlocks, and lease/lock leaks around GPU device
@@ -28,4 +30,5 @@ jobs:
         - Rust correctness: unwrap()/expect()/panic! on fallible paths in the
           daemon loop; error propagation; unchecked Option/Result.
         - IPC/socket input handling: unvalidated/untrusted client requests.
+        - When the diff touches Rust, prioritize the rust-quality:rust-reviewer agent for language-specific Rust review.
         Do NOT re-flag rustfmt/clippy findings — CI lints already own those.
