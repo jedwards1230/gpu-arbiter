@@ -29,33 +29,18 @@ The crate is structured as a library (`src/lib.rs`) plus two binaries:
 
 **Cross-platform invariant**: the daemon is Linux-only at runtime but builds and tests on any host. Linux-only edges are `#[cfg(target_os = "linux")]` with non-Linux stubs. Pure-logic modules (classification, config parse, state transitions) are unit-tested on macOS.
 
-## Build commands
+## Build & deploy artifact
+
+Build/test/format/lint commands live in [CONTRIBUTING.md](CONTRIBUTING.md). The **deployed** artifact is the static musl binary (what CI ships):
 
 ```sh
-# Development build
-cargo build
-
-# Release build (glibc)
-cargo build --release
-
-# Deployed artifact — static musl binary (matches what CI ships and release.yml publishes)
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-## Test, format, lint
-
-```sh
-cargo test                                       # runs on macOS too (pure logic)
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-```
-
-CI runs all four in sequence; all must pass on every PR.
-
 ## Toolchain
 
-Pinned via `rust-toolchain.toml` to the `stable` channel. Requires Rust ≥ 1.88 (edition 2024, let-chains). Components: `rustfmt`, `clippy`.
+Pinned via `rust-toolchain.toml` to `stable`, Rust ≥ 1.88 (edition 2024 — needs let-chains). Install steps are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## CI workflows (`.github/workflows/`)
 

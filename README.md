@@ -247,9 +247,9 @@ match = "Heroic"
 ```sh
 cargo build --release                                   # native
 cargo build --release --target x86_64-unknown-linux-musl  # static (deploy target)
-cargo test          # pure logic — runs on macOS too
-cargo fmt --check && cargo clippy --all-targets -- -D warnings
 ```
+
+For development setup and CI checks, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The daemon is **Linux-only at runtime** (netlink `cn_proc`, `/proc`,
 `nvidia-smi`, `systemctl`) but builds and tests on any host: Linux-only edges are
