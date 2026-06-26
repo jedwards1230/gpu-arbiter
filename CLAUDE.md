@@ -1,6 +1,6 @@
-@CONTRIBUTING.md
-
 # gpu-arbiter
+
+@CONTRIBUTING.md
 
 A Linux root daemon that treats a shared GPU machine as **gaming-first, AI-compute-second**. It detects game launches via the kernel `cn_proc` process-event connector, evicts configured GPU compute tenants (e.g. Ollama) from the GPU, restores them when gaming ends, and exposes an HTTP control surface (default port `48750`) with endpoints for state (`/status`), Prometheus metrics (`/metrics`), liveness (`/healthz`), and localhost-only manual overrides (`POST /units/{unit}/start|stop`). Back-compat `/ollama/start|stop` aliases address the first managed unit.
 
