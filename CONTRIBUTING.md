@@ -31,6 +31,10 @@ cargo clippy --all-targets -- -D warnings
 
 CI runs format check → clippy → build → test on every PR; all must pass.
 
+## Documentation
+
+Keep documentation current as part of the change, not as a follow-up — update the README and any affected docs in the same PR. A new config key should be reflected in `packaging/config.example.toml` (the authoritative config reference) and, where relevant, the man pages under `man/`.
+
 ## Before you open a PR
 
 Make sure all CI checks pass locally first — run the formatter, linter, and tests before pushing.
