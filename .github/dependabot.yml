@@ -1,0 +1,27 @@
+# .github/dependabot.yml — Dependabot version updates (per repo-standards Wave 3)
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependency", "chore"]
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependency", "chore"]
+    commit-message:
+      prefix: "deps(cargo)"
+    groups:
+      cargo:
+        patterns: ["*"]
