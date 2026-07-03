@@ -28,18 +28,26 @@
 //! tasks (`procmon`, `presence`, the HTTP server) are `abort()`ed, after the
 //! reconcile task has already stopped.
 
-use gpu_arbiter::cli::{self, Command};
+use gpu_arbiter::cli::{self, Command, WaitFor};
 
 /// Parse argv and handle every **cross-platform** command (version, help, usage
-/// errors, `--check-config`, and the `status` client) here — they work
-/// identically on the macOS stub build, so they live above the Linux cfg gate.
+/// errors, `--check-config`, and the `status`/`wait`/`watch` clients) here —
+/// they work identically on the macOS stub build, so they live above the
+/// Linux cfg gate.
 ///
 /// Returns the resolved config path **only** for [`Command::RunDaemon`] (the one
 /// command that needs the Linux runtime); every other command prints and exits
 /// inside this function. The version is `CARGO_PKG_VERSION`, baked from the git
 /// tag at release build time.
 fn handle_cli_or_get_daemon_config() -> String {
-    let cmd = cli::parse_args(std::env::args().skip(1));
+    let cmd = match cli::parse_args(std::env::args().skip(1)) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            eprintln!("gpu-arbiter: {e}");
+            eprintln!("Try 'gpu-arbiter --help' for usage.");
+            std::process::exit(2);
+        }
+    };
     match cmd {
         Command::Version => {
             println!("gpu-arbiter {}", env!("CARGO_PKG_VERSION"));
@@ -48,11 +56,6 @@ fn handle_cli_or_get_daemon_config() -> String {
         Command::Help => {
             println!("{}", cli::help_text());
             std::process::exit(0);
-        }
-        Command::Error(msg) => {
-            eprintln!("gpu-arbiter: {msg}");
-            eprintln!("Try 'gpu-arbiter --help' for usage.");
-            std::process::exit(2);
         }
         Command::CheckConfig { config } => {
             let path = resolve_path(config.as_deref());
@@ -67,9 +70,27 @@ fn handle_cli_or_get_daemon_config() -> String {
                 }
             }
         }
-        Command::Status { config, json } => {
-            let path = resolve_path(config.as_deref());
-            std::process::exit(run_status(&path, json));
+        Command::Status {
+            config,
+            url,
+            json,
+            quiet,
+        } => {
+            let base_url = resolve_daemon_url_or_exit(config.as_deref(), url.as_deref());
+            std::process::exit(run_status(&base_url, json, quiet));
+        }
+        Command::Wait {
+            config,
+            url,
+            for_state,
+            timeout,
+        } => {
+            let base_url = resolve_daemon_url_or_exit(config.as_deref(), url.as_deref());
+            std::process::exit(run_wait(&base_url, for_state, timeout));
+        }
+        Command::Watch { config, url, json } => {
+            let base_url = resolve_daemon_url_or_exit(config.as_deref(), url.as_deref());
+            std::process::exit(run_watch(&base_url, json));
         }
         Command::RunDaemon { config } => resolve_path(config.as_deref()),
     }
@@ -81,35 +102,67 @@ fn resolve_path(flag: Option<&str>) -> String {
     cli::resolve_config_path(flag, |k| std::env::var(k).ok())
 }
 
-/// The `status` subcommand: a localhost HTTP **client**. Reads the config to find
-/// the port, GETs `http://127.0.0.1:<port>/status` with `ureq` (the same no-TLS
-/// client the tray uses), and prints the rendered summary (or raw JSON). Returns
-/// the process exit code. Cross-platform — runs on any host that can reach the
-/// socket, including the macOS dev box.
-fn run_status(config_path: &str, json: bool) -> i32 {
-    let cfg = match gpu_arbiter::config::Config::load(config_path) {
+/// Resolve the daemon base URL for `status`/`wait`/`watch` (see
+/// [`cli::resolve_daemon_url`]), loading the local config **only** when
+/// neither `--url` nor `GPU_ARBITER_URL` already answers the question — so a
+/// caller pointed at a remote daemon via `--url` never needs a local config
+/// file to exist. Exits the process (code 1) on a config load failure, the
+/// only way this can fail.
+fn resolve_daemon_url_or_exit(config_flag: Option<&str>, url_flag: Option<&str>) -> String {
+    let env = std::env::var("GPU_ARBITER_URL").ok();
+    if url_flag.is_some() || env.as_deref().is_some_and(|s| !s.is_empty()) {
+        return cli::resolve_daemon_url(url_flag, env.as_deref(), 0);
+    }
+    let path = resolve_path(config_flag);
+    let cfg = match gpu_arbiter::config::Config::load(&path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("ERROR: {e}");
-            return 1;
+            std::process::exit(1);
         }
     };
-    let url = format!("http://127.0.0.1:{}/status", cfg.port);
+    cli::resolve_daemon_url(None, None, cfg.port)
+}
 
-    let body = match ureq::get(&url).call() {
-        Ok(mut resp) => match resp.body_mut().read_json::<serde_json::Value>() {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("ERROR: reading /status response from {url}: {e}");
-                return 1;
-            }
-        },
+/// GET `{base_url}/status` and parse the body as JSON. The one HTTP call
+/// shared by `status`/`wait`/`watch` — `ureq` (the same no-TLS client the
+/// tray uses), so this runs on any host that can reach the socket, including
+/// the macOS dev box.
+fn fetch_status_json(base_url: &str) -> Result<serde_json::Value, String> {
+    let url = format!("{base_url}/status");
+    match ureq::get(&url).call() {
+        Ok(mut resp) => resp
+            .body_mut()
+            .read_json::<serde_json::Value>()
+            .map_err(|e| format!("reading /status response from {url}: {e}")),
+        Err(e) => Err(format!("querying {url}: {e}")),
+    }
+}
+
+/// The `status` subcommand: fetch `/status` once and render it — human
+/// summary, raw JSON (`--json`), or nothing at all (`-q`/`--quiet`, see
+/// [`cli::quiet_exit_code`]). Returns the process exit code.
+///
+/// Exit codes: `0` success (or, quiet, `available`); `1` a fetch/render error
+/// (or, quiet, any non-`available` state); `2` (quiet only) the daemon is
+/// unreachable — a distinct code so a script can tell "GPU claimed" from
+/// "can't even ask".
+fn run_status(base_url: &str, json: bool, quiet: bool) -> i32 {
+    let body = match fetch_status_json(base_url) {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("ERROR: querying {url}: {e}");
-            eprintln!("Is the gpu-arbiter daemon running?");
-            return 1;
+            if !quiet {
+                eprintln!("ERROR: {e}");
+                eprintln!("Is the gpu-arbiter daemon running?");
+            }
+            return if quiet { 2 } else { 1 };
         }
     };
+
+    if quiet {
+        let state = body.get("state").and_then(|s| s.as_str()).unwrap_or("");
+        return cli::quiet_exit_code(state);
+    }
 
     if json {
         match serde_json::to_string_pretty(&body) {
@@ -123,6 +176,88 @@ fn run_status(config_path: &str, json: bool) -> i32 {
         println!("{}", cli::render_status(&body));
     }
     0
+}
+
+/// The `wait` subcommand: poll `/status` every [`cli::POLL_INTERVAL`] until
+/// [`cli::wait_condition_met`] holds or `timeout` elapses. A blocking loop
+/// (`std::thread::sleep`) — this runs before the tokio runtime exists (see
+/// `handle_cli_or_get_daemon_config`), so there's no executor to avoid
+/// blocking. Returns the process exit code: `0` reached, `1` timed out or the
+/// daemon was unreachable.
+fn run_wait(base_url: &str, for_state: WaitFor, timeout: std::time::Duration) -> i32 {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match fetch_status_json(base_url) {
+            Ok(body) => {
+                let state = body.get("state").and_then(|s| s.as_str()).unwrap_or("");
+                if cli::wait_condition_met(state, for_state) {
+                    return 0;
+                }
+            }
+            Err(e) => {
+                eprintln!("ERROR: {e}");
+                eprintln!("Is the gpu-arbiter daemon running?");
+                return 1;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "ERROR: timed out after {}s waiting for state to reach {for_state:?}",
+                timeout.as_secs()
+            );
+            return 1;
+        }
+        std::thread::sleep(cli::POLL_INTERVAL);
+    }
+}
+
+/// The `watch` subcommand: poll `/status` every [`cli::POLL_INTERVAL`] and
+/// print one line per state transition (plus the initial observation — see
+/// [`cli::watch_should_emit`]) until killed. Client-side polling, not a
+/// server-side SSE/long-poll endpoint (deliberately — keeps the daemon's HTTP
+/// surface small; see the module docs). Never returns in practice (`loop`
+/// with no `break`); the `i32` return type only exists so the call site can
+/// stay symmetric with `run_status`/`run_wait`.
+fn run_watch(base_url: &str, json: bool) -> i32 {
+    let mut prev_state: Option<String> = None;
+    loop {
+        match fetch_status_json(base_url) {
+            Ok(body) => {
+                let state = body
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                if cli::watch_should_emit(prev_state.as_deref(), &state) {
+                    let claims: Vec<String> = body
+                        .get("claims")
+                        .and_then(|c| c.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|c| c.as_str())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let ts = gpu_arbiter::state::format_rfc3339(std::time::SystemTime::now());
+                    let line = if json {
+                        cli::watch_json_line(&ts, prev_state.as_deref(), &state, &claims)
+                    } else {
+                        cli::watch_human_line(&ts, prev_state.as_deref(), &state, &claims)
+                    };
+                    println!("{line}");
+                    use std::io::Write as _;
+                    let _ = std::io::stdout().flush();
+                    prev_state = Some(state);
+                }
+            }
+            // Transient fetch errors don't stop watch — it runs until killed;
+            // log to stderr and keep polling (stdout stays a pure
+            // transition-log stream, safe to pipe).
+            Err(e) => eprintln!("WARN: {e}"),
+        }
+        std::thread::sleep(cli::POLL_INTERVAL);
+    }
 }
 
 // Linux is the only runtime target (netlink cn_proc, /proc, nvidia-smi,
