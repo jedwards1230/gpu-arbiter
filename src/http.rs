@@ -1639,7 +1639,22 @@ mod tests {
             path.exists(),
             "dropping a UnixListener must not unlink its socket file"
         );
-        assert!(!socket_is_live(&path).await);
+        // A just-dropped listener's kernel-side teardown isn't always
+        // synchronous with `drop` on macOS — under load the probe can
+        // transiently still see the socket as connectable, and the probe's
+        // deliberate conservatism reads that as "live" (correct daemon
+        // behavior: the real-world stale file is hours old, not
+        // microseconds). Poll until the probe settles false, bounded, so the
+        // test asserts the settled answer rather than the teardown race —
+        // same rationale as `bind_uds_removes_a_genuinely_stale_socket_and_binds_fresh`.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while socket_is_live(&path).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "probe never settled to 'stale' for a dropped listener's socket file within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
