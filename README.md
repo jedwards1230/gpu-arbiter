@@ -129,7 +129,8 @@ remote stream. `input_monitor_up = false` means presence is **unknown** (fail-sa
 
 ### Metrics
 
-`/metrics` exposes the same state as Prometheus gauges, including the presence set:
+`/metrics` exposes the current state as Prometheus **gauges**, including the
+presence set:
 
 | Metric | Meaning |
 |---|---|
@@ -141,6 +142,19 @@ remote stream. `input_monitor_up = false` means presence is **unknown** (fail-sa
 `gpu_arbiter_gaming AND NOT gpu_arbiter_local_present` (gated on
 `gpu_arbiter_input_monitor_up`) is the signal an "abandoned game left running"
 alert should key off — so it stops false-firing during local at-desk play.
+
+It also exposes four **counters** — durable eviction/restart/reconcile history
+that outlives journald's short retention on the deployment host. Monotonic for
+the daemon's process lifetime; a restart resets them to 0, so alert/dashboard
+queries should use `rate()`/`increase()` rather than comparing raw values
+across a restart:
+
+| Metric | Meaning |
+|---|---|
+| `gpu_arbiter_evictions_total{unit,outcome}` | Cumulative eviction attempts, `outcome` ∈ `graceful`\|`sigkill`\|`error`. A no-op (the unit wasn't running) is not counted. |
+| `gpu_arbiter_unit_restarts_total{unit}` | Cumulative successful managed-unit starts driven by the daemon (eager restore or manual start) |
+| `gpu_arbiter_proc_events_dropped_total` | Cumulative `cn_proc` drop occurrences: kernel `ENOBUFS` overflow plus full-trigger-channel drops |
+| `gpu_arbiter_reconcile_passes_total{trigger}` | Cumulative reconcile passes, `trigger` ∈ `proc_event`\|`timer`\|`manual`\|`startup` |
 
 ## Command-line usage
 
