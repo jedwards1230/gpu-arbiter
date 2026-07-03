@@ -197,7 +197,7 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 | `ollama_unit` | `"ollama.service"` | **Legacy** single managed unit (used when `managed_units` is unset) |
 | `eager_ollama` | `true` | **Legacy** restart-on-gaming-end for the single unit |
 | `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation |
-| `vram_free_threshold_mb` | `2000` | VRAM-used below this = GPU "freed" |
+| `vram_free_threshold_mb` | `2000` | VRAM-used below this = GPU "freed" — applied to the evicting unit's own attributed VRAM when available, else total GPU VRAM (see [Eviction VRAM gating](#eviction-vram-gating)) |
 | `reconcile_interval_s` | `30` | Slow backstop interval (detection is event-driven) |
 | `detect_steam` | `true` | Match `SteamLaunch AppId=` (all Steam games) |
 | `game_patterns` | `[]` | `[[game_patterns]] name/match` for non-Steam launchers |
@@ -252,6 +252,19 @@ gating](#eviction-vram-gating)) is attributed via two channels, tried in order:
 
 Neither channel reporting a match means `vram_mb` is omitted from `/status`
 entirely (never a misleading `0`).
+
+### Eviction VRAM gating
+
+The graceful-eviction wait (`stop` → poll → SIGKILL after `eviction_timeout_s`)
+gates on the **evicting unit's own attributed VRAM**, using the same
+attribution channels as above (cgroup, then `vram_match`) — not on total GPU
+VRAM. This matters during a real game launch: the game is loading its own
+VRAM onto the GPU *concurrently* with the tenant's teardown, so gating on
+total usage rarely dropped below `vram_free_threshold_mb` before the timeout
+elapsed — eviction routinely escalated to SIGKILL even when the tenant itself
+released cleanly. Falls back to the legacy total-GPU-VRAM gate when
+attribution isn't available this poll (AMD, a failed compute-proc query, or a
+command-driven unit with no `vram_match`).
 
 ### Init systems other than systemd
 

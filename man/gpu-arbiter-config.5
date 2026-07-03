@@ -79,8 +79,18 @@ before escalating to SIGKILL.
 .B vram_free_threshold_mb
 Integer (MiB). Default
 .BR 2000 .
-VRAM\-used strictly below this value means the GPU is considered "freed" after
-eviction.
+VRAM\-used strictly below this value means the GPU (or, when attribution is
+available, the evicting unit itself) is considered "freed" after eviction.
+The graceful\-eviction poll gates on the evicting unit's
+.B own
+attributed VRAM (cgroup, then
+.BR vram_match ,
+same precedence as
+.I /status
+attribution) when available, falling back to total GPU VRAM otherwise \(em
+see
+.B vram_match
+below.
 .TP
 .B reconcile_interval_s
 Integer (seconds). Default
