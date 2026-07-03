@@ -8,14 +8,12 @@
 //! side-effecting parts — the `/proc` scan that *builds* the snapshot, and the
 //! managed-unit drive — are async and integration-tested on a live Linux host.
 
-use std::sync::Arc;
-
-use tokio::sync::Mutex;
+use std::sync::{Arc, RwLock};
 
 use crate::classify::{self, GpuGraphicsProc};
 use crate::config::Config;
 use crate::gpu::{self, GpuBackend};
-use crate::state::{ArbiterState, Claim, ReconcileTrigger, State, UnitStatus};
+use crate::state::{ArbiterState, Claim, ReconcileTrigger, State, UnitStatus, write_state};
 use crate::units;
 
 /// Reconcile-pass errors. Composes the module errors a pass can surface: the
@@ -189,10 +187,11 @@ pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> Result<ProcSnapshot
 ///
 /// ## Locking — the long eviction runs *off* the state lock
 ///
-/// `state` is the shared `Arc<Mutex<ArbiterState>>`. This function takes the lock
-/// only for **brief** mutations and releases it across every slow shell-out (the
-/// `/proc` scan, `nvidia-smi`, `systemctl`). Critically, the
-/// `evicting → ... → gaming` kill window — which can take up to
+/// `state` is the shared `Arc<std::sync::RwLock<ArbiterState>>`. This function
+/// takes the lock only for **brief, synchronous** mutations (no `.await` is ever
+/// held across it — see [`crate::state::write_state`]) and releases it across
+/// every slow shell-out (the `/proc` scan, `nvidia-smi`, `systemctl`).
+/// Critically, the `evicting → ... → gaming` kill window — which can take up to
 /// `eviction_timeout_s` — happens with the lock **dropped**, so `GET /status`
 /// never blocks during the very window the transient `evicting` state exists to
 /// advertise. The reconcile task is still the only *writer*, so there is no
@@ -212,7 +211,7 @@ pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> Result<ProcSnapshot
 /// hiccup), which no downstream code expects. `Copy`, so threading it through
 /// every pass costs nothing.
 pub async fn reconcile(
-    state: &Arc<Mutex<ArbiterState>>,
+    state: &Arc<RwLock<ArbiterState>>,
     cfg: &Config,
     presence: &crate::presence::PresenceMonitor,
     trigger: ReconcileTrigger,
@@ -225,7 +224,7 @@ pub async fn reconcile(
     // Brief lock: decide, record the fresh claim set, snapshot the current state
     // so we can pick an Ollama action without holding the lock.
     let (current, desired) = {
-        let mut guard = state.lock().await;
+        let mut guard = write_state(state);
         let desired = ArbiterState::resolve_state(&claims);
         let current = guard.state;
         guard.claims = claims;
@@ -245,7 +244,7 @@ pub async fn reconcile(
             // machines back off, then tear every managed unit down (in order) with
             // the lock DROPPED so `/status` stays responsive across the whole kill
             // window. Gaming wins unconditionally even if one unit errors.
-            state.lock().await.set_state(State::Evicting);
+            write_state(state).set_state(State::Evicting);
             for u in cfg.resolved_units() {
                 match units::evict(u, cfg, backend).await {
                     Ok(outcome) => {
@@ -257,7 +256,7 @@ pub async fn reconcile(
                 }
             }
             // Gaming wins the GPU unconditionally — even if eviction errored.
-            state.lock().await.set_state(State::Gaming);
+            write_state(state).set_state(State::Gaming);
         }
         UnitAction::Restart => {
             // gaming → available (verified: the snapshot above was clean). Settle
@@ -266,12 +265,12 @@ pub async fn reconcile(
             // subsumes it (the edge is reached only after a clean scan, and the
             // post-step's `desired == Available` guard is the same "GPU is free"
             // condition), so both paths share one idempotent code path.
-            state.lock().await.set_state(State::Available);
+            write_state(state).set_state(State::Available);
         }
         UnitAction::None => {
             // No transition needing a unit action: just settle the state
             // (covers the `evicting → gaming` settle and steady-state passes).
-            state.lock().await.set_state(desired);
+            write_state(state).set_state(desired);
         }
     }
 
@@ -332,7 +331,7 @@ fn ensure_running_targets(desired: State, cfg: &Config) -> Vec<&crate::config::M
 /// The shell-outs run with the lock **dropped**; only the final field write takes
 /// it briefly, so `/status` never blocks on `systemctl is-active`/`nvidia-smi`.
 async fn refresh_substate(
-    state: &Arc<Mutex<ArbiterState>>,
+    state: &Arc<RwLock<ArbiterState>>,
     cfg: &Config,
     presence: &crate::presence::PresenceMonitor,
     backend: GpuBackend,
@@ -376,7 +375,7 @@ async fn refresh_substate(
         monitor_up: presence.healthy(),
     };
 
-    let mut guard = state.lock().await;
+    let mut guard = write_state(state);
     guard.units = unit_statuses;
     guard.presence = presence_view;
     if let Some(mem) = mem {
@@ -416,6 +415,7 @@ pub enum UnitAction {
 mod tests {
     use super::*;
     use crate::config::GamePattern;
+    use crate::state::read_state;
 
     fn proc(pid: i32, cmdline: &str) -> ProcInfo {
         ProcInfo {
@@ -510,10 +510,10 @@ mod tests {
     // ── reconcile orchestration (macOS: observe() yields an empty snapshot, so
     //    claim_set is empty; the systemctl/nvidia-smi shell-outs fail-soft) ──
 
-    /// Wrap a state in the shared `Arc<Mutex>` the (refactored) `reconcile` now
-    /// takes, mirroring the daemon's real wiring.
-    fn shared(state: ArbiterState) -> Arc<Mutex<ArbiterState>> {
-        Arc::new(Mutex::new(state))
+    /// Wrap a state in the shared `Arc<RwLock>` `reconcile` takes, mirroring the
+    /// daemon's real wiring.
+    fn shared(state: ArbiterState) -> Arc<RwLock<ArbiterState>> {
+        Arc::new(RwLock::new(state))
     }
 
     #[tokio::test]
@@ -535,7 +535,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let g = state.lock().await;
+        let g = read_state(&state);
         assert_eq!(g.state, State::Available);
         assert!(g.claims.is_empty());
     }
@@ -569,7 +569,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let g = state.lock().await;
+        let g = read_state(&state);
         assert_eq!(g.units.len(), 2);
         // Order matches the configured (eviction) order.
         assert_eq!(g.units[0].unit, "ollama.service");
@@ -594,7 +594,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let g = state.lock().await;
+        let g = read_state(&state);
         assert_eq!(g.presence.last_input_unix, 1_700_000_500);
         // A fresh monitor that never enumerated is unhealthy (fail-safe default).
         assert!(!g.presence.monitor_up);
@@ -669,7 +669,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.lock().await.state, State::Available);
+        assert_eq!(read_state(&state).state, State::Available);
         assert!(
             marker.exists(),
             "ensure-running should have started the stopped eager unit"
@@ -796,7 +796,7 @@ mod tests {
         .await
         .expect("reconcile must succeed even when an eager unit's start fails");
         // State still settles Available — a failed start doesn't corrupt state.
-        assert_eq!(state.lock().await.state, State::Available);
+        assert_eq!(read_state(&state).state, State::Available);
     }
 
     #[tokio::test]
@@ -820,7 +820,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(state.lock().await.state, State::Available);
+        assert_eq!(read_state(&state).state, State::Available);
         assert!(marker.exists());
         let _ = std::fs::remove_file(&marker);
     }

@@ -21,18 +21,18 @@
 //! Note axum 0.8 path-param syntax is `/{p}` (not `/:p`).
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::Json;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Router, response::IntoResponse};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::gpu::GpuBackend;
-use crate::state::{ArbiterState, ReconcileTrigger, StatusSnapshot};
+use crate::state::{ArbiterState, ReconcileTrigger, StatusSnapshot, read_state};
 use crate::units;
 
 /// Shared application state handed to every handler.
@@ -45,8 +45,10 @@ use crate::units;
 /// `POST /units/{unit}/stop` eviction path rather than re-probed per request.
 #[derive(Clone)]
 pub struct AppState {
-    /// Live arbiter state, shared with the reconcile task.
-    pub state: Arc<Mutex<ArbiterState>>,
+    /// Live arbiter state, shared with the reconcile task. `std::sync::RwLock`,
+    /// not `tokio::sync`: every critical section here is a brief, synchronous
+    /// read with no `.await` held across it (see [`crate::state::read_state`]).
+    pub state: Arc<RwLock<ArbiterState>>,
     /// Channel to request a reconcile pass from the HTTP side.
     pub triggers: mpsc::Sender<ReconcileTrigger>,
     /// Immutable daemon config (for the `/units/*` debug handlers).
@@ -76,7 +78,7 @@ pub fn router(app: AppState) -> Router {
 /// counts), so no loopback gate. The body is produced by the pure
 /// [`render_metrics`] so it unit-tests on the macOS dev host.
 pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
-    let guard = app.state.lock().await;
+    let guard = read_state(&app.state);
     let snap = guard.snapshot();
     // Read the state-entered instant straight off live state as whole unix
     // seconds — avoids round-tripping the `/status` RFC-3339 string back to a
@@ -358,7 +360,7 @@ pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
 
 /// `GET /status` — serialize the current [`StatusSnapshot`] as JSON.
 pub async fn status(State(app): State<AppState>) -> Json<StatusSnapshot> {
-    let snap = app.state.lock().await.snapshot();
+    let snap = read_state(&app.state).snapshot();
     Json(snap)
 }
 

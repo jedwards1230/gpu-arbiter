@@ -161,8 +161,12 @@ impl StatusSnapshot {
 /// The live, in-memory state owned by the single reconcile task.
 ///
 /// Not serialized directly — it produces a [`StatusSnapshot`] for `/status`.
-/// Shared with the HTTP handlers behind a `tokio::sync::RwLock`/`Mutex` (wired
-/// in `main`).
+/// Shared with the HTTP handlers behind a `std::sync::RwLock` (wired in
+/// `main`): every critical section is a brief, synchronous take-mutate-drop
+/// with no `.await` held across the lock, so the std (non-async) `RwLock` is
+/// the right primitive — `/status`/`/metrics` take a read lock, the reconcile
+/// task takes a write lock only for the short mutations (never across the
+/// slow shell-outs; see `reconcile`'s docs).
 #[derive(Debug, Clone)]
 pub struct ArbiterState {
     /// Current externally-visible state.
@@ -257,6 +261,41 @@ impl ArbiterState {
             input_monitor_up: self.presence.monitor_up,
         }
     }
+}
+
+/// Take a read lock on the shared [`ArbiterState`] (`/status`/`/metrics`
+/// handlers). Panics on a poisoned lock — see [`write_state`] for the policy
+/// this and [`write_state`] share.
+pub fn read_state(
+    state: &std::sync::RwLock<ArbiterState>,
+) -> std::sync::RwLockReadGuard<'_, ArbiterState> {
+    state.read().unwrap_or_else(|poison| {
+        panic!("ArbiterState lock poisoned (a prior writer panicked): {poison}")
+    })
+}
+
+/// Take a write lock on the shared [`ArbiterState`] (the reconcile task's brief
+/// mutations).
+///
+/// ## Poisoning policy: fatal, not recovered
+///
+/// A poisoned lock means a prior writer panicked mid-mutation, leaving
+/// `ArbiterState` potentially inconsistent (e.g. `units` updated but
+/// `presence`/`gpu_vram_used_mb` not, or `state` left stale relative to
+/// `claims`). For a root daemon whose entire job is deciding whether to evict
+/// or restore GPU tenants, silently continuing on unverified state risks
+/// getting that decision wrong in either direction — leaving a tenant off
+/// forever, or restarting one into a live game. Crashing here and relying on
+/// systemd's `Restart=always` (`packaging/gpu-arbiter.service`) to boot a
+/// fresh process — which re-runs the startup reconcile against freshly
+/// observed ground truth — is the safer failure mode than
+/// `into_inner()`-recovering a guard over data of unknown integrity.
+pub fn write_state(
+    state: &std::sync::RwLock<ArbiterState>,
+) -> std::sync::RwLockWriteGuard<'_, ArbiterState> {
+    state.write().unwrap_or_else(|poison| {
+        panic!("ArbiterState lock poisoned (a prior writer panicked): {poison}")
+    })
 }
 
 /// Format a [`SystemTime`] as an RFC 3339 / ISO-8601 UTC string for `/status`

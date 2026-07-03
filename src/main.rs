@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
     use gpu_arbiter::config::Config;
@@ -140,8 +140,8 @@ mod linux {
     use gpu_arbiter::presence::{self, PresenceMonitor};
     use gpu_arbiter::procmon;
     use gpu_arbiter::reconcile;
-    use gpu_arbiter::state::{ArbiterState, ReconcileTrigger};
-    use tokio::sync::{Mutex, mpsc};
+    use gpu_arbiter::state::{ArbiterState, ReconcileTrigger, read_state};
+    use tokio::sync::mpsc;
 
     /// Debounce window for coalescing `ProcEvent` bursts. A game launch fires a
     /// storm of fork/exec events; we want **one** reconcile shortly after the
@@ -202,7 +202,7 @@ mod linux {
         );
 
         // 2. Shared state + the trigger channel.
-        let state = Arc::new(Mutex::new(ArbiterState::new()));
+        let state = Arc::new(RwLock::new(ArbiterState::new()));
         let (triggers_tx, triggers_rx) = mpsc::channel::<ReconcileTrigger>(TRIGGER_CHANNEL_DEPTH);
 
         // 2b. Local-presence monitor. Seed `last_input` to NOW (the startup bias)
@@ -227,7 +227,7 @@ mod linux {
             // our own here; reconcile is the only thing that does.
             tracing::error!(error = %e, "startup reconcile failed; continuing (backstop will retry)");
         }
-        tracing::info!(state = ?state.lock().await.state, "startup reconcile complete");
+        tracing::info!(state = ?read_state(&state).state, "startup reconcile complete");
 
         // 3b. Presence watcher: epoll-watch physical input devices, re-enumerate on
         //     hotplug + the reconcile cadence backstop. Gated on the config toggle —
@@ -295,7 +295,7 @@ mod linux {
     }
 
     /// The sole state-mutating task. Owns `state`; every other task only *reads*
-    /// it (via the HTTP `Mutex`) or *requests* a pass (via the trigger channel).
+    /// it (via the HTTP `RwLock`) or *requests* a pass (via the trigger channel).
     ///
     /// Two trigger sources are merged with `tokio::select!`:
     /// - the **periodic backstop** `interval` (covers dropped netlink events),
@@ -306,7 +306,7 @@ mod linux {
     /// storm into a single reconcile. `Manual`/`Timer` reconcile immediately
     /// (they're deliberate, low-rate, latency-sensitive).
     async fn reconcile_task(
-        state: Arc<Mutex<ArbiterState>>,
+        state: Arc<RwLock<ArbiterState>>,
         cfg: Arc<Config>,
         presence: PresenceMonitor,
         mut triggers: mpsc::Receiver<ReconcileTrigger>,
