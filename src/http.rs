@@ -328,12 +328,24 @@ fn esc(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// [`serve`] failures: both the initial bind and the serve loop itself only
+/// ever fail with an IO error (a bind conflict, or the listener erroring
+/// mid-serve). Its own small type rather than reusing
+/// [`crate::reconcile::ReconcileError`] — `http` and `reconcile` are otherwise
+/// independent modules, and this error carries no GPU/unit/config cases.
+#[derive(Debug, thiserror::Error)]
+pub enum HttpError {
+    /// Binding the listener, or the serve loop itself, failed.
+    #[error("HTTP server: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 /// Serve the axum HTTP control surface on `addr` until the process exits.
 /// Cross-platform.
 ///
 /// Binds with `ConnectInfo<SocketAddr>` wired in so the `/ollama/*` handlers can
 /// read the peer address and reject non-loopback callers.
-pub async fn serve(addr: SocketAddr, app: AppState) -> anyhow::Result<()> {
+pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP control surface listening");
     axum::serve(

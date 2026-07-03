@@ -18,6 +18,33 @@ use crate::gpu::{self, GpuBackend};
 use crate::state::{ArbiterState, Claim, ReconcileTrigger, State, UnitStatus};
 use crate::units;
 
+/// Reconcile-pass errors. Composes the module errors a pass can surface: the
+/// `/proc` scan (and the blocking task that runs it) is the only source that
+/// currently propagates out of [`reconcile`] (unit/GPU eviction failures are
+/// caught and logged — gaming wins regardless, see [`reconcile`]'s docs), but
+/// [`GpuError`](crate::gpu::GpuError)/[`UnitError`](crate::units::UnitError)/
+/// [`ConfigError`](crate::config::ConfigError) conversions are included so a
+/// future change to what this function propagates doesn't need a new error
+/// type — just a `?`.
+#[derive(Debug, thiserror::Error)]
+pub enum ReconcileError {
+    /// The `/proc` scan (or another synchronous read reconcile performs) failed.
+    #[error("scanning /proc: {0}")]
+    Io(#[from] std::io::Error),
+    /// The blocking `/proc`-scan task panicked.
+    #[error("proc-scan task panicked: {0}")]
+    Join(#[from] tokio::task::JoinError),
+    /// A GPU query failed.
+    #[error(transparent)]
+    Gpu(#[from] crate::gpu::GpuError),
+    /// A managed-unit control invocation failed.
+    #[error(transparent)]
+    Unit(#[from] crate::units::UnitError),
+    /// Loading/parsing the config failed.
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+}
+
 /// One observed process: its pid and full cmdline (NUL-joined `/proc/<pid>/cmdline`
 /// flattened to spaces). The unit the pure classifier consumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +113,7 @@ pub fn flatten_cmdline(raw: &[u8]) -> String {
 /// graphics-proc query (only when the VRAM heuristic is on) is an async
 /// `tokio::process` shell-out and stays on the runtime.
 #[cfg(target_os = "linux")]
-pub async fn observe(cfg: &Config, backend: GpuBackend) -> anyhow::Result<ProcSnapshot> {
+pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
     // Blocking /proc walk off the runtime threads.
     let procs = tokio::task::spawn_blocking(scan_proc).await??;
 
@@ -114,7 +141,7 @@ pub async fn observe(cfg: &Config, backend: GpuBackend) -> anyhow::Result<ProcSn
 /// empty cmdline (kernel thread / zombie) is skipped since it can't match any
 /// game rule.
 #[cfg(target_os = "linux")]
-fn scan_proc() -> anyhow::Result<Vec<ProcInfo>> {
+fn scan_proc() -> Result<Vec<ProcInfo>, ReconcileError> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
         let entry = match entry {
@@ -146,7 +173,7 @@ fn scan_proc() -> anyhow::Result<Vec<ProcInfo>> {
 /// Non-Linux stub: there is no `/proc`. Returns an empty snapshot so the crate
 /// compiles and the reconcile loop is exercisable in tests on macOS.
 #[cfg(not(target_os = "linux"))]
-pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> anyhow::Result<ProcSnapshot> {
+pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
     Ok(ProcSnapshot::default())
 }
 
@@ -190,7 +217,7 @@ pub async fn reconcile(
     presence: &crate::presence::PresenceMonitor,
     trigger: ReconcileTrigger,
     backend: GpuBackend,
-) -> anyhow::Result<()> {
+) -> Result<(), ReconcileError> {
     // Slow, off-lock: scan /proc (+ optional GPU procs).
     let snap = observe(cfg, backend).await?;
     let claims = claim_set(&snap, cfg);

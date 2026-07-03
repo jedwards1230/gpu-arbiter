@@ -121,7 +121,7 @@ fn run_status(config_path: &str, json: bool) -> i32 {
 // systemctl). The crate still builds/tests on macOS via the non-Linux `main`
 // stub below and the cfg-gated/stubbed module internals.
 #[cfg(target_os = "linux")]
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = handle_cli_or_get_daemon_config();
     linux::run(config_path)
 }
@@ -154,7 +154,7 @@ mod linux {
     /// triggers are redundant and safe to drop (`procmon` uses `try_send`).
     const TRIGGER_CHANNEL_DEPTH: usize = 64;
 
-    pub fn run(config_path: String) -> anyhow::Result<()> {
+    pub fn run(config_path: String) -> Result<(), Box<dyn std::error::Error>> {
         init_tracing();
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -163,7 +163,7 @@ mod linux {
         rt.block_on(async_main(config_path))
     }
 
-    async fn async_main(config_path: String) -> anyhow::Result<()> {
+    async fn async_main(config_path: String) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Config (missing file → defaults). Path resolved from
         //    --config / GPU_ARBITER_CONFIG / the built-in default by the caller.
         let cfg = Arc::new(Config::load(&config_path)?);

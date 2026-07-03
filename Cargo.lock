@@ -662,7 +662,6 @@ dependencies = [
 name = "gpu-arbiter"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "axum",
  "evdev",
  "inotify",
