@@ -316,6 +316,9 @@ mod linux {
         rt.block_on(async_main(config_path))
     }
 
+    // Startup wiring is sequential by design (config → state → sync reconcile →
+    // task spawns) — splitting it would only scatter the ordering constraints.
+    #[allow(clippy::too_many_lines)]
     async fn async_main(config_path: String) -> Result<(), Box<dyn std::error::Error>> {
         // 1. Config (missing file → defaults). Path resolved from
         //    --config / GPU_ARBITER_CONFIG / the built-in default by the caller.
@@ -366,8 +369,7 @@ mod linux {
         //     into ArbiterState each pass for /status + /metrics.
         let start_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs().cast_signed())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs().cast_signed());
         let presence = PresenceMonitor::new(start_unix);
 
         // 3. STARTUP reconcile BEFORE anything else can drive Ollama: a daemon
@@ -391,7 +393,7 @@ mod linux {
             let monitor = presence.clone();
             let interval = Duration::from_secs(cfg.reconcile_interval_s.max(1));
             Some(tokio::spawn(async move {
-                presence::run(monitor, interval).await
+                presence::run(monitor, interval).await;
             }))
         } else {
             tracing::info!("presence detection disabled in config; presence reported unknown");
@@ -583,9 +585,10 @@ mod linux {
                     return;
                 }
                 _ = interval.tick() => ReconcileTrigger::Timer,
-                recv = triggers.recv() => match recv {
-                    Some(t) => t,
-                    None => {
+                recv = triggers.recv() => {
+                    if let Some(t) = recv {
+                        t
+                    } else {
                         tracing::info!("trigger channel closed; reconcile task exiting");
                         return;
                     }
@@ -632,10 +635,11 @@ mod linux {
         let deadline = tokio::time::Instant::now() + DEBOUNCE;
         loop {
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => return ReconcileTrigger::ProcEvent,
+                () = tokio::time::sleep_until(deadline) => return ReconcileTrigger::ProcEvent,
                 recv = triggers.recv() => match recv {
-                    // Another proc event: keep coalescing (deadline unchanged).
-                    Some(ReconcileTrigger::ProcEvent) => continue,
+                    // Another proc event: keep coalescing (deadline unchanged —
+                    // the empty arm falls through to the next loop iteration).
+                    Some(ReconcileTrigger::ProcEvent) => {}
                     // A deliberate trigger: stop debouncing and carry it through.
                     Some(other) => return other,
                     // Channel closed: the original ProcEvent still warrants a pass.
@@ -672,8 +676,8 @@ mod linux {
         };
 
         tokio::select! {
-            _ = term => tracing::debug!("SIGTERM"),
-            _ = int => tracing::debug!("SIGINT"),
+            () = term => tracing::debug!("SIGTERM"),
+            () = int => tracing::debug!("SIGINT"),
         }
     }
 
