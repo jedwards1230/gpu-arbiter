@@ -161,10 +161,37 @@ jobs:
           set -euo pipefail
           # The git tag is the single source of truth. Stamp the package version
           # so CARGO_PKG_VERSION (→ `--version` and `/status.version`) matches the
-          # release. Only the package `version = "..."` line starts at column 0;
-          # dependency versions are inline (`tokio = { version = ... }`), so this
-          # is unambiguous. Edits only this ephemeral tagged checkout.
-          sed -i -E "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          # release. Edits only this ephemeral tagged checkout — never pushed
+          # back to main.
+          #
+          # Scoped to the `[package]` table (not a blind `^version = ` anchor
+          # across the whole file): today all dependencies use the inline
+          # `{ version = ... }` form, so a bare `^version = ` sed only ever
+          # matches the package line — but a long-form dependency table
+          # (`[dependencies.foo]` followed by an un-indented `version = "..."`
+          # key, which TOML permits) would also start at column 0 and silently
+          # get corrupted by that same anchor. Fails the step outright if it
+          # doesn't find exactly one `[package]`-scoped `version =` line to
+          # replace, instead of silently doing nothing or clobbering the wrong
+          # line.
+          tmp="$(mktemp)"
+          awk -v version="$VERSION" '
+            BEGIN { count = 0; in_package = 0 }
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version[[:space:]]*=/ {
+              print "version = \"" version "\""
+              count++
+              next
+            }
+            { print }
+            END {
+              if (count != 1) {
+                print "ERROR: expected exactly 1 [package] version line to replace, found " count > "/dev/stderr"
+                exit 1
+              }
+            }
+          ' Cargo.toml > "$tmp"
+          mv "$tmp" Cargo.toml
           echo "Baked version:"; grep -m1 '^version = ' Cargo.toml
 
       - name: Add musl target

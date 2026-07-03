@@ -40,7 +40,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ## Toolchain
 
-Pinned via `rust-toolchain.toml` to `stable`, Rust ≥ 1.88 (edition 2024 — needs let-chains). Components: `rustfmt`, `clippy`.
+Pinned via `rust-toolchain.toml` to an exact version (currently 1.96.1), Rust ≥ 1.88 (edition 2024 — needs let-chains; `rust-version` in `Cargo.toml` is the MSRV floor, the toolchain pin is the exact version CI/contributors build with). Components: `rustfmt`, `clippy`.
 
 ## CI workflows (`.github/workflows/`)
 
