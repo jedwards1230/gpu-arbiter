@@ -650,6 +650,7 @@ mod tests {
             local_input_last_unix: 1_699_999_970,
             physical_input_devices: 2,
             input_monitor_up: true,
+            degraded: false,
         };
         // now = last_input + 30s, threshold 600s → present.
         let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
@@ -698,6 +699,7 @@ mod tests {
             local_input_last_unix: 1_699_996_400,
             physical_input_devices: 3,
             input_monitor_up: true,
+            degraded: false,
         };
         // now = last_input + 3600s, threshold 600s → absent.
         let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
@@ -734,6 +736,7 @@ mod tests {
             local_input_last_unix: 1_699_999_990,
             physical_input_devices: 0,
             input_monitor_up: false,
+            degraded: false,
         };
         let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
         assert!(out.contains("gpu_arbiter_local_present 0"));
@@ -757,6 +760,7 @@ mod tests {
             local_input_last_unix: 0,
             physical_input_devices: 1,
             input_monitor_up: true,
+            degraded: false,
         };
         let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
         for line in out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {

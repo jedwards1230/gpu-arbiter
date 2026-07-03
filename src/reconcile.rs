@@ -305,18 +305,21 @@ pub async fn reconcile(
             // the lock DROPPED so `/status` stays responsive across the whole kill
             // window. Gaming wins unconditionally even if one unit errors.
             write_state(state).set_state(State::Evicting);
-            for u in cfg.resolved_units() {
-                match units::evict(u, cfg, backend).await {
-                    Ok(outcome) => {
-                        tracing::info!(unit = %u.unit, ?outcome, "evicted unit for gaming")
-                    }
-                    Err(e) => {
-                        tracing::error!(unit = %u.unit, error = %e, "unit eviction errored; proceeding (gaming wins)")
-                    }
-                }
+            let any_eviction_failed = evict_all_units(cfg, backend).await;
+            if any_eviction_failed {
+                // #6: visibility only — gaming still wins the GPU unconditionally
+                // below. A wedged tenant may still hold VRAM even though `state`
+                // reports a clean `gaming`; surface that so an operator (or an
+                // alert, in a later wave) doesn't mistake "gaming" for "GPU fully
+                // reclaimed".
+                tracing::error!(
+                    "reconcile: one or more managed units failed to evict; GPU handed to gaming anyway but a tenant may still hold VRAM (degraded)"
+                );
             }
             // Gaming wins the GPU unconditionally — even if eviction errored.
-            write_state(state).set_state(State::Gaming);
+            let mut guard = write_state(state);
+            guard.degraded = any_eviction_failed;
+            guard.set_state(State::Gaming);
         }
         UnitAction::Restart => {
             // gaming → available (verified: the snapshot above was clean). Settle
@@ -325,12 +328,25 @@ pub async fn reconcile(
             // subsumes it (the edge is reached only after a clean scan, and the
             // post-step's `desired == Available` guard is the same "GPU is free"
             // condition), so both paths share one idempotent code path.
-            write_state(state).set_state(State::Available);
+            //
+            // Leaving `gaming` clears any eviction-degraded flag from the prior
+            // session — it was scoped to that eviction, and it's moot once the
+            // game (and its tenant-holding wedge, if any) is gone.
+            let mut guard = write_state(state);
+            guard.degraded = false;
+            guard.set_state(State::Available);
         }
         UnitAction::None => {
             // No transition needing a unit action: just settle the state
             // (covers the `evicting → gaming` settle and steady-state passes).
-            write_state(state).set_state(desired);
+            // Clear `degraded` only once we've settled cleanly back to
+            // `available` — while still `gaming`, a prior pass's degraded flag
+            // must persist across the steady-state passes in between.
+            let mut guard = write_state(state);
+            if desired == State::Available {
+                guard.degraded = false;
+            }
+            guard.set_state(desired);
         }
     }
 
@@ -405,6 +421,27 @@ pub async fn reconcile(
 
     refresh_substate(state, cfg, presence, backend).await;
     Ok(())
+}
+
+/// Evict every managed unit, in order, for an `available → gaming` transition.
+/// Gaming wins the GPU unconditionally regardless of outcome (each failure is
+/// logged here) — this only reports whether **any** unit failed, which feeds
+/// the `degraded` visibility flag (#6). Pulled out of [`reconcile`] as its own
+/// function so the "did anything fail" decision is unit-testable without
+/// needing a real game claim to reach the `Evict` branch (macOS/CI `observe`
+/// is stubbed empty, so nothing ever resolves to `Gaming` there).
+async fn evict_all_units(cfg: &Config, backend: GpuBackend) -> bool {
+    let mut any_failed = false;
+    for u in cfg.resolved_units() {
+        match units::evict(u, cfg, backend).await {
+            Ok(outcome) => tracing::info!(unit = %u.unit, ?outcome, "evicted unit for gaming"),
+            Err(e) => {
+                any_failed = true;
+                tracing::error!(unit = %u.unit, error = %e, "unit eviction errored; proceeding (gaming wins)");
+            }
+        }
+    }
+    any_failed
 }
 
 /// The eager units the ensure-running post-step should bring up this pass. **Pure**
@@ -1287,6 +1324,87 @@ mod tests {
         assert!(!ensure_running_toctou_clear(&[Claim::Pattern(
             "heroic".into()
         )]));
+    }
+
+    // ── wedged-eviction visibility (#6) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn evict_all_units_false_when_every_eviction_succeeds() {
+        // is_active_cmd = false → already-clear, no failure.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            stop_cmd = ["true"]
+            is_active_cmd = "false"
+            "#,
+        )
+        .unwrap();
+        assert!(!evict_all_units(&cfg, GpuBackend::default()).await);
+    }
+
+    #[tokio::test]
+    async fn evict_all_units_true_when_any_eviction_fails() {
+        // is_active_cmd = true (so evict() actually runs stop_cmd), stop_cmd
+        // exits non-zero → a real eviction failure.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            stop_cmd = ["false"]
+            is_active_cmd = "true"
+            "#,
+        )
+        .unwrap();
+        assert!(evict_all_units(&cfg, GpuBackend::default()).await);
+    }
+
+    #[tokio::test]
+    async fn degraded_clears_on_restart_to_available() {
+        // A prior pass left `degraded` set; the gaming -> available verified
+        // restart (macOS observe() is always an empty/clean scan) must clear it
+        // — the wedge, if any, is moot once the game (and gaming state) is gone.
+        let mut s = ArbiterState::new();
+        s.state = State::Gaming;
+        s.degraded = true;
+        let state = shared(s);
+        let cfg = Config::default();
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        let g = read_state(&state);
+        assert_eq!(g.state, State::Available);
+        assert!(!g.degraded);
+    }
+
+    #[tokio::test]
+    async fn degraded_clears_when_none_branch_settles_available() {
+        // Already-Available steady state (unit_action == None) with a stale
+        // `degraded` flag from an unrelated prior pass — still clears, since
+        // `desired == Available`.
+        let mut s = ArbiterState::new();
+        s.state = State::Available;
+        s.degraded = true;
+        let state = shared(s);
+        let cfg = Config::default();
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!read_state(&state).degraded);
     }
 
     #[test]

@@ -250,6 +250,16 @@ pub fn render_status(v: &serde_json::Value) -> String {
     let _ = writeln!(o, "State:   {state}");
     let _ = writeln!(o, "Since:   {since}");
 
+    // Degraded (#6): shown only when true — a wedged eviction, not the
+    // common case. Gaming still won the GPU; this just tells the operator a
+    // tenant may still hold VRAM.
+    if v.get("degraded").and_then(|b| b.as_bool()).unwrap_or(false) {
+        let _ = writeln!(
+            o,
+            "Degraded: one or more units failed to evict (see daemon logs)"
+        );
+    }
+
     // Claims.
     let claims: Vec<&str> = v
         .get("claims")
@@ -556,6 +566,27 @@ mod tests {
         assert!(out.contains("ollama.service: stopped"), "{out}");
         assert!(out.contains("vllm.service: stopped"), "{out}");
         assert!(out.contains("Daemon:  v1.2.3"), "{out}");
+        // No `degraded` key in the payload → the line is omitted entirely.
+        assert!(!out.contains("Degraded"), "{out}");
+    }
+
+    /// #6: a degraded snapshot (a wedged eviction) surfaces a distinct line;
+    /// the common (non-degraded) case renders nothing extra.
+    #[test]
+    fn render_status_degraded_shows_a_line() {
+        let payload = serde_json::json!({
+            "version": "1.2.3",
+            "state": "gaming",
+            "claims": ["steam:440"],
+            "units": [],
+            "ollama": { "unit": "ollama.service", "running": false, "models": [] },
+            "gpu_vram_used_mb": 21500,
+            "gpu_vram_total_mb": 32768,
+            "since": "2026-06-07T20:00:00Z",
+            "degraded": true
+        });
+        let out = render_status(&payload);
+        assert!(out.contains("Degraded:"), "{out}");
     }
 
     /// An available payload with a running Ollama (models + VRAM) renders the

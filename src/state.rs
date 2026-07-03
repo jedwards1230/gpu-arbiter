@@ -194,6 +194,16 @@ pub struct StatusSnapshot {
     /// Whether the input monitor is healthy. `false` ⇒ presence is **unknown**
     /// (fail-safe: an alert must not suppress on a down monitor).
     pub input_monitor_up: bool,
+
+    /// `true` if the most recent `available → gaming` eviction pass had at
+    /// least one managed unit fail to evict. Gaming still wins the GPU
+    /// unconditionally when this is set (see
+    /// [`crate::reconcile::reconcile`]'s `Evict` handling) — this is visibility
+    /// only, not a different outcome: a wedged tenant may still hold VRAM
+    /// while `state` reports a clean `gaming`. Cleared on the next eviction
+    /// pass that succeeds cleanly, or when the state resolves back to
+    /// `available`.
+    pub degraded: bool,
 }
 
 impl StatusSnapshot {
@@ -248,6 +258,9 @@ pub struct ArbiterState {
     /// re-derives everything from observed truth rather than trusting a stale
     /// hold from a prior run.
     pub held: HashSet<String>,
+    /// `true` if the most recent eviction pass had at least one unit fail —
+    /// feeds [`StatusSnapshot::degraded`].
+    pub degraded: bool,
 }
 
 /// The local-presence view embedded in [`ArbiterState`] / [`StatusSnapshot`],
@@ -277,6 +290,7 @@ impl Default for ArbiterState {
             since: SystemTime::now(),
             presence: Presence::default(),
             held: HashSet::new(),
+            degraded: false,
         }
     }
 }
@@ -323,6 +337,7 @@ impl ArbiterState {
             local_input_last_unix: self.presence.last_input_unix,
             physical_input_devices: self.presence.devices,
             input_monitor_up: self.presence.monitor_up,
+            degraded: self.degraded,
         }
     }
 }
