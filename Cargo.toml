@@ -17,6 +17,10 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+# CancellationToken for graceful shutdown (drives the reconcile task's own loop
+# exit instead of `abort()`ing it mid-pass). Pure-Rust, part of the tokio
+# project, no default features needed beyond the always-compiled `sync` module.
+tokio-util = { version = "0.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 # JSON for the axum `/status` body. Pure-Rust; the serializer/deserializer also
 # lets the HTTP contract be unit-tested on macOS.

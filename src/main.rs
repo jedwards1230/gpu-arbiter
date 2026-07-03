@@ -16,9 +16,17 @@
 //! fed by an `mpsc` of [`gpu_arbiter::state::ReconcileTrigger`]s from the
 //! netlink task (`procmon`), a `tokio::time::interval`, and the HTTP handlers.
 //! `ProcEvent` bursts are coalesced by a **hand-rolled `select!` + deadline
-//! debounce** (~150 ms, no `tokio_util`). The blocking `/proc` scan runs under
-//! `spawn_blocking` inside `reconcile`. SIGTERM/SIGINT trigger a graceful
-//! shutdown.
+//! debounce** (~150 ms). The blocking `/proc` scan runs under `spawn_blocking`
+//! inside `reconcile`.
+//!
+//! SIGTERM/SIGINT trigger a **real** graceful shutdown: a
+//! [`tokio_util::sync::CancellationToken`] tells the reconcile task's own
+//! `select!` to stop picking up new triggers, so any pass already in flight —
+//! including an eviction's `systemctl stop` → poll-VRAM → SIGKILL window —
+//! always runs to completion; the task is joined (bounded by
+//! `SHUTDOWN_JOIN_TIMEOUT`) rather than `abort()`ed. Only the stateless I/O
+//! tasks (`procmon`, `presence`, the HTTP server) are `abort()`ed, after the
+//! reconcile task has already stopped.
 
 use gpu_arbiter::cli::{self, Command};
 
@@ -142,6 +150,7 @@ mod linux {
     use gpu_arbiter::reconcile;
     use gpu_arbiter::state::{ArbiterState, ReconcileTrigger, read_state};
     use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     /// Debounce window for coalescing `ProcEvent` bursts. A game launch fires a
     /// storm of fork/exec events; we want **one** reconcile shortly after the
@@ -153,6 +162,14 @@ mod linux {
     /// a backed-up channel just means "reconcile is already pending" — extra
     /// triggers are redundant and safe to drop (`procmon` uses `try_send`).
     const TRIGGER_CHANNEL_DEPTH: usize = 64;
+
+    /// How long shutdown waits for the reconcile task to finish its in-flight
+    /// pass and exit its own loop before giving up and returning anyway (the
+    /// process is exiting either way; this only bounds how long that takes).
+    /// Comfortably above any single unit's `eviction_timeout_s` (default 5s,
+    /// and the SIGKILL escalation itself is fast) even with several managed
+    /// units evicted in sequence.
+    const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
     pub fn run(config_path: String) -> Result<(), Box<dyn std::error::Error>> {
         init_tracing();
@@ -244,12 +261,17 @@ mod linux {
         };
 
         // 4. The single reconcile task that owns state mutation going forward.
+        //    `cancel` is how shutdown asks it to exit its own loop (see step 7) —
+        //    never `abort()`ed, so an in-flight eviction can never be cancelled
+        //    mid-kill-window.
+        let cancel = CancellationToken::new();
         let reconcile_handle = tokio::spawn(reconcile_task(
             state.clone(),
             cfg.clone(),
             presence.clone(),
             triggers_rx,
             backend,
+            cancel.clone(),
         ));
 
         // 5. cn_proc netlink listener → ProcEvent triggers.
@@ -279,11 +301,31 @@ mod linux {
         wait_for_shutdown().await;
         tracing::info!("shutdown signal received; stopping");
 
-        // Dropping the last sender closes the channel → the reconcile task ends
-        // its loop; aborting the I/O tasks is fine (they hold no durable state —
-        // Ollama lifecycle is owned by reconcile, which has already exited).
-        drop(triggers_tx);
-        reconcile_handle.abort();
+        // Real graceful shutdown: `cancel` only takes effect the next time the
+        // reconcile task's own `select!` is choosing its *next* trigger (see
+        // `reconcile_task`), so a pass already in flight — including the
+        // `systemctl stop` → poll-VRAM → SIGKILL eviction window — always runs
+        // to completion first; it is never `abort()`ed mid-eviction. Bound the
+        // join so a genuinely wedged pass can't hang shutdown forever — the
+        // process exits either way once the timeout elapses.
+        //
+        // (Note dropping `triggers_tx` here would NOT close the trigger
+        // channel by itself — `AppState` and `procmon` each hold their own
+        // clone — so cancellation, not channel closure, is what actually
+        // stops the reconcile task.)
+        cancel.cancel();
+        match tokio::time::timeout(SHUTDOWN_JOIN_TIMEOUT, reconcile_handle).await {
+            Ok(Ok(())) => tracing::info!("reconcile task exited cleanly"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "reconcile task panicked during shutdown"),
+            Err(_) => tracing::warn!(
+                timeout = ?SHUTDOWN_JOIN_TIMEOUT,
+                "reconcile task did not exit in time; abandoning it (process is exiting anyway)"
+            ),
+        }
+
+        // These hold no durable state: unit lifecycle is owned exclusively by
+        // the reconcile task, which has already stopped above, so aborting the
+        // I/O-only tasks here is safe.
         procmon_handle.abort();
         http_handle.abort();
         if let Some(h) = presence_handle {
@@ -313,6 +355,7 @@ mod linux {
         presence: PresenceMonitor,
         mut triggers: mpsc::Receiver<ReconcileTrigger>,
         backend: GpuBackend,
+        cancel: CancellationToken,
     ) {
         let mut interval =
             tokio::time::interval(Duration::from_secs(cfg.reconcile_interval_s.max(1)));
@@ -320,7 +363,16 @@ mod linux {
         interval.tick().await;
 
         loop {
+            // `cancel.cancelled()` only competes for the NEXT trigger — it is one
+            // arm of this `select!`, not a signal raced against an in-flight
+            // `reconcile(...).await` below. That's what makes shutdown "real":
+            // a pass already running (including the eviction kill window) always
+            // finishes; cancellation only stops the loop from starting another.
             let trigger = tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::info!("reconcile task: shutdown requested; exiting (no pass in flight)");
+                    return;
+                }
                 _ = interval.tick() => ReconcileTrigger::Timer,
                 recv = triggers.recv() => match recv {
                     Some(t) => t,
