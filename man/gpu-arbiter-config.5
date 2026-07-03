@@ -237,12 +237,29 @@ be represented. When
 are unset for a unit it is systemd\-driven exactly as before.
 .TP
 .B vram_match
-String. Default: none. Substring matched case\-insensitively against
+String. Default: none.
+.B Fallback
+substring matched case\-insensitively against
 .B nvidia-smi
 compute\-process names to attribute this unit's VRAM in
 .IR /status .
-When unset, no VRAM figure is reported for the unit (the field is omitted, not
-reported as 0).
+For a
+.B systemd\-supervised
+unit, cgroup PID resolution attributes VRAM automatically with
+.B no config needed
+\(em it reads
+.I /proc/<pid>/cgroup
+to find the owning unit directly, so it cannot be fooled by a wrapper binary
+(a venv interpreter, a launcher script) the way this name\-substring match
+can be.
+.B vram_match
+remains the
+.B only
+attribution channel for command\-driven
+.RB ( *_cmd )
+units and non\-systemd hosts, where no cgroup path resolves to a configured
+unit name. When unset (and no cgroup match applies), no VRAM figure is
+reported for the unit (the field is omitted, not reported as 0).
 .TP
 .B kind
 String. Default: none. Introspection backend selector for the

@@ -218,7 +218,7 @@ SIGKILL` loop, in order) and restores when gaming ends. Each entry:
 |---|---|---|
 | `unit` | _(required)_ | systemd unit the daemon owns (or a free-form label when command overrides are set) |
 | `eager_restart` | `true` | Restart this unit when gaming ends |
-| `vram_match` | _(none)_ | Substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution |
+| `vram_match` | _(none)_ | **Fallback** substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution. A systemd-supervised unit is attributed automatically via cgroup PID resolution with no config needed; `vram_match` is only consulted for command-driven (`*_cmd`) units and non-systemd hosts (see [VRAM attribution](#vram-attribution)) |
 | `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (runs `ollama ps`); any other value reports no models and suppresses the name heuristic |
 | `introspect_cmd` | _(none)_ | Explicit command (shell-free argv) whose stdout lists loaded model/process names, one per line. Takes precedence over `kind` and the name heuristic |
 | `stop_cmd` | _(none)_ | Override: command to stop/evict the tenant (`None` → `systemctl stop`) |
@@ -229,6 +229,29 @@ SIGKILL` loop, in order) and restores when gaming ends. Each entry:
 If `managed_units` is omitted, a single entry is synthesized from the legacy
 `ollama_unit` / `eager_ollama` fields (with `vram_match = "ollama"`), so an
 unconfigured daemon behaves exactly as before.
+
+### VRAM attribution
+
+Each managed unit's own VRAM (surfaced as `units[].vram_mb` in `/status`, and
+used to gate graceful eviction — see [Eviction VRAM
+gating](#eviction-vram-gating)) is attributed via two channels, tried in order:
+
+1. **cgroup PID resolution** (primary, systemd units only, no config needed):
+   every GPU compute process's `/proc/<pid>/cgroup` names the systemd unit
+   that spawned it, regardless of what binary the unit actually execs. This
+   can't be fooled by a wrapper interpreter or launcher script — the historical
+   `vram_match` gap: an `asr-runner.service` unit's GPU process might be
+   `/opt/asr-runner/venv/bin/python` (the venv interpreter), so a name
+   substring like `vram_match = "parakeet"` never matches even though the unit
+   is definitely the one holding the GPU. Cgroup attribution sidesteps that
+   entirely.
+2. **`vram_match`** (fallback): a configured substring matched against the
+   process name/path, for command-driven (`*_cmd`) units and non-systemd hosts
+   — no cgroup path resolves to a configured unit name there, so this remains
+   the only channel.
+
+Neither channel reporting a match means `vram_mb` is omitted from `/status`
+entirely (never a misleading `0`).
 
 ### Init systems other than systemd
 

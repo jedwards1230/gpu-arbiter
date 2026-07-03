@@ -55,7 +55,8 @@ pub fn classify(cmdline: &str, cfg: &Config) -> Option<Claim> {
     None
 }
 
-/// A heavy GPU *graphics* process observed by the optional VRAM heuristic.
+/// A heavy GPU *graphics* process observed by the optional VRAM heuristic (also
+/// reused for the GPU *compute* process list — same shape, different query).
 ///
 /// Produced by [`crate::gpu`] from `nvidia-smi` output; consumed here so the
 /// heuristic decision stays a pure function. `name` is the process comm/name
@@ -64,10 +65,17 @@ pub fn classify(cmdline: &str, cfg: &Config) -> Option<Claim> {
 pub struct GpuGraphicsProc {
     /// Process id.
     pub pid: i32,
-    /// Process name (matched against `gpu_allowlist`).
+    /// Process name (matched against `gpu_allowlist`). `nvidia-smi` reports
+    /// the full binary path (e.g. `/usr/local/bin/ollama`), not a bare comm.
     pub name: String,
     /// VRAM attributed to this process (MiB).
     pub vram_mb: u64,
+    /// The systemd unit owning this process's cgroup, if resolved (#7) — e.g.
+    /// `Some("ollama.service")`. `None` until [`crate::cgroup::attribute_units`]
+    /// enriches the list (the raw `nvidia-smi` parse always leaves this
+    /// `None`), or when cgroup attribution didn't apply (no `system.slice`
+    /// cgroup, non-Linux host, or the query never attempted resolution).
+    pub owning_unit: Option<String>,
 }
 
 /// Apply the opt-in VRAM heuristic to one GPU graphics process. Pure.
@@ -138,14 +146,21 @@ mod tests {
         assert_eq!(classify("SteamLaunch AppId=440 -- x", &cfg), None);
     }
 
+    /// A `GpuGraphicsProc` with no cgroup attribution — the common case for a
+    /// user-session graphics process the heuristic evaluates.
+    fn graphics_proc(pid: i32, name: &str, vram_mb: u64) -> GpuGraphicsProc {
+        GpuGraphicsProc {
+            pid,
+            name: name.to_string(),
+            vram_mb,
+            owning_unit: None,
+        }
+    }
+
     #[test]
     fn heuristic_off_by_default() {
         let cfg = Config::default();
-        let p = GpuGraphicsProc {
-            pid: 99,
-            name: "MysteryGame".to_string(),
-            vram_mb: 9000,
-        };
+        let p = graphics_proc(99, "MysteryGame", 9000);
         assert_eq!(heuristic_claim(&p, &cfg), None);
     }
 
@@ -156,27 +171,15 @@ mod tests {
             vram_game_threshold_mb: 4000,
             ..Config::default()
         };
-        let game = GpuGraphicsProc {
-            pid: 99,
-            name: "MysteryGame".to_string(),
-            vram_mb: 9000,
-        };
+        let game = graphics_proc(99, "MysteryGame", 9000);
         assert_eq!(heuristic_claim(&game, &cfg), Some(Claim::Gpu(99)));
 
         // Allowlisted process is never flagged.
-        let kwin = GpuGraphicsProc {
-            pid: 1,
-            name: "kwin_wayland".to_string(),
-            vram_mb: 9000,
-        };
+        let kwin = graphics_proc(1, "kwin_wayland", 9000);
         assert_eq!(heuristic_claim(&kwin, &cfg), None);
 
         // Below threshold is never flagged.
-        let small = GpuGraphicsProc {
-            pid: 2,
-            name: "MysteryGame".to_string(),
-            vram_mb: 100,
-        };
+        let small = graphics_proc(2, "MysteryGame", 100);
         assert_eq!(heuristic_claim(&small, &cfg), None);
     }
 }

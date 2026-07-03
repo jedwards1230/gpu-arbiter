@@ -61,3 +61,10 @@ pub mod procmon;
 // whether someone is at the desk. The classifiers are pure & cross-platform; the
 // evdev watcher is Linux-gated with a non-Linux stub.
 pub mod presence;
+
+// cgroup-based PID -> systemd-unit attribution: /proc/<pid>/cgroup parsing
+// feeds per-unit VRAM attribution (reconcile.rs's /status refresh, units.rs's
+// eviction gating) with a signal that can't be fooled by a wrapper binary the
+// way a process-name substring match can. The parser is pure & cross-platform;
+// the /proc reads are Linux-gated with a non-Linux stub.
+pub mod cgroup;

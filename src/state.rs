@@ -135,8 +135,11 @@ pub struct UnitStatus {
     /// Loaded model names (best-effort; Ollama-only — empty for other units, or
     /// when not running / unknown).
     pub models: Vec<String>,
-    /// VRAM attributed to this unit in MiB (best-effort; `None` when unknown or
-    /// the unit has no `vram_match`).
+    /// VRAM attributed to this unit in MiB (best-effort; `None` when unknown).
+    /// Attributed primarily via cgroup PID resolution (#7; works for any
+    /// systemd-supervised unit with no config needed), falling back to the
+    /// unit's configured `vram_match` substring for command-driven tenants.
+    /// `None` when neither channel found a match.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_mb: Option<u64>,
     /// Whether an operator has manually stopped this unit via

@@ -503,8 +503,12 @@ async fn refresh_substate(
     // One compute-proc query feeds every unit's VRAM attribution. Best-effort: a
     // failed/absent query leaves each `vram_mb` as None so `/status` omits it
     // rather than lying with a 0. (AMD returns an empty list, so attribution is
-    // simply omitted there — it must not error.)
-    let compute = backend.query_compute_procs().await.ok();
+    // simply omitted there — it must not error.) Cgroup-enriched (#7) so
+    // `vram_mb_by_cgroup` below has owning-unit data to match against.
+    let compute = match backend.query_compute_procs().await {
+        Ok(procs) => Some(crate::cgroup::attribute_units(procs).await),
+        Err(_) => None,
+    };
     // Snapshot the held set so /status can tell an operator *why* a stopped unit
     // isn't restarting (see ArbiterState::held / ensure_running_targets).
     let held = { read_state(state).held.clone() };
@@ -543,10 +547,16 @@ async fn refresh_substate(
             } else {
                 Vec::new()
             };
-            // Attribute VRAM via the unit's configured `vram_match` substring
-            // — likewise only when confirmed running.
-            let vram_mb = match (running, &u.vram_match, compute) {
-                (Some(true), Some(needle), Some(procs)) => gpu::vram_mb_matching(procs, needle),
+            // Attribute VRAM (#7) — likewise only when confirmed running.
+            // Precedence: cgroup unit match first (can't be fooled by a
+            // wrapper binary), falling back to the unit's configured
+            // `vram_match` substring for command-driven/non-systemd tenants.
+            let vram_mb = match (running, compute) {
+                (Some(true), Some(procs)) => gpu::vram_mb_by_cgroup(procs, &u.unit).or_else(|| {
+                    u.vram_match
+                        .as_deref()
+                        .and_then(|needle| gpu::vram_mb_matching(procs, needle))
+                }),
                 _ => None,
             };
             UnitStatus {
