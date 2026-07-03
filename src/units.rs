@@ -253,15 +253,35 @@ pub enum EvictionStep {
 /// eviction routinely escalates to SIGKILL even though the tenant itself
 /// released cleanly. Gating on the tenant's own attributed VRAM instead makes
 /// the game's concurrent VRAM growth irrelevant to this decision.
+///
+/// **Structurally blind attribution, and the seen-nonzero gate (#61):**
+/// `Attributed` is only ever constructed by [`unit_vram_reading`] when the
+/// *backend* can attribute per-process VRAM at all
+/// ([`gpu::GpuBackend::attribution_capable`] — AMD structurally can't, since
+/// sysfs exposes no per-process interface, so it never reaches this variant)
+/// AND, for a zero reading specifically, only once *this same eviction* has
+/// already observed the unit attributed with nonzero VRAM at least once. A
+/// zero seen before that proof degrades to `Fallback` instead — an
+/// `Attributed(0)` a caller never proved the channel could see this unit
+/// would be indistinguishable from "the channel is structurally blind for
+/// this tenant" (AMD, a graphics-context-only NVIDIA tenant
+/// `query_compute_procs` never enumerates, or a typo'd `vram_match`), and
+/// trusting it there would free the eviction gate on poll one regardless of
+/// whether the tenant is actually still holding the GPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitVramReading {
     /// This unit's own VRAM (MiB), attributed via cgroup (systemd units) or
     /// `vram_match` (command-driven units) — see
-    /// [`gpu::attribute_unit_vram`]. `0` is a legitimate, meaningful reading:
-    /// the unit is fully drained, not merely "not measured".
+    /// [`gpu::attribute_unit_vram`]. `0` is a legitimate, meaningful reading
+    /// (the unit is fully drained, not merely "not measured") **only because**
+    /// [`unit_vram_reading`] never constructs this variant with `0` unless an
+    /// earlier poll in this eviction already proved the channel can see the
+    /// unit — see the seen-nonzero note above.
     Attributed(u64),
-    /// Attribution was unavailable this poll (AMD, a failed compute-proc
-    /// query, or a command-driven unit with no `vram_match` configured) —
+    /// Attribution was unavailable or not (yet) trustworthy this poll — an
+    /// attribution-incapable backend (AMD), a failed compute-proc query, a
+    /// command-driven unit with no `vram_match` configured, or an
+    /// as-yet-unproven `Attributed(0)` (see the seen-nonzero note above) —
     /// falls back to the legacy total-GPU-VRAM gate. `None` when even the
     /// total-VRAM read itself failed ("unknown-memory").
     Fallback(Option<GpuMemory>),
@@ -558,9 +578,27 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
 /// concurrently with this teardown, so the old total-VRAM gate rarely dropped
 /// below threshold before the timeout — eviction routinely escalated to
 /// SIGKILL even when the tenant itself released cleanly. Falls back to the
-/// legacy total-GPU-VRAM gate when attribution isn't available this poll
-/// (AMD, a failed compute-proc query, or a command-driven unit with no
-/// `vram_match`).
+/// legacy total-GPU-VRAM gate when attribution isn't available or, per the
+/// seen-nonzero gate below, not yet trustworthy this poll.
+///
+/// **Attribution capability and the seen-nonzero gate (#61):** per-unit
+/// attribution requires BOTH the unit to have a structural channel
+/// (`attribution_capable` — is it a systemd unit, or does it have a
+/// configured `vram_match`?) AND the *backend* to be able to answer it
+/// ([`gpu::GpuBackend::attribution_capable`] — AMD structurally can't; its
+/// `query_compute_procs` always returns `Ok(vec![])`, which used to be
+/// misread as "queried successfully, unit confirmed drained" and skipped the
+/// drain wait on the very first poll). Even on a capable backend, a
+/// zero-VRAM reading is trusted as "drained" only once THIS eviction has
+/// already observed the unit attributed with nonzero VRAM at least once
+/// (tracked via `seen_nonzero` through the poll loop below) — a zero seen
+/// before that proof degrades to the total-VRAM fallback (+ the existing
+/// VRAM-free-or-PID-gone timeout recheck below) instead of an instant,
+/// possibly-wrong `Freed`. This also covers a typo'd `vram_match` and an
+/// NVIDIA tenant holding VRAM only via a graphics context
+/// `query_compute_procs` never enumerates — both would otherwise read as a
+/// confident zero on poll one. See [`UnitVramReading`]'s docs for the full
+/// decision.
 ///
 /// Returns:
 /// - [`EvictionOutcome::AlreadyClear`] if the unit wasn't running to begin with,
@@ -585,7 +623,12 @@ pub async fn evict(
     let is_systemd = matches!(sup, Supervisor::Systemd);
     // Whether ANY attribution channel structurally applies to this unit: a
     // systemd unit is always cgroup-attributable when the compute query
-    // succeeds; a command-driven unit needs an explicit `vram_match`.
+    // succeeds; a command-driven unit needs an explicit `vram_match`. This is
+    // the *unit*-side half of attribution capability — [`unit_vram_reading`]
+    // additionally gates on the *backend*-side half
+    // ([`gpu::GpuBackend::attribution_capable`]) before trusting a reading
+    // (#61: AMD structurally can't attribute per-process VRAM at all, and
+    // `is_systemd` alone used to be read as "yes it can").
     let attribution_capable = is_systemd || u.vram_match.is_some();
 
     // Nothing to do if the unit isn't running.
@@ -606,9 +649,23 @@ pub async fn evict(
 
     // Poll until this unit's own VRAM drops below the free threshold (or the
     // total-GPU fallback does) or we time out.
+    //
+    // `seen_nonzero` (#61) tracks, across polls IN THIS SINGLE EVICTION,
+    // whether attribution has ever actually observed `u` holding nonzero
+    // VRAM — proof the attribution channel can see this unit's process at
+    // all. Until that's proven, a zero reading is not trusted as "drained"
+    // (see [`UnitVramReading`]'s docs) — it's structurally indistinguishable
+    // from a channel that can't see this tenant in the first place.
     let start = std::time::Instant::now();
+    let mut seen_nonzero = false;
     loop {
-        let reading = unit_vram_reading(u, backend, is_systemd, attribution_capable).await;
+        let reading =
+            unit_vram_reading(u, backend, is_systemd, attribution_capable, seen_nonzero).await;
+        if let UnitVramReading::Attributed(mb) = reading
+            && mb > 0
+        {
+            seen_nonzero = true;
+        }
         match eviction_step(reading, start.elapsed(), cfg) {
             EvictionStep::Freed => return Ok(EvictionOutcome::Freed),
             EvictionStep::Escalate => {
@@ -644,24 +701,36 @@ pub async fn evict(
     }
 }
 
-/// Build one eviction poll's [`UnitVramReading`] (#8) — the only
+/// Build one eviction poll's [`UnitVramReading`] (#8, #61) — the only
 /// side-effecting (shell-out / `/proc` read) half of the eviction-gating
-/// decision; [`eviction_step`] and [`gpu::attribute_unit_vram`] are the pure
-/// halves.
+/// decision; [`eviction_step`], [`gpu::attribute_unit_vram`], and
+/// [`attribution_is_trustworthy`] are the pure halves.
 ///
 /// Queries the compute-proc list (and cgroup-enriches it for a systemd unit)
-/// only when `attribution_capable` — a command-driven unit with no
-/// `vram_match` has no possible attribution channel, so there's no point
-/// paying for the query. Falls back to a total-VRAM read only when
-/// attribution genuinely can't answer this poll (compute query failed), not
-/// on every poll — avoids doubling the shell-out cost in the common case.
+/// only when `attribution_capable` (the unit-side channel — is it a systemd
+/// unit, or does it have a configured `vram_match`?) AND
+/// `backend.attribution_capable()` (the backend-side channel — can this
+/// vendor's compute-proc query attribute per-process VRAM at all? #61: AMD's
+/// always returns `Ok(vec![])`, which is NOT the same thing as "queried
+/// successfully, found nothing" for gating purposes) — a unit/backend
+/// combination that structurally can't answer has no possible attribution
+/// channel, so there's no point paying for the query.
+///
+/// [`attribution_is_trustworthy`] then decides whether the resulting
+/// attribution (if any) is trusted as `Attributed`, or degraded to the
+/// total-VRAM `Fallback` because it's an as-yet-unproven zero (#61
+/// seen-nonzero gate — see [`UnitVramReading`]'s docs). The fallback query
+/// only runs when actually needed (attribution unavailable, or an unproven
+/// zero), not on every poll — avoids doubling the shell-out cost in the
+/// common case.
 async fn unit_vram_reading(
     u: &ManagedUnit,
     backend: GpuBackend,
     is_systemd: bool,
     attribution_capable: bool,
+    seen_nonzero: bool,
 ) -> UnitVramReading {
-    if attribution_capable {
+    let attributed = if attribution_capable && backend.attribution_capable() {
         let compute = if is_systemd {
             match backend.query_compute_procs().await {
                 Ok(procs) => Some(crate::cgroup::attribute_units(procs).await),
@@ -670,18 +739,55 @@ async fn unit_vram_reading(
         } else {
             backend.query_compute_procs().await.ok()
         };
-        if let Some(mb) = gpu::attribute_unit_vram(
+        gpu::attribute_unit_vram(
             compute.as_deref(),
             is_systemd,
             &u.unit,
             u.vram_match.as_deref(),
-        ) {
-            return UnitVramReading::Attributed(mb);
-        }
+        )
+    } else {
+        None
+    };
+
+    if attribution_is_trustworthy(attributed, seen_nonzero) {
+        // Safe: `attribution_is_trustworthy` only returns `true` for `Some`.
+        let mb = attributed.unwrap_or_default();
+        return UnitVramReading::Attributed(mb);
     }
-    // A failed GPU read is a first-class `None` — "not yet free" (never
-    // stalls; at worst we escalate). See `eviction_step`'s docs.
+    // Untrustworthy or unavailable this poll — a first-class fallback to the
+    // total-VRAM gate, "not yet free" if even that read fails (never stalls;
+    // at worst we escalate). See `eviction_step`'s docs.
     UnitVramReading::Fallback(backend.query_memory().await.ok())
+}
+
+/// Whether a poll's raw per-unit attribution outcome (`Some(mb)` from
+/// [`gpu::attribute_unit_vram`], or `None` if attribution wasn't even
+/// attempted/available this poll) should be trusted as this poll's
+/// [`UnitVramReading::Attributed`] reading, or degraded to the total-VRAM
+/// [`UnitVramReading::Fallback`] instead (#61). Pure — the testable core of
+/// the seen-nonzero gate; see [`UnitVramReading`]'s docs for the full policy
+/// this implements.
+///
+/// - `None`: never trustworthy — attribution wasn't available this poll at
+///   all (attribution-incapable backend/unit, or the compute-proc query
+///   itself failed).
+/// - `Some(mb)` with `mb > 0`: always trustworthy — a nonzero reading can
+///   only come from a channel that genuinely sees this unit's process, so
+///   it's also the poll that should flip `seen_nonzero` true for every later
+///   poll in this same eviction (the caller's responsibility — this fn is
+///   pure and doesn't mutate anything).
+/// - `Some(0)` with `seen_nonzero` true: trustworthy — an earlier poll in
+///   this eviction already proved the channel sees this unit, so a later
+///   zero is a real "now drained" transition.
+/// - `Some(0)` with `seen_nonzero` false: NOT (yet) trustworthy — this could
+///   just as easily be a channel that structurally can't see this tenant at
+///   all (AMD, an NVIDIA tenant holding VRAM only via a graphics context
+///   `query_compute_procs` never enumerates, a typo'd `vram_match`) as a
+///   genuine drain, and there's no way to tell them apart from a single
+///   zero reading with no prior nonzero observation.
+#[must_use]
+fn attribution_is_trustworthy(attributed: Option<u64>, seen_nonzero: bool) -> bool {
+    matches!(attributed, Some(mb) if mb > 0 || seen_nonzero)
 }
 
 /// Stop a unit via its supervisor (`systemctl stop` or the `stop` argv).
@@ -902,6 +1008,99 @@ mod tests {
             ),
             EvictionStep::Escalate
         );
+    }
+
+    // ── seen-nonzero attribution gate (#61) ─────────────────────────────────
+    //
+    // These test `attribution_is_trustworthy` (the pure decision) combined
+    // with `eviction_step` (the pure gate the resulting reading feeds) so the
+    // full "is a poll's attribution trusted, and what does that trust decide"
+    // pipeline is covered end to end, not just each half in isolation.
+
+    #[test]
+    fn amd_backend_structurally_falls_back_never_attributed() {
+        // The AMD half of #61: `GpuBackend::attribution_capable()` is the
+        // structural gate `unit_vram_reading` checks before ever calling
+        // `attribute_unit_vram` — AMD must never reach `Attributed` at all,
+        // regardless of `is_systemd`/`vram_match`. (The backend-capability
+        // check itself is exercised directly in gpu.rs's
+        // `nvidia_is_attribution_capable_amd_is_not`; this asserts the
+        // consequence eviction gating actually cares about — a fallback
+        // reading, gated on total VRAM, not an instant-freed `Attributed(0)`.)
+        assert!(!GpuBackend::Amd.attribution_capable());
+        let cfg = Config::default();
+        // Even a "confirmed drained" *total* VRAM reading must still respect
+        // the normal fallback gate (vram_is_free), not skip straight to
+        // Freed just because attribution was never attempted.
+        assert_eq!(
+            eviction_step(fallback(500), Duration::from_secs(1), &cfg),
+            EvictionStep::Freed
+        );
+        assert_eq!(
+            eviction_step(fallback(21000), Duration::from_secs(1), &cfg),
+            EvictionStep::KeepWaiting
+        );
+    }
+
+    #[test]
+    fn never_seen_nonzero_zero_attribution_is_not_trustworthy() {
+        // The core #61 fix: an Attributed(0) with no prior nonzero
+        // observation this eviction is NOT trusted — this is exactly the
+        // shape a typo'd `vram_match`, a graphics-context-only NVIDIA
+        // tenant, or (pre-backend-gate) AMD would all produce on poll one.
+        assert!(!attribution_is_trustworthy(Some(0), false));
+        // The caller degrades this to Fallback(total) — asserted at the
+        // `unit_vram_reading`/`evict` integration level is out of pure-test
+        // reach (it shells out), but the decision this fn drives is exactly
+        // "don't hand eviction_step an Attributed(0) here".
+    }
+
+    #[test]
+    fn seen_nonzero_then_zero_attribution_is_trustworthy_and_freed() {
+        // Once this eviction has already observed the unit holding nonzero
+        // VRAM, a later zero IS trusted — and eviction_step correctly reads
+        // a trusted Attributed(0) as Freed.
+        assert!(attribution_is_trustworthy(Some(0), true));
+        let cfg = Config::default();
+        assert_eq!(
+            eviction_step(UnitVramReading::Attributed(0), Duration::from_secs(1), &cfg),
+            EvictionStep::Freed
+        );
+    }
+
+    #[test]
+    fn seen_nonzero_still_held_attribution_is_trustworthy_not_freed() {
+        // A nonzero reading is always trustworthy (seen_nonzero or not) —
+        // and eviction_step correctly keeps waiting / escalates on it, never
+        // Freed, regardless of the seen-nonzero history.
+        assert!(attribution_is_trustworthy(Some(6000), true));
+        assert!(attribution_is_trustworthy(Some(6000), false));
+        let cfg = Config::default(); // timeout 5s
+        assert_eq!(
+            eviction_step(
+                UnitVramReading::Attributed(6000),
+                Duration::from_secs(1),
+                &cfg
+            ),
+            EvictionStep::KeepWaiting
+        );
+        assert_eq!(
+            eviction_step(
+                UnitVramReading::Attributed(6000),
+                Duration::from_secs(5),
+                &cfg
+            ),
+            EvictionStep::Escalate
+        );
+    }
+
+    #[test]
+    fn attribution_never_attempted_is_never_trustworthy() {
+        // No attribution channel available this poll at all (structurally
+        // incapable backend/unit, or the compute-proc query itself failed) —
+        // never trusted, seen_nonzero or not.
+        assert!(!attribution_is_trustworthy(None, false));
+        assert!(!attribution_is_trustworthy(None, true));
     }
 
     // ── eviction outcome → metric bucket mapping (#14) ──────────────────────

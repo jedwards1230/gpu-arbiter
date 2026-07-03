@@ -77,7 +77,7 @@ The annotated example at `packaging/config.example.toml` is the authoritative re
 ## Runtime requirements (Linux only)
 
 - Root / `CAP_NET_ADMIN` (for `cn_proc` netlink socket and `systemctl`)
-- NVIDIA: `nvidia-smi` on `PATH`; AMD: no extra tooling (reads `/sys/class/drm/card*/device/mem_info_vram_*`). **AMD limitation**: sysfs exposes no per-process VRAM interface, so the opt-in VRAM heuristic is blind on AMD and per-unit VRAM in `/status` is always empty — eviction itself works identically on both vendors.
+- NVIDIA: `nvidia-smi` on `PATH`; AMD: no extra tooling (reads `/sys/class/drm/card*/device/mem_info_vram_*`). **AMD limitation**: sysfs exposes no per-process VRAM interface, so the opt-in VRAM heuristic is blind on AMD and per-unit VRAM in `/status` is always empty. Eviction still completes correctly on both vendors, but not identically: `GpuBackend::attribution_capable()` routes AMD straight to the legacy total-GPU-VRAM gate (never a per-unit `Attributed` reading — see the eviction-gating seen-nonzero note in `units.rs`), where NVIDIA gets the precise per-unit gate.
 - systemd (default); non-systemd hosts use per-unit `*_cmd` overrides
 
 ## Conventions

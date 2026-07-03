@@ -181,6 +181,26 @@ impl GpuBackend {
             GpuBackend::Amd => Ok(Vec::new()),
         }
     }
+
+    /// Whether this backend can attribute **per-process** VRAM at all (#61).
+    ///
+    /// `false` on AMD is a *structural* fact about the backend, distinct from
+    /// [`query_compute_procs`](Self::query_compute_procs) returning
+    /// `Ok(vec![])` on AMD — that empty `Ok` is indistinguishable, at the call
+    /// site, from "queried successfully and genuinely found nothing", which is
+    /// exactly the shape a real "this unit is fully drained" reading takes.
+    /// Before this method existed, eviction gating
+    /// ([`crate::units::unit_vram_reading`]) trusted that empty-`Ok` as
+    /// `Attributed(0)` — "drained" — on the very first poll, silently skipping
+    /// the drain wait on every AMD host, because it never queried this at all;
+    /// it inferred capability from whether the *unit* has an attribution
+    /// channel (`is_systemd`/`vram_match`), not whether the *backend* can
+    /// answer that channel's query in the first place. Callers that need "can
+    /// this poll possibly attribute VRAM to a unit" must check both.
+    #[must_use]
+    pub fn attribution_capable(self) -> bool {
+        matches!(self, GpuBackend::Nvidia)
+    }
 }
 
 /// Best-effort PATH probe for `nvidia-smi` (drives `auto` detection). Pure-ish
@@ -657,6 +677,18 @@ mod tests {
             GpuBackend::Nvidia
         );
         assert_eq!(GpuBackend::resolve(GpuBackendKind::Amd), GpuBackend::Amd);
+    }
+
+    // ── per-process attribution capability (#61) ────────────────────────────
+
+    #[test]
+    fn nvidia_is_attribution_capable_amd_is_not() {
+        // The structural fact eviction gating gates on: AMD's
+        // `query_compute_procs` returning `Ok(vec![])` must never be mistaken
+        // for "queried successfully, unit confirmed drained" — see this
+        // method's docs.
+        assert!(GpuBackend::Nvidia.attribution_capable());
+        assert!(!GpuBackend::Amd.attribution_capable());
     }
 
     // Smoke test, not a strict assertion: on a host that actually has GPU

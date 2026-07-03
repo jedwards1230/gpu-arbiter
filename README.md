@@ -126,6 +126,12 @@ unit and it hasn't been manually started again (see below). Top-level
 to evict — gaming still won the GPU unconditionally, but a tenant may still be
 holding VRAM.
 
+**Wire note:** `running` is a JSON-visible type change from a plain boolean —
+a consumer that deserializes `/status` into a strict `bool` field (rather than
+`Option<bool>`/`bool | null`) will fail to parse on a `null`. This is rare in
+practice (it only happens when `is-active` itself can't be run), but a
+strict-typed client should be updated to expect it.
+
 ### Manual start/stop and holds
 
 `POST /units/{unit}/stop` now **holds** the unit down: without a hold, the
@@ -348,8 +354,17 @@ VRAM onto the GPU *concurrently* with the tenant's teardown, so gating on
 total usage rarely dropped below `vram_free_threshold_mb` before the timeout
 elapsed — eviction routinely escalated to SIGKILL even when the tenant itself
 released cleanly. Falls back to the legacy total-GPU-VRAM gate when
-attribution isn't available this poll (AMD, a failed compute-proc query, or a
-command-driven unit with no `vram_match`).
+attribution isn't available this poll (an attribution-incapable backend —
+AMD, always — a failed compute-proc query, or a command-driven unit with no
+`vram_match`).
+
+A zero-VRAM reading is only trusted as "this unit is drained" once the
+current eviction has already observed the unit attributed with *nonzero*
+VRAM at least once — proof the attribution channel can actually see this
+unit's process. A zero seen before that proof (a typo'd `vram_match`, an
+NVIDIA tenant holding VRAM only via a graphics context the compute-proc
+query never lists, or — pre-attribution-capability-check — AMD) degrades to
+the total-VRAM fallback gate instead of an instant, possibly-wrong "freed".
 
 ### Init systems other than systemd
 
