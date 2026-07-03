@@ -41,6 +41,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, Path, State};
@@ -581,31 +582,60 @@ fn esc(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// [`serve`] failures: both the initial bind and the serve loop itself only
-/// ever fail with an IO error (a bind conflict, or the listener erroring
-/// mid-serve). Its own small type rather than reusing
+/// [`serve`]/[`serve_uds`] failures. Its own small type rather than reusing
 /// [`crate::reconcile::ReconcileError`] — `http` and `reconcile` are otherwise
 /// independent modules, and this error carries no GPU/unit/config cases.
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
-    /// Binding the listener, or the serve loop itself, failed.
+    /// Binding a listener, creating/chmod-ing the unix socket's parent
+    /// directory, or the serve loop itself, failed with an IO error.
     #[error("HTTP server: {0}")]
     Io(#[from] std::io::Error),
+    /// The unix control socket at `path` answered a live-probe connect (#61)
+    /// before bind — another process (almost certainly a second gpu-arbiter
+    /// instance) is already listening there. Fatal by design: stealing a
+    /// live process's control socket would let two daemons race the same
+    /// managed units. See [`bind_uds`]'s docs.
+    #[error(
+        "control socket {path} is already in use by a live process (refusing to steal it — is another gpu-arbiter instance running?)"
+    )]
+    SocketInUse {
+        /// The socket path that answered the probe.
+        path: String,
+    },
 }
 
-/// Serve the axum HTTP control surface on `addr` until the process exits.
-/// Cross-platform.
+/// Bind the TCP listener for [`serve_on`], without starting the serve loop.
 ///
-/// Binds with `ConnectInfo<SocketAddr>` wired in so the `/ollama/*` handlers can
-/// read the peer address and reject non-loopback callers.
+/// Split from [`serve_on`]/[`serve`] specifically so a bind failure (the port
+/// already in use, a permission error) is something the caller can await and
+/// propagate **synchronously at startup**, before anything is spawned — see
+/// [`crate::main`]'s wiring (#61: previously the failure only surfaced inside
+/// a detached `tokio::spawn`ed task, logged and swallowed, leaving the daemon
+/// "running" with no working HTTP surface at all).
 ///
 /// # Errors
 ///
-/// Returns [`HttpError`] if binding the TCP listener or the serve loop itself
-/// fails.
-pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
+/// Returns [`HttpError`] if binding the TCP listener fails.
+pub async fn bind(addr: SocketAddr) -> Result<tokio::net::TcpListener, HttpError> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP control surface listening");
+    Ok(listener)
+}
+
+/// Serve the axum HTTP control surface on an already-[`bind`]-ed `listener`
+/// until the process exits. Cross-platform.
+///
+/// Binds the service with `ConnectInfo<SocketAddr>` wired in so the
+/// `/ollama/*` handlers can read the peer address and reject non-loopback
+/// callers.
+///
+/// # Errors
+///
+/// Returns [`HttpError`] if the serve loop itself fails — a runtime
+/// accept-loop error, not a bind failure (the listener is already bound by
+/// the time this is called; see [`bind`]).
+pub async fn serve_on(listener: tokio::net::TcpListener, app: AppState) -> Result<(), HttpError> {
     axum::serve(
         listener,
         router(app).into_make_service_with_connect_info::<SocketAddr>(),
@@ -614,8 +644,65 @@ pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
     Ok(())
 }
 
-/// Serve [`write_router`] (the manual start/stop write path — #17) on a unix
-/// domain socket at `socket_path` until the process exits.
+/// [`bind`] + [`serve_on`] combined — the daemon's own startup wiring calls
+/// them separately (see [`bind`]'s docs on why); this convenience wrapper is
+/// for callers (tests, examples) that don't need bind and serve as
+/// independently-awaitable steps.
+///
+/// # Errors
+///
+/// Returns [`HttpError`] if binding the TCP listener or the serve loop itself
+/// fails.
+pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
+    serve_on(bind(addr).await?, app).await
+}
+
+/// Hard ceiling on the stale-socket live-probe connect in [`bind_uds`].
+/// Generous for a local unix-socket connect (which normally completes in
+/// microseconds) while still bounding daemon startup — a probe that hangs
+/// this long is itself treated as "can't prove it's safe" (see
+/// [`socket_is_live`]'s docs), not as an infinite wait.
+const STALE_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Whether another process is actively listening on the unix socket at
+/// `path`, probed via a short connect attempt (#61) — the check [`bind_uds`]
+/// runs **before** ever unlinking what might be a stale leftover file from
+/// an unclean prior shutdown, so a live second gpu-arbiter instance's socket
+/// is never stolen out from under it.
+///
+/// - A successful connect: live. Something is genuinely listening and
+///   accepting at `path` right now.
+/// - `ConnectionRefused`: the classic stale-socket signature — the file
+///   exists (it's a socket special file the kernel will still let you
+///   `connect(2)` to) but nothing has it open for `accept()`, which only
+///   happens after an unclean shutdown left the file behind. Not live.
+/// - `NotFound`: no file at all — nothing to probe, not live.
+/// - Any other error (permission denied) or the probe itself timing out:
+///   conservatively treated as live. "Couldn't prove it's safe to remove" is
+///   not the same claim as "safe to remove" — a false positive here costs an
+///   operator having to clear a genuinely-stuck file by hand, which is far
+///   cheaper than two daemon instances silently racing the same managed
+///   units over the same socket.
+#[cfg(unix)]
+async fn socket_is_live(path: &std::path::Path) -> bool {
+    match tokio::time::timeout(
+        STALE_SOCKET_PROBE_TIMEOUT,
+        tokio::net::UnixStream::connect(path),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => true,
+        Ok(Err(e)) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ),
+        Err(_elapsed) => true,
+    }
+}
+
+/// Bind the unix control socket at `socket_path`, without starting the serve
+/// loop — see [`bind`]'s docs for why the daemon's own startup calls bind and
+/// serve as separate, synchronously-awaited steps (#61).
 ///
 /// - Creates the parent directory (mode `0700`, root-owned — see below) if
 ///   missing. The default `socket_path`
@@ -624,8 +711,12 @@ pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
 ///   than bare `/run`, specifically so this directory exists and is ours to
 ///   lock down; a custom `socket_path` may also name a (possibly nested)
 ///   subdirectory.
-/// - Removes a stale socket file left by an unclean prior shutdown before
-///   binding (a leftover file makes `bind` fail with `AddrInUse`).
+/// - Probes for a live listener at `socket_path` ([`socket_is_live`]) and
+///   fails with [`HttpError::SocketInUse`] rather than unlinking it if one
+///   answers — a stale-looking socket file is not always actually stale.
+/// - Only once the probe clears: removes a stale socket file left by an
+///   unclean prior shutdown before binding (a leftover file makes `bind`
+///   fail with `AddrInUse`).
 /// - Sets the socket file mode to `0600` **after** binding (the mode a
 ///   freshly-created unix socket gets is umask-dependent, so this pins it
 ///   explicitly) — root-owned (the daemon runs as root), so this is
@@ -646,19 +737,20 @@ pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
 /// pointed at a pre-existing, more permissive directory), not the sole
 /// defense.
 ///
-/// `#[cfg(unix)]`: `tokio::net::UnixListener`, `tokio::fs::DirBuilder::mode`,
-/// and the `0600`-mode step all need a unix target. The daemon only ever runs
-/// on Linux, but this compiles equally on the macOS dev host (macOS is unix
-/// too), so no non-unix stub is needed — the crate has never targeted a
-/// non-unix host.
+/// `#[cfg(unix)]`: `tokio::net::UnixListener`/`UnixStream`,
+/// `tokio::fs::DirBuilder::mode`, and the `0600`-mode step all need a unix
+/// target. The daemon only ever runs on Linux, but this compiles equally on
+/// the macOS dev host (macOS is unix too), so no non-unix stub is needed —
+/// the crate has never targeted a non-unix host.
 ///
 /// # Errors
 ///
-/// Returns [`HttpError`] if the parent directory can't be created at mode
-/// `0700`, a stale socket file can't be removed, binding the unix listener
-/// fails, its mode can't be set to `0600`, or the serve loop itself fails.
+/// Returns [`HttpError::SocketInUse`] if a live process is already listening
+/// at `socket_path`. Returns [`HttpError::Io`] if the parent directory can't
+/// be created at mode `0700`, a stale socket file can't be removed, binding
+/// the unix listener fails, or its mode can't be set to `0600`.
 #[cfg(unix)]
-pub async fn serve_uds(socket_path: &str, app: AppState) -> Result<(), HttpError> {
+pub async fn bind_uds(socket_path: &str) -> Result<tokio::net::UnixListener, HttpError> {
     use std::os::unix::fs::PermissionsExt;
 
     let path = std::path::Path::new(socket_path);
@@ -677,6 +769,13 @@ pub async fn serve_uds(socket_path: &str, app: AppState) -> Result<(), HttpError
         builder.mode(0o700);
         builder.create(parent).await?;
     }
+
+    if socket_is_live(path).await {
+        return Err(HttpError::SocketInUse {
+            path: socket_path.to_string(),
+        });
+    }
+
     match tokio::fs::remove_file(path).await {
         Ok(()) => tracing::debug!(socket = socket_path, "removed stale control socket"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -686,8 +785,37 @@ pub async fn serve_uds(socket_path: &str, app: AppState) -> Result<(), HttpError
     let listener = tokio::net::UnixListener::bind(path)?;
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
     tracing::info!(socket = socket_path, "unix control socket listening");
+    Ok(listener)
+}
+
+/// Serve [`write_router`] (the manual start/stop write path — #17) on an
+/// already-[`bind_uds`]-ed `listener` until the process exits.
+///
+/// # Errors
+///
+/// Returns [`HttpError`] if the serve loop itself fails — a runtime
+/// accept-loop error, not a bind failure (the listener is already bound by
+/// the time this is called; see [`bind_uds`]).
+#[cfg(unix)]
+pub async fn serve_uds_on(
+    listener: tokio::net::UnixListener,
+    app: AppState,
+) -> Result<(), HttpError> {
     axum::serve(listener, write_router(app)).await?;
     Ok(())
+}
+
+/// [`bind_uds`] + [`serve_uds_on`] combined — the daemon's own startup wiring
+/// calls them separately (see [`bind`]'s docs on why); this convenience
+/// wrapper is for callers (tests) that don't need bind and serve as
+/// independently-awaitable steps.
+///
+/// # Errors
+///
+/// Returns [`HttpError`] if [`bind_uds`] or [`serve_uds_on`] fails.
+#[cfg(unix)]
+pub async fn serve_uds(socket_path: &str, app: AppState) -> Result<(), HttpError> {
+    serve_uds_on(bind_uds(socket_path).await?, app).await
 }
 
 /// `GET /status` — serialize the current [`StatusSnapshot`] as JSON.
@@ -1460,6 +1588,115 @@ mod tests {
         );
 
         handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── stale-socket live-probe (#61) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn socket_is_live_false_when_no_file_exists() {
+        let dir = short_unique_socket_dir("probe-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        // No `create_dir_all` — the path (and its parent) genuinely don't exist.
+        let path = dir.join("gpu-arbiter.sock");
+        assert!(!socket_is_live(&path).await);
+    }
+
+    #[tokio::test]
+    async fn socket_is_live_false_for_a_genuinely_stale_socket_file() {
+        // A socket *file* left behind with nothing listening on it — the
+        // classic "unclean shutdown" shape: bind a listener, then drop it
+        // WITHOUT unlinking the file (mirrors a daemon that got SIGKILLed
+        // before its own cleanup ran).
+        let dir = short_unique_socket_dir("probe-stale");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gpu-arbiter.sock");
+        {
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            drop(listener); // no accept loop ever ran; the file is now stale
+        }
+        assert!(
+            path.exists(),
+            "dropping a UnixListener must not unlink its socket file"
+        );
+        assert!(!socket_is_live(&path).await);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn socket_is_live_true_while_a_listener_is_bound() {
+        let dir = short_unique_socket_dir("probe-live");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gpu-arbiter.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        // A connect succeeds against the listener's backlog even before
+        // anything calls accept() — which is exactly the "is this address
+        // claimed by a live process" question the probe is answering, not
+        // "is it currently servicing requests".
+        assert!(socket_is_live(&path).await);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_refuses_to_steal_a_live_socket() {
+        // The headline #61 fix: bind_uds must never unlink-and-rebind over a
+        // socket a live process is actually listening on.
+        let dir = short_unique_socket_dir("steal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gpu-arbiter.sock");
+        let live_listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let socket_path = path.to_string_lossy().into_owned();
+        let err = bind_uds(&socket_path).await.unwrap_err();
+        assert!(
+            matches!(&err, HttpError::SocketInUse { path: p } if p == &socket_path),
+            "expected SocketInUse, got: {err:?}"
+        );
+        // The live listener's file must be untouched — still exists, still
+        // the same live listener (bind_uds returned before ever calling
+        // remove_file).
+        assert!(path.exists());
+        drop(live_listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_uds_removes_a_genuinely_stale_socket_and_binds_fresh() {
+        // The non-regression half: a stale (probe-false) socket file must
+        // still be cleaned up and bound over, exactly like before #61.
+        let dir = short_unique_socket_dir("stale-rebind");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gpu-arbiter.sock");
+        {
+            let stale = tokio::net::UnixListener::bind(&path).unwrap();
+            drop(stale);
+        }
+        assert!(path.exists());
+
+        // A just-dropped listener's kernel-side teardown isn't always
+        // synchronous with `drop` on macOS — under load the probe can
+        // transiently see the socket as connectable and report SocketInUse
+        // (which is the CORRECT conservative daemon behavior: "couldn't
+        // prove it's stale" must never unlink; the real-world stale file is
+        // hours old, not microseconds). Retry briefly so the test asserts
+        // the settled behavior, not the teardown race.
+        let socket_path = path.to_string_lossy().into_owned();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let listener = loop {
+            match bind_uds(&socket_path).await {
+                Ok(l) => break l,
+                Err(HttpError::SocketInUse { .. }) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("bind_uds over a stale socket failed: {e:?}"),
+            }
+        };
+        drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -65,8 +65,16 @@ only, no bearer tokens). The parent directory is created if missing at mode
 0700, root\-owned, and is itself part of the auth boundary, not just the
 socket file's own mode: it closes the brief window between the socket file
 being created (bind) and its mode being pinned to 0600 (chmod), during which
-another local user could otherwise attempt a connection. A stale socket file
-from an unclean prior shutdown is removed before binding. An
+another local user could otherwise attempt a connection. Before binding, an
+existing socket file is probed with a short connect: if a live process
+answers (another gpu\-arbiter instance), startup fails rather than stealing
+its socket; only a genuinely stale file from an unclean prior shutdown
+(nothing listening) is removed. A failure to bind either listener (this
+socket or the TCP
+.BR port )
+is fatal at startup \(em the daemon exits nonzero so the service manager
+surfaces and retries it, instead of half\-running without a control surface.
+An
 .B empty string
 disables the unix socket entirely (the write path is then reachable only via
 the deprecated, loopback\-gated TCP routes on

@@ -426,6 +426,16 @@ mod linux {
         //    /healthz`) plus the deprecated TCP write routes, bound to
         //    `cfg.bind` (default 0.0.0.0, unchanged historical behavior —
         //    #22). The sanctioned write path is the unix socket below (#17).
+        //
+        //    Both listeners are BOUND HERE, synchronously, before either
+        //    serve loop is spawned (#61): a bind failure (the TCP port
+        //    already in use, a live unix socket already listening — see
+        //    `http::HttpError::SocketInUse` — or a permission error) fails
+        //    daemon startup via `?` instead of only surfacing inside a
+        //    detached task's `tracing::error!`, which used to leave the
+        //    process "running" with no working HTTP surface at all. A
+        //    runtime accept-loop error *after* a successful bind is still
+        //    logged-and-continue below — only the bind itself is fatal.
         let addr = SocketAddr::new(cfg.bind, cfg.port);
         let app = AppState {
             state: state.clone(),
@@ -433,23 +443,26 @@ mod linux {
             cfg: cfg.clone(),
         };
         let uds_app = app.clone();
+        let tcp_listener = http::bind(addr).await?;
         let http_handle = tokio::spawn(async move {
-            if let Err(e) = http::serve(addr, app).await {
+            if let Err(e) = http::serve_on(tcp_listener, app).await {
                 tracing::error!(error = %e, "HTTP server exited");
             }
         });
 
         // 6b. Unix control socket (#17): the sanctioned write path — local
-        // root only, file-permission-gated (mode 0600), no bearer tokens.
-        // Serves ONLY `/units/*` + `/ollama/*`; the read-only surface above
-        // stays TCP/LAN. `socket_path = ""` opts out entirely.
+        // root only, file-permission-gated (mode 0600 file, mode 0700 parent
+        // directory — #61), no bearer tokens. Serves ONLY `/units/*` +
+        // `/ollama/*`; the read-only surface above stays TCP/LAN.
+        // `socket_path = ""` opts out entirely.
         let socket_handle = if cfg.socket_path.is_empty() {
             tracing::info!("unix control socket disabled (socket_path is empty)");
             None
         } else {
             let socket_path = cfg.socket_path.clone();
+            let uds_listener = http::bind_uds(&socket_path).await?;
             Some(tokio::spawn(async move {
-                if let Err(e) = http::serve_uds(&socket_path, uds_app).await {
+                if let Err(e) = http::serve_uds_on(uds_listener, uds_app).await {
                     tracing::error!(error = %e, socket = %socket_path, "unix control socket exited");
                 }
             }))
