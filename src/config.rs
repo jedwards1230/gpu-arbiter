@@ -9,6 +9,12 @@
 //!
 //! Pure & cross-platform: parsing is a pure function, unit-tested on macOS with
 //! literal TOML strings.
+//!
+//! [`Config`], [`ManagedUnit`], and [`GamePattern`] all carry
+//! `#[serde(deny_unknown_fields)]`: a typo'd or unrecognized key is a parse
+//! error naming the offending key, not a silently-ignored no-op. This is what
+//! makes `--check-config` (see [`crate::cli::check_config`]) trustworthy — a
+//! typo like `detect_stema` used to still print `OK`.
 
 use serde::Deserialize;
 
@@ -21,6 +27,7 @@ use serde::Deserialize;
 /// match = "Heroic"
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GamePattern {
     /// Human-readable claim name (becomes `pattern:<name>`).
     pub name: String,
@@ -126,6 +133,7 @@ pub enum GpuBackendKind {
 /// # kill_cmd optional; if omitted, escalation re-runs stop_cmd
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedUnit {
     /// systemd unit the daemon exclusively owns — or, when `*_cmd` overrides are
     /// set, a free-form label for `/status` and logging.
@@ -280,7 +288,7 @@ impl<'de> Deserialize<'de> for ArgvCmd {
 /// | `presence_idle_threshold_s` | `gpu_arbiter_presence_idle_threshold_s` |
 /// | `gpu_backend` | `gpu_arbiter_gpu_backend` |
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Master enable. (The Ansible role also gates the unit on this.)
     pub enabled: bool,
@@ -520,6 +528,65 @@ mod tests {
         // A template bug producing the wrong type must fail fast with a typed
         // Parse error, not silently default.
         let err = Config::from_toml("port = \"not_a_number\"").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        // #4: a typo'd top-level key (e.g. `detect_stema` instead of
+        // `detect_steam`) must fail parse instead of silently defaulting —
+        // otherwise `--check-config` prints OK on a config that does nothing the
+        // operator intended.
+        let err = Config::from_toml("detect_stema = true").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("detect_stema"),
+            "error should name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_per_unit_key_is_rejected() {
+        // Same guard on a per-`managed_units` entry.
+        let err = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama.service"
+            eagre_restart = true
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("eagre_restart"),
+            "error should name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_game_pattern_key_is_rejected() {
+        let err = Config::from_toml(
+            r#"
+            [[game_patterns]]
+            name = "heroic"
+            match = "Heroic"
+            extra = "nope"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("extra"),
+            "error should name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn units_toml_key_is_rejected_not_silently_accepted() {
+        // Config::units is `#[serde(skip)]` (computed, never read from the file) —
+        // a config that tries to set it directly must be a typed error, not
+        // silently ignored (which was the pre-deny_unknown_fields behavior).
+        let err = Config::from_toml("units = []").unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)));
     }
 
