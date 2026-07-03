@@ -184,10 +184,19 @@ pub enum EvictionStep {
 
 /// Pure decision for one eviction poll. Unit-tested without any process I/O.
 ///
+/// `mem` is `None` when the GPU read failed/is unavailable this poll — a
+/// first-class "unknown" rather than a sentinel value threaded through
+/// [`vram_is_free`]. Unknown is never treated as freed (it can't be, by
+/// construction: `freed` only comes from `Some(mem)` where `vram_is_free`
+/// actually held), so a flaky reading degrades to `KeepWaiting`/`Escalate`
+/// exactly like a confirmed non-free reading — it never stalls, and the worst
+/// case is an escalation that turns out to be unnecessary.
+///
 /// `freed` wins over `timed_out` when both hold in the same poll (a graceful
 /// release on the very last tick is still graceful — no need to SIGKILL).
-pub fn eviction_step(mem: GpuMemory, elapsed: Duration, cfg: &Config) -> EvictionStep {
-    if vram_is_free(mem, cfg) {
+pub fn eviction_step(mem: Option<GpuMemory>, elapsed: Duration, cfg: &Config) -> EvictionStep {
+    let freed = matches!(mem, Some(mem) if vram_is_free(mem, cfg));
+    if freed {
         EvictionStep::Freed
     } else if elapsed >= Duration::from_secs(cfg.eviction_timeout_s) {
         EvictionStep::Escalate
@@ -425,19 +434,16 @@ pub async fn evict(
     // Poll nvidia-smi until VRAM drops below the free threshold or we time out.
     let start = std::time::Instant::now();
     loop {
-        // A failed GPU read counts as "not yet free" (never stalls; at worst we
-        // escalate).
-        let mem = backend.query_memory().await.unwrap_or(GpuMemory {
-            used_mb: u64::MAX,
-            total_mb: 0,
-        });
+        // A failed GPU read is a first-class `None` — "not yet free" (never
+        // stalls; at worst we escalate). See `eviction_step`'s docs.
+        let mem = backend.query_memory().await.ok();
         match eviction_step(mem, start.elapsed(), cfg) {
             EvictionStep::Freed => return Ok(EvictionOutcome::Freed),
             EvictionStep::Escalate => {
                 // Timed out on VRAM — but the stop already reaped the unit
                 // synchronously, so the only way we're here is either real
-                // VRAM pressure OR a flaky `nvidia-smi` (read as u64::MAX → never
-                // "free"). VRAM free *or PID gone* gate: if the unit
+                // VRAM pressure OR a flaky `nvidia-smi` (a `None` read never
+                // resolves as "free"). VRAM free *or PID gone* gate: if the unit
                 // is already inactive, the process is gone and its CUDA context
                 // (hence VRAM) released — SIGKILL would hit nothing. Treat that as
                 // a graceful release instead of a misleading `Escalated`.
@@ -537,11 +543,11 @@ mod tests {
         ));
     }
 
-    fn mem(used: u64) -> GpuMemory {
-        GpuMemory {
+    fn mem(used: u64) -> Option<GpuMemory> {
+        Some(GpuMemory {
             used_mb: used,
             total_mb: 32768,
-        }
+        })
     }
 
     #[test]
@@ -588,14 +594,15 @@ mod tests {
 
     #[test]
     fn eviction_step_failed_gpu_read_keeps_waiting_then_escalates() {
-        // evict() maps a failed nvidia-smi read to used_mb = u64::MAX.
+        // evict() maps a failed nvidia-smi read to `None` — a first-class
+        // "unknown" reading, never treated as freed.
         let cfg = Config::default();
         assert_eq!(
-            eviction_step(mem(u64::MAX), Duration::from_secs(1), &cfg),
+            eviction_step(None, Duration::from_secs(1), &cfg),
             EvictionStep::KeepWaiting
         );
         assert_eq!(
-            eviction_step(mem(u64::MAX), Duration::from_secs(5), &cfg),
+            eviction_step(None, Duration::from_secs(5), &cfg),
             EvictionStep::Escalate
         );
     }
