@@ -197,13 +197,13 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 | `ollama_unit` | `"ollama.service"` | **Legacy** single managed unit (used when `managed_units` is unset) |
 | `eager_ollama` | `true` | **Legacy** restart-on-gaming-end for the single unit |
 | `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation |
-| `vram_free_threshold_mb` | `2000` | VRAM-used below this = GPU "freed" |
+| `vram_free_threshold_mb` | `2000` | VRAM-used below this = GPU "freed" — applied to the evicting unit's own attributed VRAM when available, else total GPU VRAM (see [Eviction VRAM gating](#eviction-vram-gating)) |
 | `reconcile_interval_s` | `30` | Slow backstop interval (detection is event-driven) |
 | `detect_steam` | `true` | Match `SteamLaunch AppId=` (all Steam games) |
 | `game_patterns` | `[]` | `[[game_patterns]] name/match` for non-Steam launchers |
 | `vram_heuristic` | `false` | Opt-in: heavy non-allowlisted graphics procs = games |
 | `vram_game_threshold_mb` | `4000` | Threshold for the heuristic |
-| `gpu_allowlist` | `["ollama", "kwin_wayland", "plasmashell", "Xwayland"]` | Sanctioned tenants |
+| `gpu_allowlist` | `["ollama", "kwin_wayland", "plasmashell", "Xwayland"]` | Sanctioned tenants for the `vram_heuristic` — matched (case-insensitively, no substrings) against a proc's full name/path, its basename, and its owning systemd unit when cgroup-resolved |
 | `presence_detection` | `true` | Watch physical input devices for local-presence reporting |
 | `presence_idle_threshold_s` | `600` | Physical-input silence after which `local_present = 0` |
 | `gpu_backend` | `"auto"` | GPU vendor backend: `"auto"` (nvidia-smi if present, else amdgpu sysfs, else nvidia), `"nvidia"`, or `"amd"` |
@@ -218,7 +218,7 @@ SIGKILL` loop, in order) and restores when gaming ends. Each entry:
 |---|---|---|
 | `unit` | _(required)_ | systemd unit the daemon owns (or a free-form label when command overrides are set) |
 | `eager_restart` | `true` | Restart this unit when gaming ends |
-| `vram_match` | _(none)_ | Substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution |
+| `vram_match` | _(none)_ | **Fallback** substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution. A systemd-supervised unit is attributed automatically via cgroup PID resolution with no config needed; `vram_match` is only consulted for command-driven (`*_cmd`) units and non-systemd hosts (see [VRAM attribution](#vram-attribution)) |
 | `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (runs `ollama ps`); any other value reports no models and suppresses the name heuristic |
 | `introspect_cmd` | _(none)_ | Explicit command (shell-free argv) whose stdout lists loaded model/process names, one per line. Takes precedence over `kind` and the name heuristic |
 | `stop_cmd` | _(none)_ | Override: command to stop/evict the tenant (`None` → `systemctl stop`) |
@@ -229,6 +229,42 @@ SIGKILL` loop, in order) and restores when gaming ends. Each entry:
 If `managed_units` is omitted, a single entry is synthesized from the legacy
 `ollama_unit` / `eager_ollama` fields (with `vram_match = "ollama"`), so an
 unconfigured daemon behaves exactly as before.
+
+### VRAM attribution
+
+Each managed unit's own VRAM (surfaced as `units[].vram_mb` in `/status`, and
+used to gate graceful eviction — see [Eviction VRAM
+gating](#eviction-vram-gating)) is attributed via two channels, tried in order:
+
+1. **cgroup PID resolution** (primary, systemd units only, no config needed):
+   every GPU compute process's `/proc/<pid>/cgroup` names the systemd unit
+   that spawned it, regardless of what binary the unit actually execs. This
+   can't be fooled by a wrapper interpreter or launcher script — the historical
+   `vram_match` gap: an `asr-runner.service` unit's GPU process might be
+   `/opt/asr-runner/venv/bin/python` (the venv interpreter), so a name
+   substring like `vram_match = "parakeet"` never matches even though the unit
+   is definitely the one holding the GPU. Cgroup attribution sidesteps that
+   entirely.
+2. **`vram_match`** (fallback): a configured substring matched against the
+   process name/path, for command-driven (`*_cmd`) units and non-systemd hosts
+   — no cgroup path resolves to a configured unit name there, so this remains
+   the only channel.
+
+Neither channel reporting a match means `vram_mb` is omitted from `/status`
+entirely (never a misleading `0`).
+
+### Eviction VRAM gating
+
+The graceful-eviction wait (`stop` → poll → SIGKILL after `eviction_timeout_s`)
+gates on the **evicting unit's own attributed VRAM**, using the same
+attribution channels as above (cgroup, then `vram_match`) — not on total GPU
+VRAM. This matters during a real game launch: the game is loading its own
+VRAM onto the GPU *concurrently* with the tenant's teardown, so gating on
+total usage rarely dropped below `vram_free_threshold_mb` before the timeout
+elapsed — eviction routinely escalated to SIGKILL even when the tenant itself
+released cleanly. Falls back to the legacy total-GPU-VRAM gate when
+attribution isn't available this poll (AMD, a failed compute-proc query, or a
+command-driven unit with no `vram_match`).
 
 ### Init systems other than systemd
 

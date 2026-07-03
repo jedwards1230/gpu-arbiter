@@ -245,7 +245,15 @@ pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
             let pid = cols.next()?.parse::<i32>().ok()?;
             let name = cols.next()?.to_string();
             let vram_mb = cols.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            Some(GpuGraphicsProc { pid, name, vram_mb })
+            Some(GpuGraphicsProc {
+                pid,
+                name,
+                vram_mb,
+                // Cgroup attribution (#7) is a separate enrichment pass
+                // (`crate::cgroup::attribute_units`) — the raw CSV parse never
+                // knows about it.
+                owning_unit: None,
+            })
         })
         .collect()
 }
@@ -417,6 +425,13 @@ mod amd {
 /// matches. Pure helper over an observed compute-proc list, driven by each unit's
 /// configured `vram_match`.
 ///
+/// **Fallback path (#7):** cgroup attribution ([`vram_mb_by_cgroup`]) is the
+/// primary attribution channel for a systemd-supervised unit — it can't be
+/// fooled by a wrapper binary (a venv interpreter, a launcher script) the way
+/// this name-substring match can. This function remains the only channel for
+/// command-driven (`*_cmd`) units and non-systemd hosts, where no cgroup path
+/// resolves to a configured unit name at all.
+///
 /// Returns `None` when no matching compute proc is seen (so `/status` omits the
 /// field rather than reporting a misleading `0`). On AMD the compute list is
 /// always empty, so this always returns `None` (attribution degrades cleanly).
@@ -429,6 +444,74 @@ pub fn vram_mb_matching(compute: &[GpuGraphicsProc], needle: &str) -> Option<u64
         .peekable();
     matched.peek()?; // no matching compute proc → None (don't report a misleading 0)
     Some(matched.sum())
+}
+
+/// Best-effort VRAM (MiB) attributed to a managed unit via cgroup PID
+/// resolution (#7) — the primary `/status` attribution channel for a
+/// systemd-supervised unit. Pure helper over a compute-proc list already
+/// enriched by [`crate::cgroup::attribute_units`].
+///
+/// Sums every compute proc whose [`GpuGraphicsProc::owning_unit`] resolved to
+/// exactly `unit_name`. Same "`None` when nothing matched" contract as
+/// [`vram_mb_matching`] (so `/status` omits the field instead of asserting a
+/// misleading `0` for a unit nothing was ever attributed to) — see
+/// [`unit_vram_sum`] for the eviction-gating counterpart, which needs an
+/// explicit `0` to mean "confirmed drained".
+pub fn vram_mb_by_cgroup(compute: &[GpuGraphicsProc], unit_name: &str) -> Option<u64> {
+    let mut matched = compute
+        .iter()
+        .filter(|p| p.owning_unit.as_deref() == Some(unit_name))
+        .map(|p| p.vram_mb)
+        .peekable();
+    matched.peek()?;
+    Some(matched.sum())
+}
+
+/// Sum of VRAM (MiB) among `compute` procs whose cgroup resolved to
+/// `unit_name` — an **explicit** `0` when the compute-proc query succeeded
+/// but nothing currently maps to the unit. Pure.
+///
+/// Unlike [`vram_mb_by_cgroup`], a genuine zero here *is* the signal callers
+/// want: [`attribute_unit_vram`] (eviction gating, #8) needs to distinguish
+/// "the unit's process is confirmed gone" from "we have no idea", which
+/// `Option`-collapsing zero-into-`None` would erase.
+fn unit_vram_sum(compute: &[GpuGraphicsProc], unit_name: &str) -> u64 {
+    compute
+        .iter()
+        .filter(|p| p.owning_unit.as_deref() == Some(unit_name))
+        .map(|p| p.vram_mb)
+        .sum()
+}
+
+/// Attribute one managed unit's own VRAM (MiB) for an eviction-gating poll
+/// (#8). Pure — the decision core [`crate::units::eviction_step`] builds its
+/// [`crate::units::UnitVramReading`] from.
+///
+/// Precedence:
+/// - `is_systemd` (the unit's resolved [`crate::units::Supervisor`] is
+///   [`Supervisor::Systemd`](crate::units::Supervisor::Systemd)): trust cgroup
+///   attribution unconditionally once the compute-proc query itself succeeded
+///   this poll — a systemd unit's live process is always under its own
+///   cgroup, so a zero-sum match is a trustworthy "fully drained" signal, not
+///   "couldn't tell". `vram_match` is not consulted (cgroup is strictly more
+///   reliable for a systemd unit — see [`vram_mb_matching`]'s docs).
+/// - otherwise (command-driven `*_cmd` unit, no cgroup path structurally
+///   resolves to it): fall back to `vram_match`, if configured, again with an
+///   explicit `0` for "no matching proc this poll".
+/// - `None` when neither channel is available this poll (the compute query
+///   failed, or the unit is command-driven with no `vram_match`) — the caller
+///   falls back to the total-GPU-VRAM gate.
+pub fn attribute_unit_vram(
+    compute: Option<&[GpuGraphicsProc]>,
+    is_systemd: bool,
+    unit_name: &str,
+    vram_match: Option<&str>,
+) -> Option<u64> {
+    let procs = compute?;
+    if is_systemd {
+        return Some(unit_vram_sum(procs, unit_name));
+    }
+    vram_match.map(|needle| vram_mb_matching(procs, needle).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -588,6 +671,120 @@ mod tests {
         let procs = parse_graphics_procs_csv("333, python3, 4000\n");
         assert_eq!(vram_mb_matching(&procs, "ollama"), None);
         assert_eq!(vram_mb_matching(&[], "ollama"), None);
+    }
+
+    // ── cgroup attribution (#7) ─────────────────────────────────────────────
+
+    /// A compute proc with a resolved owning unit — the shape
+    /// `crate::cgroup::attribute_units` produces.
+    fn attributed(
+        pid: i32,
+        name: &str,
+        vram_mb: u64,
+        owning_unit: Option<&str>,
+    ) -> GpuGraphicsProc {
+        GpuGraphicsProc {
+            pid,
+            name: name.to_string(),
+            vram_mb,
+            owning_unit: owning_unit.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn vram_by_cgroup_sums_matching_unit_ignores_name() {
+        // The motivating live bug: the process name never contains "asr" or
+        // "parakeet", but cgroup attribution finds it anyway.
+        let procs = vec![
+            attributed(
+                1,
+                "/opt/asr-runner/venv/bin/python",
+                6000,
+                Some("asr-runner.service"),
+            ),
+            attributed(2, "/usr/local/bin/ollama", 21000, Some("ollama.service")),
+            attributed(3, "some-other-proc", 500, None),
+        ];
+        assert_eq!(vram_mb_by_cgroup(&procs, "asr-runner.service"), Some(6000));
+        assert_eq!(vram_mb_by_cgroup(&procs, "ollama.service"), Some(21000));
+    }
+
+    #[test]
+    fn vram_by_cgroup_none_when_no_owning_unit_matches() {
+        let procs = vec![attributed(1, "python", 4000, None)];
+        assert_eq!(vram_mb_by_cgroup(&procs, "asr-runner.service"), None);
+        assert_eq!(vram_mb_by_cgroup(&[], "asr-runner.service"), None);
+    }
+
+    // ── eviction-gating attribution (#8) ────────────────────────────────────
+
+    #[test]
+    fn attribute_unit_vram_systemd_trusts_cgroup_even_at_zero() {
+        // A systemd unit whose process has already exited (or was never GPU
+        // resident) — the compute query succeeded, cgroup attribution found
+        // no match, and that IS the freed signal: Some(0), not None.
+        let procs = vec![attributed(1, "other-proc", 999, Some("other.service"))];
+        assert_eq!(
+            attribute_unit_vram(Some(&procs), true, "ollama.service", None),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn attribute_unit_vram_systemd_ignores_vram_match_precedence() {
+        // Even when vram_match is ALSO configured, cgroup wins for a systemd
+        // unit — vram_match is never consulted.
+        let procs = vec![attributed(
+            1,
+            "totally-unrelated-name",
+            5000,
+            Some("ollama.service"),
+        )];
+        assert_eq!(
+            attribute_unit_vram(Some(&procs), true, "ollama.service", Some("ollama")),
+            Some(5000)
+        );
+    }
+
+    #[test]
+    fn attribute_unit_vram_command_driven_falls_back_to_vram_match() {
+        // A command-driven unit (is_systemd = false) has no cgroup path that
+        // could resolve to it — vram_match is the only channel.
+        let procs = parse_graphics_procs_csv("1, /usr/local/bin/ollama, 21000\n");
+        assert_eq!(
+            attribute_unit_vram(Some(&procs), false, "ollama", Some("ollama")),
+            Some(21000)
+        );
+        // No match this poll → confirmed drained (explicit 0, not None).
+        let empty: Vec<GpuGraphicsProc> = Vec::new();
+        assert_eq!(
+            attribute_unit_vram(Some(&empty), false, "ollama", Some("ollama")),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn attribute_unit_vram_command_driven_without_vram_match_is_none() {
+        // No cgroup channel (command-driven) AND no vram_match configured →
+        // structurally no attribution this poll; caller must fall back to
+        // total GPU VRAM.
+        let procs = parse_graphics_procs_csv("1, /usr/local/bin/ollama, 21000\n");
+        assert_eq!(
+            attribute_unit_vram(Some(&procs), false, "ollama", None),
+            None
+        );
+    }
+
+    #[test]
+    fn attribute_unit_vram_none_when_compute_query_failed() {
+        assert_eq!(
+            attribute_unit_vram(None, true, "ollama.service", Some("ollama")),
+            None
+        );
+        assert_eq!(
+            attribute_unit_vram(None, false, "ollama", Some("ollama")),
+            None
+        );
     }
 
     #[tokio::test]

@@ -141,9 +141,16 @@ pub struct ManagedUnit {
     /// Restart this unit when gaming ends (eager warm-up). Defaults to `true`.
     #[serde(default = "default_true")]
     pub eager_restart: bool,
-    /// Substring matched (case-insensitive) against `nvidia-smi` compute-proc
-    /// names to attribute this unit's VRAM in `/status`. `None` → no VRAM is
-    /// reported for the unit (the field is omitted rather than reported as 0).
+    /// **Fallback** substring (case-insensitive) matched against `nvidia-smi`
+    /// compute-proc names to attribute this unit's VRAM in `/status`. For a
+    /// systemd-supervised unit, cgroup PID resolution (#7) attributes VRAM
+    /// automatically with no config needed — it isn't fooled by a wrapper
+    /// binary (a venv interpreter, a launcher script) the way this
+    /// name-substring match can be. `vram_match` remains the only attribution
+    /// channel for command-driven (`*_cmd`) units and non-systemd hosts, where
+    /// no cgroup path resolves to a configured unit name. `None` → no VRAM is
+    /// reported for the unit via this channel (the field is omitted rather
+    /// than reported as 0).
     #[serde(default)]
     pub vram_match: Option<String>,
     /// Introspection backend selector for the `/status` `models[]` list. The only
@@ -333,7 +340,12 @@ pub struct Config {
     pub vram_heuristic: bool,
     /// VRAM threshold (MiB) for the opt-in heuristic.
     pub vram_game_threshold_mb: u64,
-    /// Sanctioned GPU tenants (for the heuristic + a sanity log line).
+    /// Sanctioned GPU tenants (for the heuristic + a sanity log line). Each
+    /// entry is matched case-insensitively against a `vram_heuristic`
+    /// graphics proc's full name/path, its path basename, and (when cgroup
+    /// attribution resolved one, #7) its owning systemd unit — see
+    /// [`crate::classify::matches_allowlist`] (#13). No substring matching:
+    /// every check is an exact equality.
     pub gpu_allowlist: Vec<String>,
 
     // ── presence ─────────────────────────────────────────────────────────────

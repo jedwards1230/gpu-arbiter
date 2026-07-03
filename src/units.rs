@@ -28,7 +28,7 @@
 use std::time::Duration;
 
 use crate::config::{Config, Introspection, ManagedUnit};
-use crate::gpu::{GpuBackend, GpuMemory};
+use crate::gpu::{self, GpuBackend, GpuMemory};
 
 /// Managed-unit control errors.
 #[derive(Debug, thiserror::Error)]
@@ -198,20 +198,51 @@ pub enum EvictionStep {
     KeepWaiting,
 }
 
+/// A per-poll VRAM reading for the unit under eviction (#8).
+///
+/// The pre-#8 gate watched *total* GPU VRAM, which is unreliable exactly when
+/// it matters most: during a game launch the game is loading its own VRAM
+/// onto the GPU **while** a tenant is tearing down, so total usage rarely
+/// drops below the free threshold before `eviction_timeout_s` elapses — the
+/// eviction routinely escalates to SIGKILL even though the tenant itself
+/// released cleanly. Gating on the tenant's own attributed VRAM instead makes
+/// the game's concurrent VRAM growth irrelevant to this decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitVramReading {
+    /// This unit's own VRAM (MiB), attributed via cgroup (systemd units) or
+    /// `vram_match` (command-driven units) — see
+    /// [`gpu::attribute_unit_vram`]. `0` is a legitimate, meaningful reading:
+    /// the unit is fully drained, not merely "not measured".
+    Attributed(u64),
+    /// Attribution was unavailable this poll (AMD, a failed compute-proc
+    /// query, or a command-driven unit with no `vram_match` configured) —
+    /// falls back to the legacy total-GPU-VRAM gate. `None` when even the
+    /// total-VRAM read itself failed ("unknown-memory").
+    Fallback(Option<GpuMemory>),
+}
+
 /// Pure decision for one eviction poll. Unit-tested without any process I/O.
 ///
-/// `mem` is `None` when the GPU read failed/is unavailable this poll — a
-/// first-class "unknown" rather than a sentinel value threaded through
-/// [`vram_is_free`]. Unknown is never treated as freed (it can't be, by
-/// construction: `freed` only comes from `Some(mem)` where `vram_is_free`
-/// actually held), so a flaky reading degrades to `KeepWaiting`/`Escalate`
-/// exactly like a confirmed non-free reading — it never stalls, and the worst
-/// case is an escalation that turns out to be unnecessary.
+/// The decision matrix over [`UnitVramReading`]:
+/// - `Attributed(mb)`: freed iff `mb < vram_free_threshold_mb` — the same
+///   threshold semantics [`vram_is_free`] applies to the total-VRAM gate,
+///   just scoped to this one unit. `0` always reads as freed.
+/// - `Fallback(Some(mem))`: freed iff [`vram_is_free`] holds for the total GPU
+///   reading — the pre-#8 behavior, used when per-unit attribution isn't
+///   available this poll.
+/// - `Fallback(None)`: unknown — never treated as freed. A flaky/absent
+///   reading degrades to `KeepWaiting`/`Escalate` exactly like a confirmed
+///   non-free reading, so eviction never stalls; the worst case is an
+///   escalation that turns out to be unnecessary.
 ///
 /// `freed` wins over `timed_out` when both hold in the same poll (a graceful
 /// release on the very last tick is still graceful — no need to SIGKILL).
-pub fn eviction_step(mem: Option<GpuMemory>, elapsed: Duration, cfg: &Config) -> EvictionStep {
-    let freed = matches!(mem, Some(mem) if vram_is_free(mem, cfg));
+pub fn eviction_step(reading: UnitVramReading, elapsed: Duration, cfg: &Config) -> EvictionStep {
+    let freed = match reading {
+        UnitVramReading::Attributed(mb) => mb < cfg.vram_free_threshold_mb,
+        UnitVramReading::Fallback(Some(mem)) => vram_is_free(mem, cfg),
+        UnitVramReading::Fallback(None) => false,
+    };
     if freed {
         EvictionStep::Freed
     } else if elapsed >= Duration::from_secs(cfg.eviction_timeout_s) {
@@ -439,27 +470,36 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
     }
 }
 
-/// Evict `unit` from the GPU: `systemctl stop`, then poll `nvidia-smi` until VRAM
-/// drops below `vram_free_threshold_mb` (graceful) or `eviction_timeout_s`
-/// elapses. On timeout, re-check the unit: if it's already inactive the process
-/// is gone and its VRAM released (VRAM free *or PID gone* gate) —
-/// that's a graceful [`EvictionOutcome::Freed`]. Only a unit that's genuinely
-/// still up gets `systemctl kill -s SIGKILL`, after which we **proceed regardless**
-/// (gaming wins the GPU unconditionally; a game launch must never hang waiting on
-/// a managed unit).
+/// Evict `unit` from the GPU: `systemctl stop`, then poll until the unit's own
+/// VRAM drains below `vram_free_threshold_mb` (graceful, #8) or
+/// `eviction_timeout_s` elapses. On timeout, re-check the unit: if it's
+/// already inactive the process is gone and its VRAM released (VRAM free *or
+/// PID gone* gate) — that's a graceful [`EvictionOutcome::Freed`]. Only a unit
+/// that's genuinely still up gets `systemctl kill -s SIGKILL`, after which we
+/// **proceed regardless** (gaming wins the GPU unconditionally; a game launch
+/// must never hang waiting on a managed unit).
 ///
 /// `cfg` supplies the shared `eviction_timeout_s` / `vram_free_threshold_mb`
-/// (the same gates apply to every managed unit). Note the VRAM poll watches
-/// *total* GPU memory, so with several heavy tenants the threshold is reached
-/// once the GPU as a whole has drained — evicting units in order keeps this
-/// monotonic.
+/// (the same gates apply to every managed unit, whether the reading is
+/// per-unit or the total-GPU fallback — see [`UnitVramReading`]).
+///
+/// **Per-unit gating (#8):** each poll attributes `u`'s own VRAM via
+/// [`gpu::attribute_unit_vram`] (cgroup for a systemd unit, `vram_match` for a
+/// command-driven one) and gates on *that*, not total GPU VRAM. This matters
+/// during a real game launch: the game is loading its own VRAM onto the GPU
+/// concurrently with this teardown, so the old total-VRAM gate rarely dropped
+/// below threshold before the timeout — eviction routinely escalated to
+/// SIGKILL even when the tenant itself released cleanly. Falls back to the
+/// legacy total-GPU-VRAM gate when attribution isn't available this poll
+/// (AMD, a failed compute-proc query, or a command-driven unit with no
+/// `vram_match`).
 ///
 /// Returns:
 /// - [`EvictionOutcome::AlreadyClear`] if the unit wasn't running to begin with,
 /// - [`EvictionOutcome::Freed`] if VRAM drained gracefully within the timeout,
 /// - [`EvictionOutcome::Escalated`] if the timeout forced a SIGKILL.
 ///
-/// The GPU poll failing is non-fatal: a missing/erroring `nvidia-smi` reading is
+/// A GPU/attribution read failing is non-fatal: a missing/erroring reading is
 /// treated as "not yet free", so the worst case is escalation, never a stall.
 pub async fn evict(
     u: &ManagedUnit,
@@ -467,6 +507,11 @@ pub async fn evict(
     backend: GpuBackend,
 ) -> Result<EvictionOutcome, UnitError> {
     let sup = Supervisor::resolve(u);
+    let is_systemd = matches!(sup, Supervisor::Systemd);
+    // Whether ANY attribution channel structurally applies to this unit: a
+    // systemd unit is always cgroup-attributable when the compute query
+    // succeeds; a command-driven unit needs an explicit `vram_match`.
+    let attribution_capable = is_systemd || u.vram_match.is_some();
 
     // Nothing to do if the unit isn't running.
     if !is_running(u).await? {
@@ -484,13 +529,12 @@ pub async fn evict(
         });
     }
 
-    // Poll nvidia-smi until VRAM drops below the free threshold or we time out.
+    // Poll until this unit's own VRAM drops below the free threshold (or the
+    // total-GPU fallback does) or we time out.
     let start = std::time::Instant::now();
     loop {
-        // A failed GPU read is a first-class `None` — "not yet free" (never
-        // stalls; at worst we escalate). See `eviction_step`'s docs.
-        let mem = backend.query_memory().await.ok();
-        match eviction_step(mem, start.elapsed(), cfg) {
+        let reading = unit_vram_reading(u, backend, is_systemd, attribution_capable).await;
+        match eviction_step(reading, start.elapsed(), cfg) {
             EvictionStep::Freed => return Ok(EvictionOutcome::Freed),
             EvictionStep::Escalate => {
                 // Timed out on VRAM — but the stop already reaped the unit
@@ -523,6 +567,46 @@ pub async fn evict(
             }
         }
     }
+}
+
+/// Build one eviction poll's [`UnitVramReading`] (#8) — the only
+/// side-effecting (shell-out / `/proc` read) half of the eviction-gating
+/// decision; [`eviction_step`] and [`gpu::attribute_unit_vram`] are the pure
+/// halves.
+///
+/// Queries the compute-proc list (and cgroup-enriches it for a systemd unit)
+/// only when `attribution_capable` — a command-driven unit with no
+/// `vram_match` has no possible attribution channel, so there's no point
+/// paying for the query. Falls back to a total-VRAM read only when
+/// attribution genuinely can't answer this poll (compute query failed), not
+/// on every poll — avoids doubling the shell-out cost in the common case.
+async fn unit_vram_reading(
+    u: &ManagedUnit,
+    backend: GpuBackend,
+    is_systemd: bool,
+    attribution_capable: bool,
+) -> UnitVramReading {
+    if attribution_capable {
+        let compute = if is_systemd {
+            match backend.query_compute_procs().await {
+                Ok(procs) => Some(crate::cgroup::attribute_units(procs).await),
+                Err(_) => None,
+            }
+        } else {
+            backend.query_compute_procs().await.ok()
+        };
+        if let Some(mb) = gpu::attribute_unit_vram(
+            compute.as_deref(),
+            is_systemd,
+            &u.unit,
+            u.vram_match.as_deref(),
+        ) {
+            return UnitVramReading::Attributed(mb);
+        }
+    }
+    // A failed GPU read is a first-class `None` — "not yet free" (never
+    // stalls; at worst we escalate). See `eviction_step`'s docs.
+    UnitVramReading::Fallback(backend.query_memory().await.ok())
 }
 
 /// Stop a unit via its supervisor (`systemctl stop` or the `stop` argv).
@@ -613,60 +697,148 @@ mod tests {
         })
     }
 
+    /// Shorthand for the `Fallback(Some(mem(used)))` reading — the pre-#8
+    /// total-GPU-VRAM gate.
+    fn fallback(used: u64) -> UnitVramReading {
+        UnitVramReading::Fallback(mem(used))
+    }
+
+    // ── fallback-total (attribution unavailable; the pre-#8 gate) ──────────
+
     #[test]
-    fn eviction_step_keeps_waiting_under_threshold_and_timeout() {
+    fn eviction_step_fallback_keeps_waiting_under_threshold_and_timeout() {
         let cfg = Config::default(); // free<2000, timeout 5s
         assert_eq!(
-            eviction_step(mem(21000), Duration::from_secs(1), &cfg),
+            eviction_step(fallback(21000), Duration::from_secs(1), &cfg),
             EvictionStep::KeepWaiting
         );
     }
 
     #[test]
-    fn eviction_step_freed_when_vram_drains() {
+    fn eviction_step_fallback_freed_when_vram_drains() {
         let cfg = Config::default();
         assert_eq!(
-            eviction_step(mem(500), Duration::from_secs(1), &cfg),
+            eviction_step(fallback(500), Duration::from_secs(1), &cfg),
             EvictionStep::Freed
         );
     }
 
     #[test]
-    fn eviction_step_escalates_on_timeout() {
+    fn eviction_step_fallback_escalates_on_timeout() {
         let cfg = Config::default();
         assert_eq!(
-            eviction_step(mem(21000), Duration::from_secs(5), &cfg),
+            eviction_step(fallback(21000), Duration::from_secs(5), &cfg),
             EvictionStep::Escalate
         );
         assert_eq!(
-            eviction_step(mem(21000), Duration::from_secs(99), &cfg),
+            eviction_step(fallback(21000), Duration::from_secs(99), &cfg),
             EvictionStep::Escalate
         );
     }
 
     #[test]
-    fn eviction_step_freed_wins_over_timeout_on_last_tick() {
+    fn eviction_step_fallback_freed_wins_over_timeout_on_last_tick() {
         // If VRAM is free AND the timeout has elapsed in the same poll, that's
         // still a graceful release — no SIGKILL.
         let cfg = Config::default();
         assert_eq!(
-            eviction_step(mem(100), Duration::from_secs(10), &cfg),
+            eviction_step(fallback(100), Duration::from_secs(10), &cfg),
+            EvictionStep::Freed
+        );
+    }
+
+    // ── unknown-memory (Fallback(None): even the total-VRAM read failed) ───
+
+    #[test]
+    fn eviction_step_unknown_memory_keeps_waiting_then_escalates() {
+        // evict() maps a failed nvidia-smi read to `None` — a first-class
+        // "unknown" reading, never treated as freed.
+        let cfg = Config::default();
+        assert_eq!(
+            eviction_step(
+                UnitVramReading::Fallback(None),
+                Duration::from_secs(1),
+                &cfg
+            ),
+            EvictionStep::KeepWaiting
+        );
+        assert_eq!(
+            eviction_step(
+                UnitVramReading::Fallback(None),
+                Duration::from_secs(5),
+                &cfg
+            ),
+            EvictionStep::Escalate
+        );
+    }
+
+    // ── attributed (#8: per-unit VRAM gating) ───────────────────────────────
+
+    #[test]
+    fn eviction_step_attributed_freed_when_unit_vram_is_zero() {
+        // The headline #8 fix: the unit's OWN vram is drained to 0 even though
+        // (unmodeled here) a game could simultaneously be loading VRAM
+        // elsewhere on the GPU — that's irrelevant to this unit's gate.
+        let cfg = Config::default();
+        assert_eq!(
+            eviction_step(UnitVramReading::Attributed(0), Duration::from_secs(1), &cfg),
             EvictionStep::Freed
         );
     }
 
     #[test]
-    fn eviction_step_failed_gpu_read_keeps_waiting_then_escalates() {
-        // evict() maps a failed nvidia-smi read to `None` — a first-class
-        // "unknown" reading, never treated as freed.
-        let cfg = Config::default();
+    fn eviction_step_attributed_freed_below_threshold_nonzero() {
+        // Same strict-< semantics as vram_is_free, just scoped to the unit.
+        let cfg = Config::default(); // threshold 2000
         assert_eq!(
-            eviction_step(None, Duration::from_secs(1), &cfg),
+            eviction_step(
+                UnitVramReading::Attributed(1999),
+                Duration::from_secs(1),
+                &cfg
+            ),
+            EvictionStep::Freed
+        );
+        assert_eq!(
+            eviction_step(
+                UnitVramReading::Attributed(2000),
+                Duration::from_secs(1),
+                &cfg
+            ),
+            EvictionStep::KeepWaiting
+        );
+    }
+
+    #[test]
+    fn eviction_step_attributed_still_held_keeps_waiting_then_escalates() {
+        let cfg = Config::default(); // timeout 5s
+        assert_eq!(
+            eviction_step(
+                UnitVramReading::Attributed(6000),
+                Duration::from_secs(1),
+                &cfg
+            ),
             EvictionStep::KeepWaiting
         );
         assert_eq!(
-            eviction_step(None, Duration::from_secs(5), &cfg),
+            eviction_step(
+                UnitVramReading::Attributed(6000),
+                Duration::from_secs(5),
+                &cfg
+            ),
             EvictionStep::Escalate
+        );
+    }
+
+    #[test]
+    fn eviction_step_attributed_freed_wins_over_timeout_on_last_tick() {
+        let cfg = Config::default();
+        assert_eq!(
+            eviction_step(
+                UnitVramReading::Attributed(0),
+                Duration::from_secs(10),
+                &cfg
+            ),
+            EvictionStep::Freed
         );
     }
 

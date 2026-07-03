@@ -48,7 +48,10 @@
 #vram_game_threshold_mb = 4000
 
 # Sanctioned GPU tenants, used by the heuristic (and a sanity log line) to avoid
-# flagging known-good processes as games.
+# flagging known-good processes as games. Each entry is matched
+# case-insensitively (no substrings) against a proc's full name/path, its
+# path basename (e.g. "1password" matches /opt/1Password/1password), and its
+# owning systemd unit when cgroup attribution resolved one.
 #gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
 
 # Cmdline-substring patterns for non-Steam launchers. Repeat the table per
@@ -81,11 +84,14 @@
 # "ollama.service", eager_restart = true, vram_match = "ollama"), so an
 # unconfigured daemon evicts Ollama exactly as before.
 #
-# Tenant 1 — Ollama, driven by systemd (the default supervisor):
+# Tenant 1 — Ollama, driven by systemd (the default supervisor). VRAM
+# attribution for a systemd unit is automatic via cgroup PID resolution — no
+# vram_match needed; it's set below only to keep working on the (rare) VRAM
+# heuristic / legacy fallback paths where cgroup data isn't available.
 #[[managed_units]]
 #unit = "ollama.service"        # systemd unit the daemon exclusively owns
 #eager_restart = true           # restart this unit when gaming ends
-#vram_match = "ollama"          # substring for /status VRAM attribution (optional)
+#vram_match = "ollama"          # FALLBACK substring for /status VRAM attribution (optional; cgroup wins when it applies)
 #kind = "ollama"                # introspection backend for /status models[] (optional; only "ollama" recognized)
 #introspect_cmd = "ollama ps"   # explicit model-list command, overrides kind (optional)
 

@@ -111,7 +111,10 @@ pub fn flatten_cmdline(raw: &[u8]) -> String {
 /// under [`tokio::task::spawn_blocking`] — it never stalls the runtime or the
 /// HTTP server. The optional `nvidia-smi`
 /// graphics-proc query (only when the VRAM heuristic is on) is an async
-/// `tokio::process` shell-out and stays on the runtime.
+/// `tokio::process` shell-out and stays on the runtime; each returned proc is
+/// then cgroup-enriched (#7, [`crate::cgroup::attribute_units`]) so
+/// [`classify::matches_allowlist`]'s owning-unit check (#13) has data to work
+/// with.
 #[cfg(target_os = "linux")]
 pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
     // Blocking /proc walk off the runtime threads.
@@ -119,10 +122,11 @@ pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, 
 
     // Only pay for the GPU graphics query when the heuristic actually needs it.
     let gpu_graphics = if cfg.vram_heuristic {
-        backend.query_graphics_procs().await.unwrap_or_else(|e| {
+        let graphics = backend.query_graphics_procs().await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "graphics-proc query failed; heuristic sees nothing this pass");
             Vec::new()
-        })
+        });
+        crate::cgroup::attribute_units(graphics).await
     } else {
         Vec::new()
     };
@@ -503,8 +507,12 @@ async fn refresh_substate(
     // One compute-proc query feeds every unit's VRAM attribution. Best-effort: a
     // failed/absent query leaves each `vram_mb` as None so `/status` omits it
     // rather than lying with a 0. (AMD returns an empty list, so attribution is
-    // simply omitted there — it must not error.)
-    let compute = backend.query_compute_procs().await.ok();
+    // simply omitted there — it must not error.) Cgroup-enriched (#7) so
+    // `vram_mb_by_cgroup` below has owning-unit data to match against.
+    let compute = match backend.query_compute_procs().await {
+        Ok(procs) => Some(crate::cgroup::attribute_units(procs).await),
+        Err(_) => None,
+    };
     // Snapshot the held set so /status can tell an operator *why* a stopped unit
     // isn't restarting (see ArbiterState::held / ensure_running_targets).
     let held = { read_state(state).held.clone() };
@@ -543,10 +551,16 @@ async fn refresh_substate(
             } else {
                 Vec::new()
             };
-            // Attribute VRAM via the unit's configured `vram_match` substring
-            // — likewise only when confirmed running.
-            let vram_mb = match (running, &u.vram_match, compute) {
-                (Some(true), Some(needle), Some(procs)) => gpu::vram_mb_matching(procs, needle),
+            // Attribute VRAM (#7) — likewise only when confirmed running.
+            // Precedence: cgroup unit match first (can't be fooled by a
+            // wrapper binary), falling back to the unit's configured
+            // `vram_match` substring for command-driven/non-systemd tenants.
+            let vram_mb = match (running, compute) {
+                (Some(true), Some(procs)) => gpu::vram_mb_by_cgroup(procs, &u.unit).or_else(|| {
+                    u.vram_match
+                        .as_deref()
+                        .and_then(|needle| gpu::vram_mb_matching(procs, needle))
+                }),
                 _ => None,
             };
             UnitStatus {
