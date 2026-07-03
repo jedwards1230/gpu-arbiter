@@ -41,7 +41,33 @@ touching systemd).
 .B port
 Integer (u16). Default
 .BR 48750 .
-HTTP listen port, bound on 0.0.0.0 and LAN\-restricted by firewalld.
+HTTP listen port for the read\-only surface (and the deprecated TCP write
+routes), bound to
+.B bind
+and LAN\-restricted by firewalld.
+.TP
+.B bind
+String (IP address). Default
+.BR """0.0.0.0""" .
+TCP bind address for the HTTP control surface. Accepts any IPv4 or IPv6
+address literal; a malformed value is a parse error naming the bad string.
+Scoping this to a LAN\-only address is defense\-in\-depth
+.B on top of,
+not instead of, the firewalld rich rule.
+.TP
+.B socket_path
+String (filesystem path). Default
+.BR """/run/gpu-arbiter.sock""" .
+Path to the unix control socket serving the write path
+.RB ( "POST /units/{unit}/start|stop" ", " /ollama/start|stop ),
+created mode 0600, root\-owned \(em the sanctioned control surface (local root
+only, no bearer tokens; the socket file's permissions are the entire auth
+boundary). The parent directory is created if missing; a stale socket file
+from an unclean prior shutdown is removed before binding. An
+.B empty string
+disables the unix socket entirely (the write path is then reachable only via
+the deprecated, loopback\-gated TCP routes on
+.BR port ).
 .TP
 .B managed_units
 Array of tables. Default: synthesized from
