@@ -170,12 +170,21 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
 /// - `gpu_arbiter_gaming` — `1` while a game holds the GPU (`state == gaming`).
 ///   This is the signal a "game left running, not being streamed" warn keys off
 ///   (it is `0` for legitimate Ollama/ASR GPU use, which never sets `gaming`).
+/// - `gpu_arbiter_degraded` — `1` while the most recent eviction pass had at
+///   least one managed unit fail to evict. Gaming still wins the GPU
+///   unconditionally when this is set — this is visibility only: a wedged
+///   tenant may still hold VRAM while `gpu_arbiter_state{state="gaming"}`
+///   reports a clean win. Alert on this to catch a stuck/wedged eviction.
 /// - `gpu_arbiter_state_since_seconds` — unix time the current state was entered.
 /// - `gpu_arbiter_claims` — count of active gaming claims.
 /// - `gpu_arbiter_claim{token,kind,id}` — `1` per active claim; the series
 ///   appearing/disappearing over time is the game launch/close record.
 /// - `gpu_arbiter_vram_used_mib` / `gpu_arbiter_vram_total_mib` — total GPU VRAM.
 /// - `gpu_arbiter_unit_running{unit}` — `1` if a managed unit is active.
+/// - `gpu_arbiter_unit_held{unit}` — `1` if an operator has manually stopped
+///   (held) this unit via `POST /units/{unit}/stop` — while held, the
+///   ensure-running post-step will not restart it even when the GPU is free.
+///   Alert on this to catch a hold an operator forgot to clear.
 /// - `gpu_arbiter_unit_vram_mib{unit}` — VRAM attributed to a managed unit.
 /// - `gpu_arbiter_local_input_last_seconds` — unix time of the most recent
 ///   physical human input (keyboard/mouse/gamepad).
@@ -276,6 +285,14 @@ pub fn render_metrics(
 
     gauge(
         &mut o,
+        "gpu_arbiter_degraded",
+        "1 while the most recent eviction pass had at least one managed unit fail to evict (gaming still wins the GPU unconditionally — this is visibility only).",
+        &[],
+        u8::from(snap.degraded),
+    );
+
+    gauge(
+        &mut o,
         "gpu_arbiter_state_since_seconds",
         "Unix time the current state was entered.",
         &[],
@@ -337,6 +354,20 @@ pub fn render_metrics(
             "gpu_arbiter_unit_running",
             &[("unit", &u.unit)],
             u8::from(u.running.unwrap_or(false)),
+        );
+    }
+    metric_header(
+        &mut o,
+        "gauge",
+        "gpu_arbiter_unit_held",
+        "1 if an operator has manually stopped (held) this unit — the ensure-running post-step will not restart it until a manual start or a daemon restart.",
+    );
+    for u in &snap.units {
+        sample(
+            &mut o,
+            "gpu_arbiter_unit_held",
+            &[("unit", &u.unit)],
+            u8::from(u.held),
         );
     }
     metric_header(
@@ -1315,6 +1346,61 @@ mod tests {
         assert!(out.contains("gpu_arbiter_local_present 0"));
         assert!(out.contains("gpu_arbiter_input_monitor_up 0"));
         assert!(out.contains("gpu_arbiter_physical_input_devices 0"));
+    }
+
+    /// `gpu_arbiter_unit_held` renders one sample per managed unit, `1` for a
+    /// manually-held unit and `0` for one that isn't — the same per-unit
+    /// sample shape as `gpu_arbiter_unit_running`.
+    #[test]
+    fn render_metrics_unit_held_reflects_per_unit_hold() {
+        let snap = StatusSnapshot {
+            version: "1.2.3".into(),
+            state: State::Available,
+            claims: vec![],
+            units: vec![
+                UnitStatus {
+                    unit: "ollama.service".into(),
+                    running: Some(false),
+                    models: vec![],
+                    vram_mb: None,
+                    held: true,
+                },
+                UnitStatus {
+                    unit: "vllm.service".into(),
+                    running: Some(true),
+                    models: vec![],
+                    vram_mb: None,
+                    held: false,
+                },
+            ],
+            ollama: UnitStatus::default(),
+            gpu_vram_used_mb: 0,
+            gpu_vram_total_mb: 0,
+            since: "1970-01-01T00:00:00Z".into(),
+            local_input_last_unix: 0,
+            physical_input_devices: 0,
+            input_monitor_up: true,
+            degraded: false,
+        };
+        let out = render_metrics(&snap, &Metrics::default(), 0, 0, 600, 0);
+        assert!(out.contains("# TYPE gpu_arbiter_unit_held gauge"));
+        assert!(out.contains("gpu_arbiter_unit_held{unit=\"ollama.service\"} 1"));
+        assert!(out.contains("gpu_arbiter_unit_held{unit=\"vllm.service\"} 0"));
+    }
+
+    /// `gpu_arbiter_degraded` mirrors `StatusSnapshot::degraded` — `1` while
+    /// the last eviction pass had errors, `0` once it resolves cleanly.
+    #[test]
+    fn render_metrics_degraded_reflects_snapshot_flag() {
+        let mut snap = empty_snapshot();
+        snap.degraded = true;
+        let out = render_metrics(&snap, &Metrics::default(), 0, 0, 600, 0);
+        assert!(out.contains("# TYPE gpu_arbiter_degraded gauge"));
+        assert!(out.contains("gpu_arbiter_degraded 1"));
+
+        snap.degraded = false;
+        let out = render_metrics(&snap, &Metrics::default(), 0, 0, 600, 0);
+        assert!(out.contains("gpu_arbiter_degraded 0"));
     }
 
     /// Every emitted sample line is preceded by its `# TYPE`, and each metric
