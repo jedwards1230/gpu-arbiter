@@ -111,7 +111,10 @@ pub fn flatten_cmdline(raw: &[u8]) -> String {
 /// under [`tokio::task::spawn_blocking`] — it never stalls the runtime or the
 /// HTTP server. The optional `nvidia-smi`
 /// graphics-proc query (only when the VRAM heuristic is on) is an async
-/// `tokio::process` shell-out and stays on the runtime.
+/// `tokio::process` shell-out and stays on the runtime; each returned proc is
+/// then cgroup-enriched (#7, [`crate::cgroup::attribute_units`]) so
+/// [`classify::matches_allowlist`]'s owning-unit check (#13) has data to work
+/// with.
 #[cfg(target_os = "linux")]
 pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
     // Blocking /proc walk off the runtime threads.
@@ -119,10 +122,11 @@ pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, 
 
     // Only pay for the GPU graphics query when the heuristic actually needs it.
     let gpu_graphics = if cfg.vram_heuristic {
-        backend.query_graphics_procs().await.unwrap_or_else(|e| {
+        let graphics = backend.query_graphics_procs().await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "graphics-proc query failed; heuristic sees nothing this pass");
             Vec::new()
-        })
+        });
+        crate::cgroup::attribute_units(graphics).await
     } else {
         Vec::new()
     };

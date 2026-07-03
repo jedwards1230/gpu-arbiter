@@ -48,7 +48,10 @@
 #vram_game_threshold_mb = 4000
 
 # Sanctioned GPU tenants, used by the heuristic (and a sanity log line) to avoid
-# flagging known-good processes as games.
+# flagging known-good processes as games. Each entry is matched
+# case-insensitively (no substrings) against a proc's full name/path, its
+# path basename (e.g. "1password" matches /opt/1Password/1password), and its
+# owning systemd unit when cgroup attribution resolved one.
 #gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
 
 # Cmdline-substring patterns for non-Steam launchers. Repeat the table per

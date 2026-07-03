@@ -203,7 +203,7 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 | `game_patterns` | `[]` | `[[game_patterns]] name/match` for non-Steam launchers |
 | `vram_heuristic` | `false` | Opt-in: heavy non-allowlisted graphics procs = games |
 | `vram_game_threshold_mb` | `4000` | Threshold for the heuristic |
-| `gpu_allowlist` | `["ollama", "kwin_wayland", "plasmashell", "Xwayland"]` | Sanctioned tenants |
+| `gpu_allowlist` | `["ollama", "kwin_wayland", "plasmashell", "Xwayland"]` | Sanctioned tenants for the `vram_heuristic` — matched (case-insensitively, no substrings) against a proc's full name/path, its basename, and its owning systemd unit when cgroup-resolved |
 | `presence_detection` | `true` | Watch physical input devices for local-presence reporting |
 | `presence_idle_threshold_s` | `600` | Physical-input silence after which `local_present = 0` |
 | `gpu_backend` | `"auto"` | GPU vendor backend: `"auto"` (nvidia-smi if present, else amdgpu sysfs, else nvidia), `"nvidia"`, or `"amd"` |

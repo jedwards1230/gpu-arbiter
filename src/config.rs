@@ -340,7 +340,12 @@ pub struct Config {
     pub vram_heuristic: bool,
     /// VRAM threshold (MiB) for the opt-in heuristic.
     pub vram_game_threshold_mb: u64,
-    /// Sanctioned GPU tenants (for the heuristic + a sanity log line).
+    /// Sanctioned GPU tenants (for the heuristic + a sanity log line). Each
+    /// entry is matched case-insensitively against a `vram_heuristic`
+    /// graphics proc's full name/path, its path basename, and (when cgroup
+    /// attribution resolved one, #7) its owning systemd unit — see
+    /// [`crate::classify::matches_allowlist`] (#13). No substring matching:
+    /// every check is an exact equality.
     pub gpu_allowlist: Vec<String>,
 
     // ── presence ─────────────────────────────────────────────────────────────
