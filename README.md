@@ -53,16 +53,28 @@ which is a *compute* proc).
 
 ## HTTP API
 
-Single port (default `48750`) bound `0.0.0.0`, LAN-restricted by a firewalld
-rich rule. `/units/*` (and the `/ollama/*` alias) are additionally localhost-only.
+The read-only surface (`/status`, `/metrics`, `/healthz`) is a single TCP port
+(default `48750`, bind address configurable via `bind` — see
+[Configuration](#configuration)), LAN-restricted by a firewalld rich rule (the
+configurable bind is defense-in-depth *on top of*, not instead of, that rule).
 
-| Method | Path | Bind | Purpose |
+The **write** path (`POST /units/{unit}/start|stop`, `/ollama/*`) is served
+twice: on a **unix control socket** (`socket_path`, default
+`/run/gpu-arbiter.sock`, mode `0600` root-owned) — the sanctioned surface,
+local-root-only, no bearer tokens — and, **deprecated**, on the same TCP port
+(loopback-only) for back-compat with the tray and any existing scripts. Both
+transports validate `{unit}` against `managed_units` before touching
+`systemctl`.
+
+| Method | Path | Transport | Purpose |
 |---|---|---|---|
-| GET | `/status` | LAN | Full state snapshot (below) |
-| GET | `/metrics` | LAN | Prometheus text-format exposition (below) |
-| GET | `/healthz` | LAN | Liveness |
-| POST | `/units/{unit}/start`, `/units/{unit}/stop` | localhost | Manual override (debugging) |
-| POST | `/ollama/start`, `/ollama/stop` | localhost | Back-compat alias for the first managed unit |
+| GET | `/status` | TCP (LAN) | Full state snapshot (below) |
+| GET | `/metrics` | TCP (LAN) | Prometheus text-format exposition (below) |
+| GET | `/healthz` | TCP (LAN) | Liveness |
+| POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket | Manual override — the sanctioned write path |
+| POST | `/ollama/start`, `/ollama/stop` | unix socket | Back-compat alias for the first managed unit |
+| POST | `/units/{unit}/start`, `/units/{unit}/stop` | TCP, localhost | **Deprecated** — same alias, kept for back-compat |
+| POST | `/ollama/start`, `/ollama/stop` | TCP, localhost | **Deprecated** alias |
 
 State is fully **auto** — derived from observed reality; there is no manual
 override of `state` itself. The `{unit}` must be one of the configured
@@ -71,6 +83,12 @@ drive arbitrary systemd units. A manual start/stop is handled by the same
 reconcile task that drives automatic eviction/restart (never a directly-racing
 HTTP handler), and `POST /units/{unit}/stop` now **holds** the unit down —
 see [Manual start/stop and holds](#manual-startstop-and-holds) below.
+
+Talk to the unix socket with any HTTP client that supports one, e.g.:
+
+```sh
+curl --unix-socket /run/gpu-arbiter.sock -X POST http://localhost/units/ollama.service/stop
+```
 
 `/status` payload:
 
@@ -159,8 +177,10 @@ across a restart:
 ## Command-line usage
 
 ```text
-gpu-arbiter [--config <PATH>] [--check-config]   Run the daemon (Linux), or validate config
-gpu-arbiter status [--config <PATH>] [--json]    Query the running daemon's /status
+gpu-arbiter [--config <PATH>] [--check-config]              Run the daemon (Linux), or validate config
+gpu-arbiter status [--config <PATH>] [--url <URL>] [--json | -q]
+gpu-arbiter wait [--for available|claimed] [--timeout <SECS>] [--url <URL>]
+gpu-arbiter watch [--json] [--url <URL>]
 gpu-arbiter --version | --help
 ```
 
@@ -168,9 +188,17 @@ gpu-arbiter --version | --help
 |---|---|
 | `-c, --config <PATH>` | Config file path (precedence below) |
 | `--check-config` | Load + validate the resolved config, print `OK: <path>` or the typed error, exit 0/1. Rejects unknown/typo'd keys at every level (top-level, `[[managed_units]]`, `[[game_patterns]]`) — a config that parses is a config with no typos, not just no type errors. |
-| `status` | Read the config for the port, GET `http://127.0.0.1:<port>/status`, print a human summary |
+| `--url <URL>` | (`status`/`wait`/`watch`) explicit daemon base URL (precedence below) |
+| `status` | GET `/status`, print a human summary |
 | `status --json` | Print the raw `/status` JSON instead of the summary |
+| `status -q` / `--quiet` | No output; exit code alone reports state (see [Exit codes](#exit-codes)) |
+| `wait [--for available\|claimed] [--timeout <SECS>]` | Poll `/status` (every 2s) until the state is reached; default `--for available`, default `--timeout 60` |
+| `watch [--json]` | Poll `/status` (every 2s) and print one line per state transition until killed; `--json` for NDJSON |
 | `-V, --version` / `-h, --help` | Print version / help and exit |
+
+**Daemon location** (`status`/`wait`/`watch`, highest precedence first):
+`--url <URL>` → `GPU_ARBITER_URL` env var (matching the tray's convention) →
+`http://127.0.0.1:<port>` from the local config.
 
 **Config-path precedence** (highest first): `--config`/`-c` → `GPU_ARBITER_CONFIG`
 env var → `/etc/gpu-arbiter/config.toml` (the default). A missing file is not an
@@ -178,8 +206,9 @@ error — the daemon falls back to built-in defaults.
 
 The daemon itself takes no required arguments; the existing systemd unit and
 `/etc/gpu-arbiter/config.toml` keep working unchanged (these flags are additive).
-`status` is a plain localhost HTTP client (no TLS), so it runs on any host that
-can reach the port. Example:
+`status`/`wait`/`watch` are plain HTTP clients (no TLS, `ureq` — the same
+client the tray uses), so they run on any host that can reach the daemon.
+Example:
 
 ```text
 $ gpu-arbiter status
@@ -192,6 +221,36 @@ Units:
   vllm.service: unknown
 Daemon:  v0.7.2
 ```
+
+`wait` replaces a hand-rolled poll loop in a launch script, e.g. block until
+the GPU is free before starting an AI workload:
+
+```sh
+gpu-arbiter wait --for available --timeout 30 && ./start-inference-server.sh
+```
+
+`watch` streams state transitions for local observability (also useful given
+desktop-1's journald retention is short — see the hardening plan):
+
+```text
+$ gpu-arbiter watch
+2026-06-13T18:00:00Z  (start) available  claims=-
+2026-06-13T18:00:12Z  available -> gaming  claims=steam:440
+2026-06-13T19:14:03Z  gaming -> available  claims=-
+```
+
+### Exit codes
+
+Any command line rejected by the parser (bad/missing flag, invalid
+combination) exits **2** before doing any work, regardless of subcommand.
+Beyond that, each subcommand's own codes:
+
+| Command | `0` | `1` | other |
+|---|---|---|---|
+| `status` | printed successfully | fetch/render error, daemon unreachable | — |
+| `status -q` | state is `available` | state is `gaming`/`evicting` | `2` = daemon unreachable |
+| `wait` | state reached | timed out, or daemon unreachable | — |
+| `--check-config` | config valid | config invalid | — |
 
 A unit's status line renders `running` / `stopped` / `unknown` (the tristate
 above); when `degraded` is set the summary also prints a `Degraded: ...` line.
@@ -207,6 +266,8 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 |---|---|---|
 | `enabled` | `true` | Master enable |
 | `port` | `48750` | HTTP listen port |
+| `bind` | `"0.0.0.0"` | TCP bind address for the read-only surface + deprecated TCP write routes |
+| `socket_path` | `"/run/gpu-arbiter.sock"` | Unix control socket path for the write path (mode `0600`, root-owned); empty string disables it |
 | `managed_units` | _(synthesized from `ollama_unit`)_ | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
 | `ollama_unit` | `"ollama.service"` | **Legacy** single managed unit (used when `managed_units` is unset) |
 | `eager_ollama` | `true` | **Legacy** restart-on-gaming-end for the single unit |

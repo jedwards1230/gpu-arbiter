@@ -16,8 +16,21 @@
 # cleanly (a quick disable without touching systemd).
 #enabled = true
 
-# HTTP listen port, bound on 0.0.0.0 and LAN-restricted by firewalld.
+# HTTP listen port for the read-only surface (/status /metrics /healthz) and
+# the deprecated TCP write routes, bound to `bind` and LAN-restricted by
+# firewalld.
 #port = 48750
+
+# TCP bind address for the HTTP control surface. Scoping this to a LAN-only
+# address is defense-in-depth ON TOP OF, not instead of, the firewalld rule.
+#bind = "0.0.0.0"
+
+# Unix control socket serving the write path (POST /units/{unit}/start|stop,
+# /ollama/start|stop) — the sanctioned control surface: local root only, no
+# bearer tokens, mode 0600 root-owned (the socket file's permissions ARE the
+# auth boundary). An empty string disables the socket entirely, leaving only
+# the deprecated, loopback-gated TCP write routes on `port`.
+#socket_path = "/run/gpu-arbiter.sock"
 
 # Seconds to wait for a graceful tenant teardown (VRAM dropping below
 # vram_free_threshold_mb) before escalating to SIGKILL.
