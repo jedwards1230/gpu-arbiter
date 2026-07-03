@@ -15,6 +15,9 @@ license = "MIT"
 description = "GPU arbiter daemon: evicts GPU compute tenants (e.g. Ollama) when a game launches (kernel cn_proc detection), restores them when gaming ends, exposes an HTTP /status endpoint for remote AI-routing decisions"
 repository = "https://github.com/jedwards1230/gpu-arbiter"
 
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
 [[bin]]
 name = "gpu-arbiter"
 path = "src/main.rs"

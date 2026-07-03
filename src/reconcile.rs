@@ -71,6 +71,7 @@ pub struct ProcSnapshot {
 /// Applies [`classify::classify`] to every cmdline and [`classify::heuristic_claim`]
 /// to every GPU graphics proc, then de-duplicates. Order is deterministic
 /// (sorted) so `/status` output is stable.
+#[must_use]
 pub fn claim_set(snap: &ProcSnapshot, cfg: &Config) -> Vec<Claim> {
     let mut claims: Vec<Claim> = Vec::new();
     for p in &snap.procs {
@@ -96,6 +97,7 @@ pub fn claim_set(snap: &ProcSnapshot, cfg: &Config) -> Vec<Claim> {
 /// `argv` like `reaper\0SteamLaunch AppId=440\0--\0tf2\0` becomes
 /// `reaper SteamLaunch AppId=440 -- tf2`. The classifier only does substring
 /// tests, so exact arg boundaries don't matter — only that the markers survive.
+#[must_use]
 pub fn flatten_cmdline(raw: &[u8]) -> String {
     let s = String::from_utf8_lossy(raw);
     s.split('\0')
@@ -115,6 +117,13 @@ pub fn flatten_cmdline(raw: &[u8]) -> String {
 /// then cgroup-enriched (#7, [`crate::cgroup::attribute_units`]) so
 /// [`classify::matches_allowlist`]'s owning-unit check (#13) has data to work
 /// with.
+///
+/// # Errors
+///
+/// Returns [`ReconcileError`] if the blocking `/proc` scan panics (a
+/// `spawn_blocking` join failure) or itself errors (e.g. `/proc` unreadable).
+/// A failed graphics-proc query is handled internally (degrades to an empty
+/// list), never propagated.
 #[cfg(target_os = "linux")]
 pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
     // Blocking /proc walk off the runtime threads.
@@ -176,7 +185,14 @@ fn scan_proc() -> Result<Vec<ProcInfo>, ReconcileError> {
 
 /// Non-Linux stub: there is no `/proc`. Returns an empty snapshot so the crate
 /// compiles and the reconcile loop is exercisable in tests on macOS.
+///
+/// # Errors
+///
+/// Never errors — kept `Result`-returning to match the Linux signature above.
+// Kept `async` (despite no `.await`) so call sites stay identical across
+// platforms — the Linux impl above genuinely awaits `spawn_blocking`.
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
 pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
     Ok(ProcSnapshot::default())
 }
@@ -216,6 +232,20 @@ pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> Result<ProcSnapshot
 /// `auto`-detection flip vendors mid-run (e.g. a transient `nvidia-smi` PATH
 /// hiccup), which no downstream code expects. `Copy`, so threading it through
 /// every pass costs nothing.
+///
+/// # Errors
+///
+/// Returns [`ReconcileError`] if the `/proc` observation step fails (see
+/// [`observe`]). Failures in the manual-trigger / eviction / restart steps are
+/// reported to the trigger's reply channel or logged, not propagated here — a
+/// degraded eviction still lets the reconcile loop continue.
+// This is the single orchestration function for one reconcile pass — manual
+// trigger handling, observe, decide, evict/restart, refresh — and is heavily
+// commented precisely because each step's ordering/locking rationale matters.
+// Splitting it to satisfy the line-count threshold would scatter that context
+// across several near-private helpers for no readability win; kept as one
+// function deliberately.
+#[allow(clippy::too_many_lines)]
 pub async fn reconcile(
     state: &Arc<RwLock<ArbiterState>>,
     cfg: &Config,
@@ -409,7 +439,7 @@ pub async fn reconcile(
             let confirmed_running = units::is_running(u)
                 .await
                 .inspect_err(|e| {
-                    tracing::warn!(unit = %u.unit, error = %e, "ensure-running: is_running check failed; treating as stopped and attempting start")
+                    tracing::warn!(unit = %u.unit, error = %e, "ensure-running: is_running check failed; treating as stopped and attempting start");
                 })
                 .unwrap_or(false);
             if !confirmed_running {
@@ -435,12 +465,7 @@ pub async fn reconcile(
             // `/proc` walk, so this is only paid when there's actually
             // something to start.
             let fresh = observe(cfg, backend).await?;
-            if !ensure_running_toctou_clear(&claim_set(&fresh, cfg)) {
-                tracing::warn!(
-                    units = to_start.len(),
-                    "ensure-running: a claim appeared mid-pass; skipping eager start(s) this pass"
-                );
-            } else {
+            if ensure_running_toctou_clear(&claim_set(&fresh, cfg)) {
                 for u in to_start {
                     if let Err(e) = units::start(u).await {
                         tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
@@ -453,6 +478,11 @@ pub async fn reconcile(
                         write_state(state).metrics.record_unit_restart(&u.unit);
                     }
                 }
+            } else {
+                tracing::warn!(
+                    units = to_start.len(),
+                    "ensure-running: a claim appeared mid-pass; skipping eager start(s) this pass"
+                );
             }
         }
     }
@@ -577,7 +607,7 @@ async fn refresh_substate(
             let running = units::is_running(u)
                 .await
                 .inspect_err(|e| {
-                    tracing::warn!(unit = %u.unit, error = %e, "/status refresh: is_running check failed; reporting unknown")
+                    tracing::warn!(unit = %u.unit, error = %e, "/status refresh: is_running check failed; reporting unknown");
                 })
                 .ok();
             // Model listing is generic per-tenant: the introspection backend
@@ -640,6 +670,11 @@ async fn refresh_substate(
 /// pair is spelled out explicitly — no wildcard arm — so adding a 4th
 /// [`State`] variant makes this a non-exhaustive-match compile error instead
 /// of silently falling through to [`UnitAction::None`].
+// Every pair is spelled out flat (not nested per clippy's suggestion) exactly
+// because this IS the exhaustiveness table the doc comment above describes —
+// nesting would obscure which pairs are actually covered.
+#[allow(clippy::unnested_or_patterns)]
+#[must_use]
 pub fn unit_action(current: State, desired: State) -> UnitAction {
     use State::{Available, Evicting, Gaming};
     match (current, desired) {

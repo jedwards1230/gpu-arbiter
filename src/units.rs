@@ -10,7 +10,7 @@
 //! - [`Supervisor::Systemd`] (the **default** — used whenever no `*_cmd`
 //!   override is configured) runs `systemctl stop|start|is-active|kill`
 //!   verbatim, byte-for-byte the daemon's historical behavior.
-//! - [`Supervisor::Command`] runs explicit, **shell-free** argv (OpenRC, runit,
+//! - [`Supervisor::Command`] runs explicit, **shell-free** argv (`OpenRC`, runit,
 //!   plain processes). `is_active` exit 0 = running. When no `kill` argv is
 //!   given, SIGKILL escalation falls back to re-running `stop` (there's no
 //!   generic SIGKILL without systemd).
@@ -115,6 +115,7 @@ impl Supervisor {
     /// systemd — mixing init systems for one tenant would be a config error, not
     /// a feature). If **none** are present the tenant is `Systemd` — the
     /// unchanged default.
+    #[must_use]
     pub fn resolve(u: &ManagedUnit) -> Supervisor {
         let any_override = u.stop_cmd.is_some()
             || u.start_cmd.is_some()
@@ -163,6 +164,7 @@ pub enum EvictionMetricOutcome {
 
 impl EvictionMetricOutcome {
     /// The Prometheus label value (`"graceful"`/`"sigkill"`/`"error"`).
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             EvictionMetricOutcome::Graceful => "graceful",
@@ -177,6 +179,7 @@ impl EvictionMetricOutcome {
 /// ([`EvictionOutcome::AlreadyClear`] — the unit wasn't running, so no eviction
 /// event occurred and `gpu_arbiter_evictions_total` must not be inflated by a
 /// no-op). Pure — unit-tested; feeds [`crate::state::Metrics::record_eviction`].
+#[must_use]
 pub fn eviction_metric_outcome(
     result: &Result<EvictionOutcome, UnitError>,
 ) -> Option<EvictionMetricOutcome> {
@@ -220,6 +223,7 @@ const INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Pure predicate: is the GPU considered "freed" given a memory snapshot and the
 /// configured free threshold? Pure — unit-tested. Strict `<`.
+#[must_use]
 pub fn vram_is_free(mem: GpuMemory, cfg: &Config) -> bool {
     mem.used_mb < cfg.vram_free_threshold_mb
 }
@@ -279,6 +283,7 @@ pub enum UnitVramReading {
 ///
 /// `freed` wins over `timed_out` when both hold in the same poll (a graceful
 /// release on the very last tick is still graceful — no need to SIGKILL).
+#[must_use]
 pub fn eviction_step(reading: UnitVramReading, elapsed: Duration, cfg: &Config) -> EvictionStep {
     let freed = match reading {
         UnitVramReading::Attributed(mb) => mb < cfg.vram_free_threshold_mb,
@@ -375,6 +380,12 @@ async fn run_argv(
 /// same convention: **exit 0 = active/running**, non-zero = inactive (not an
 /// error — it's the "inactive" answer). Only a spawn failure surfaces as
 /// [`UnitError`].
+///
+/// # Errors
+///
+/// Returns [`UnitError`] if the control command (`systemctl` or a configured
+/// `is_active_cmd`) can't be spawned or times out — not for a non-zero exit,
+/// which is the normal "inactive" answer.
 pub async fn is_running(u: &ManagedUnit) -> Result<bool, UnitError> {
     let out = match Supervisor::resolve(u) {
         Supervisor::Systemd => systemctl("is-active", &u.unit).await?,
@@ -481,11 +492,21 @@ fn resolve_unit<'c>(cfg: &'c Config, unit: &str) -> Result<&'c ManagedUnit, Unit
 }
 
 /// [`start`], resolving `unit` by name against `cfg` first. See [`resolve_unit`].
+///
+/// # Errors
+///
+/// Returns [`UnitError`] if `unit` isn't in `cfg.resolved_units()`, or if
+/// [`start`] itself fails.
 pub async fn start_by_name(cfg: &Config, unit: &str) -> Result<(), UnitError> {
     start(resolve_unit(cfg, unit)?).await
 }
 
 /// [`evict`], resolving `unit` by name against `cfg` first. See [`resolve_unit`].
+///
+/// # Errors
+///
+/// Returns [`UnitError`] if `unit` isn't in `cfg.resolved_units()`, or if
+/// [`evict`] itself fails.
 pub async fn evict_by_name(
     cfg: &Config,
     backend: GpuBackend,
@@ -496,6 +517,11 @@ pub async fn evict_by_name(
 
 /// Start `u` (eager warm-up after a verified `gaming → available` transition),
 /// via its resolved [`Supervisor`]. A non-zero start exit is a real failure.
+///
+/// # Errors
+///
+/// Returns [`UnitError`] if the control command can't be spawned, times out,
+/// or exits non-zero.
 pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
     let out = match Supervisor::resolve(u) {
         Supervisor::Systemd => systemctl("start", &u.unit).await?,
@@ -543,6 +569,13 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
 ///
 /// A GPU/attribution read failing is non-fatal: a missing/erroring reading is
 /// treated as "not yet free", so the worst case is escalation, never a stall.
+///
+/// # Errors
+///
+/// Returns [`UnitError`] if the initial `is_running` check or the `stop`
+/// control command fails to spawn, times out, or (for `stop`) exits non-zero.
+/// A failed VRAM/attribution poll during the wait loop is handled internally
+/// (treated as "not yet free"), not propagated as an error.
 pub async fn evict(
     u: &ManagedUnit,
     cfg: &Config,
@@ -593,7 +626,7 @@ pub async fn evict(
                 let still_running = is_running(u)
                     .await
                     .inspect_err(|e| {
-                        tracing::warn!(unit = %u.unit, error = %e, "eviction: is_running recheck failed; assuming still running")
+                        tracing::warn!(unit = %u.unit, error = %e, "eviction: is_running recheck failed; assuming still running");
                     })
                     .unwrap_or(true);
                 if !still_running {
@@ -732,17 +765,17 @@ mod tests {
         ));
     }
 
-    fn mem(used: u64) -> Option<GpuMemory> {
-        Some(GpuMemory {
+    fn mem(used: u64) -> GpuMemory {
+        GpuMemory {
             used_mb: used,
             total_mb: 32768,
-        })
+        }
     }
 
     /// Shorthand for the `Fallback(Some(mem(used)))` reading — the pre-#8
     /// total-GPU-VRAM gate.
     fn fallback(used: u64) -> UnitVramReading {
-        UnitVramReading::Fallback(mem(used))
+        UnitVramReading::Fallback(Some(mem(used)))
     }
 
     // ── fallback-total (attribution unavailable; the pre-#8 gate) ──────────

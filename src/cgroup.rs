@@ -56,6 +56,10 @@ pub fn unit_from_cgroup(contents: &str) -> Option<String> {
 
 /// Parse one `/proc/<pid>/cgroup` line into a unit name, if it resolves one.
 /// Pure — the per-line half of [`unit_from_cgroup`].
+// `.service`/`.scope` are systemd unit-type suffixes, not filesystem
+// extensions — they're always lowercase (never author-supplied casing), so a
+// case-insensitive match would be wrong here, not just unnecessary.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn unit_from_cgroup_line(line: &str) -> Option<String> {
     // cgroup v2: "0::/path" — rsplit on the last ':' still yields the path.
     // cgroup v1: "N:controller-list:/path" — same trick, since the path never
@@ -114,7 +118,10 @@ fn resolve_pid_units_blocking(pids: &[i32]) -> std::collections::HashMap<i32, St
 /// Non-Linux stub: there is no `/proc`. Returns `procs` unchanged — every
 /// `owning_unit` stays `None`, and callers degrade to the `vram_match`
 /// fallback exactly as if cgroup attribution found nothing.
+// Kept `async` (despite no `.await`) so call sites stay identical across
+// platforms — the Linux impl above genuinely awaits `spawn_blocking`.
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
 pub async fn attribute_units(procs: Vec<GpuGraphicsProc>) -> Vec<GpuGraphicsProc> {
     procs
 }
@@ -224,7 +231,7 @@ mod tests {
         // On macOS / CI there is no /proc — every owning_unit stays None, never
         // a panic, and the process list itself is preserved verbatim.
         let procs = vec![GpuGraphicsProc {
-            pid: std::process::id() as i32,
+            pid: std::process::id().cast_signed(),
             name: "whatever".to_string(),
             vram_mb: 100,
             owning_unit: None,

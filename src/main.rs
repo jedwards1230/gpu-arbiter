@@ -219,6 +219,8 @@ fn run_wait(base_url: &str, for_state: WaitFor, timeout: std::time::Duration) ->
 /// with no `break`); the `i32` return type only exists so the call site can
 /// stay symmetric with `run_status`/`run_wait`.
 fn run_watch(base_url: &str, json: bool) -> i32 {
+    use std::io::Write as _;
+
     let mut prev_state: Option<String> = None;
     loop {
         match fetch_status_json(base_url) {
@@ -246,7 +248,6 @@ fn run_watch(base_url: &str, json: bool) -> i32 {
                         cli::watch_human_line(&ts, prev_state.as_deref(), &state, &claims)
                     };
                     println!("{line}");
-                    use std::io::Write as _;
                     let _ = std::io::stdout().flush();
                     prev_state = Some(state);
                 }

@@ -184,12 +184,21 @@ struct RawArgs {
 /// --config x --help` still prints help). Otherwise the first non-flag token
 /// must be a known subcommand; any other positional is an error. Flags may
 /// appear before or after the subcommand.
-pub fn parse_args<I, S>(args: I) -> Result<Command, UsageError>
+///
+/// # Errors
+///
+/// Returns [`UsageError`] for an unknown flag, an unknown subcommand, an
+/// unexpected extra positional, a flag missing its (non-empty) value, or a
+/// flag combined with a subcommand it doesn't apply to.
+pub fn parse_args<I, S>(raw_args: I) -> Result<Command, UsageError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let argv: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+    let argv: Vec<String> = raw_args
+        .into_iter()
+        .map(|s| s.as_ref().to_string())
+        .collect();
     let mut raw = RawArgs::default();
 
     let mut i = 0;
@@ -391,11 +400,18 @@ where
 /// OK — it yields defaults, same as the daemon), or `Err(<typed error>)` with the
 /// `ConfigError` display string for IO / parse failures. Pure over `(path)` apart
 /// from the file read, so it works identically on the macOS stub build.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] if the file exists but fails to parse (invalid TOML
+/// or an unknown/malformed key), or if it can't be read for a reason other
+/// than "not found".
 pub fn check_config(path: &str) -> Result<String, ConfigError> {
     Config::load(path).map(|_| format!("OK: {path}"))
 }
 
 /// The `--help` text. A function (not a `const`) so the version is interpolated.
+#[must_use]
 pub fn help_text() -> String {
     format!(
         "gpu-arbiter {ver} — gaming-first GPU arbiter daemon\n\
@@ -456,6 +472,7 @@ pub fn help_text() -> String {
 /// this is unit-testable without touching the real environment or loading a
 /// config file; `main.rs` only resolves `local_port` (which needs a config
 /// load) when neither `url_flag` nor `env` already answers the question.
+#[must_use]
 pub fn resolve_daemon_url(url_flag: Option<&str>, env: Option<&str>, local_port: u16) -> String {
     if let Some(u) = url_flag {
         return u.trim_end_matches('/').to_string();
@@ -470,6 +487,7 @@ pub fn resolve_daemon_url(url_flag: Option<&str>, env: Option<&str>, local_port:
 
 /// Whether `state` (the raw `/status` JSON `state` field: `"gaming"` |
 /// `"available"` | `"evicting"`) satisfies a `wait --for` condition.
+#[must_use]
 pub fn wait_condition_met(state: &str, for_state: WaitFor) -> bool {
     match for_state {
         WaitFor::Available => state == "available",
@@ -482,6 +500,7 @@ pub fn wait_condition_met(state: &str, for_state: WaitFor) -> bool {
 /// or anything else). Daemon-unreachable is a distinct case the caller
 /// handles separately (exit `2`, see `main.rs::run_status`) — this only
 /// classifies a state that was actually fetched.
+#[must_use]
 pub fn quiet_exit_code(state: &str) -> i32 {
     i32::from(state != "available")
 }
@@ -490,12 +509,14 @@ pub fn quiet_exit_code(state: &str) -> i32 {
 /// (`prev` is `None`) always emits — so an operator starting `watch` sees the
 /// current state immediately, not just future transitions — and every later
 /// poll emits only on an actual state change.
+#[must_use]
 pub fn watch_should_emit(prev: Option<&str>, next: &str) -> bool {
     prev != Some(next)
 }
 
 /// Render a `watch` human-readable line. The first observation (`prev`
 /// `None`) reads `(start)`; every later line is `old -> new`.
+#[must_use]
 pub fn watch_human_line(ts: &str, prev: Option<&str>, next: &str, claims: &[String]) -> String {
     let claims_str = if claims.is_empty() {
         "-".to_string()
@@ -511,6 +532,7 @@ pub fn watch_human_line(ts: &str, prev: Option<&str>, next: &str, claims: &[Stri
 /// Render a `watch --json` NDJSON line: one compact JSON object, no
 /// pretty-printing — NDJSON requires exactly one line per record.
 /// `from` is JSON `null` for the first observation.
+#[must_use]
 pub fn watch_json_line(ts: &str, prev: Option<&str>, next: &str, claims: &[String]) -> String {
     serde_json::json!({
         "ts": ts,
@@ -531,6 +553,7 @@ pub fn watch_json_line(ts: &str, prev: Option<&str>, next: &str, claims: &[Strin
 /// Defensive against partial/old payloads: every field is read with a fallback
 /// (missing → a `-`/`0`/`?` placeholder) rather than panicking, so a daemon on a
 /// slightly different version still renders something useful.
+#[must_use]
 pub fn render_status(v: &serde_json::Value) -> String {
     use std::fmt::Write as _;
     let mut o = String::with_capacity(256);
@@ -545,7 +568,10 @@ pub fn render_status(v: &serde_json::Value) -> String {
     // Degraded (#6): shown only when true — a wedged eviction, not the
     // common case. Gaming still won the GPU; this just tells the operator a
     // tenant may still hold VRAM.
-    if v.get("degraded").and_then(|b| b.as_bool()).unwrap_or(false) {
+    if v.get("degraded")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
         let _ = writeln!(
             o,
             "Degraded: one or more units failed to evict (see daemon logs)"
@@ -567,11 +593,11 @@ pub fn render_status(v: &serde_json::Value) -> String {
     // GPU VRAM.
     let used = v
         .get("gpu_vram_used_mb")
-        .and_then(|n| n.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let total = v
         .get("gpu_vram_total_mb")
-        .and_then(|n| n.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let _ = writeln!(o, "GPU:     {used} / {total} MiB VRAM used");
 
@@ -585,14 +611,14 @@ pub fn render_status(v: &serde_json::Value) -> String {
                 // Tristate (#15): `running` is JSON `true`/`false`/`null` (the
                 // last meaning the daemon couldn't tell) — the missing-field
                 // case (older/partial payloads) renders the same as `null`.
-                let run_str = match u.get("running").and_then(|b| b.as_bool()) {
+                let run_str = match u.get("running").and_then(serde_json::Value::as_bool) {
                     Some(true) => "running",
                     Some(false) => "stopped",
                     None => "unknown",
                 };
 
                 // VRAM is optional (omitted when unknown).
-                let vram = match u.get("vram_mb").and_then(|n| n.as_u64()) {
+                let vram = match u.get("vram_mb").and_then(serde_json::Value::as_u64) {
                     Some(mb) => format!(", {mb} MiB"),
                     None => String::new(),
                 };

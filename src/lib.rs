@@ -10,7 +10,7 @@
 //! ## Cross-platform invariant
 //!
 //! The daemon is Linux-only **at runtime** (netlink
-//! cn_proc, `/proc`, `nvidia-smi`, `systemctl`) but MUST still `cargo build`
+//! `cn_proc`, `/proc`, `nvidia-smi`, `systemctl`) but MUST still `cargo build`
 //! and `cargo test` on macOS. The split:
 //!
 //! - **Pure logic** (cmdline classification, config parse, `nvidia-smi` /

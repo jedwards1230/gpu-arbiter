@@ -21,7 +21,7 @@ use tokio::sync::oneshot;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Claim {
     /// A Steam game: cmdline contained `SteamLaunch AppId=<id>`. Holds the
-    /// AppId. Serializes as `steam:<appid>`.
+    /// `AppId`. Serializes as `steam:<appid>`.
     Steam(String),
     /// A non-Steam launcher matched by a configured cmdline substring pattern.
     /// Holds the pattern's `name`. Serializes as `pattern:<name>`.
@@ -34,6 +34,7 @@ pub enum Claim {
 impl Claim {
     /// Render the flat `/status` token (`steam:440`, `pattern:heroic`,
     /// `gpu:12345`).
+    #[must_use]
     pub fn token(&self) -> String {
         match self {
             Claim::Steam(id) => format!("steam:{id}"),
@@ -75,7 +76,7 @@ pub enum State {
 /// identifier is needed (e.g. after a `match` has already taken `reply`).
 #[derive(Debug)]
 pub enum ReconcileTrigger {
-    /// A cn_proc exec/exit event (debounced) — the millisecond accelerator.
+    /// A `cn_proc` exec/exit event (debounced) — the millisecond accelerator.
     ProcEvent,
     /// The periodic ~30 s backstop timer — recomputes truth even if events
     /// were dropped.
@@ -118,6 +119,7 @@ impl ReconcileTrigger {
     /// A short, stable label for logging. Reads only the discriminant — safe to
     /// call even for `ManualStart`/`ManualStop` after a `match` has already
     /// taken `reply` out, since it never touches the payload.
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             ReconcileTrigger::ProcEvent => "proc_event",
@@ -133,6 +135,7 @@ impl ReconcileTrigger {
     /// [`Self::label`]: `ManualStart`/`ManualStop` both bucket to
     /// [`PassTrigger::Manual`] (the metric doesn't need to distinguish a manual
     /// start from a manual stop, only "an operator drove this pass").
+    #[must_use]
     pub fn pass_trigger(&self) -> PassTrigger {
         match self {
             ReconcileTrigger::ProcEvent => PassTrigger::ProcEvent,
@@ -395,6 +398,7 @@ pub enum PassTrigger {
 
 impl PassTrigger {
     /// The Prometheus label value (`"proc_event"`/`"timer"`/`"manual"`/`"startup"`).
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             PassTrigger::ProcEvent => "proc_event",
@@ -440,6 +444,7 @@ impl Default for ArbiterState {
 
 impl ArbiterState {
     /// Construct the initial state (boot default: `available`).
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -450,6 +455,7 @@ impl ArbiterState {
     ///
     /// The `evicting` transient is set explicitly by the eviction path, not
     /// derived here.
+    #[must_use]
     pub fn resolve_state(claims: &[Claim]) -> State {
         if claims.is_empty() {
             State::Available
@@ -488,6 +494,11 @@ impl ArbiterState {
 /// Take a read lock on the shared [`ArbiterState`] (`/status`/`/metrics`
 /// handlers). Panics on a poisoned lock — see [`write_state`] for the policy
 /// this and [`write_state`] share.
+///
+/// # Panics
+///
+/// Panics if the lock is poisoned (a prior writer panicked mid-mutation) —
+/// deliberate, see [`write_state`]'s "Poisoning policy" doc below.
 pub fn read_state(
     state: &std::sync::RwLock<ArbiterState>,
 ) -> std::sync::RwLockReadGuard<'_, ArbiterState> {
@@ -512,6 +523,11 @@ pub fn read_state(
 /// fresh process — which re-runs the startup reconcile against freshly
 /// observed ground truth — is the safer failure mode than
 /// `into_inner()`-recovering a guard over data of unknown integrity.
+///
+/// # Panics
+///
+/// Panics if the lock is poisoned (a prior writer panicked mid-mutation) —
+/// deliberate, see the "Poisoning policy" section above.
 pub fn write_state(
     state: &std::sync::RwLock<ArbiterState>,
 ) -> std::sync::RwLockWriteGuard<'_, ArbiterState> {
@@ -529,6 +545,7 @@ pub fn write_state(
 /// well beyond any timestamp this daemon emits). Sub-second precision is dropped
 /// (the `/status` contract uses whole-second timestamps); times before the Unix
 /// epoch (which the daemon never produces) clamp to the epoch.
+#[must_use]
 pub fn format_rfc3339(t: SystemTime) -> String {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -545,8 +562,12 @@ pub fn format_rfc3339(t: SystemTime) -> String {
 /// (<http://howardhinnant.github.io/date_algorithms.html>), which is exact for
 /// the whole Gregorian calendar with no leap-second fudging (UTC `/status`
 /// timestamps don't carry leap seconds).
+// `day`/`month` below are provably in [1, 31] / [1, 12] by the date algorithm
+// itself (Howard Hinnant's `days_from_civil` inverse) — the `i64 -> u32`
+// narrowing can't truncate or lose sign for any input this function computes.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn civil_from_unix_secs(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = (secs / 86_400) as i64;
+    let days = (secs / 86_400).cast_signed();
     let rem = (secs % 86_400) as u32;
     let hour = rem / 3600;
     let min = (rem % 3600) / 60;

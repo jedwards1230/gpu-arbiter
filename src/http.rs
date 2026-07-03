@@ -126,16 +126,16 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
     let since_unix = guard
         .since
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_secs().cast_signed())
         .unwrap_or(0);
     drop(guard);
     // `now`/threshold are read HERE (impure edge) and passed into the pure
     // renderer, exactly like `since_unix`, so `render_metrics` reads no clocks.
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_secs().cast_signed())
         .unwrap_or(0);
-    let threshold_s = app.cfg.presence_idle_threshold_s as i64;
+    let threshold_s = app.cfg.presence_idle_threshold_s.cast_signed();
     // procmon's dropped-event counter lives outside ArbiterState (#14's
     // module docs explain why) — read it here, at the same impure edge as
     // `now_unix`, and pass it in like every other clock/counter read.
@@ -214,6 +214,13 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
 /// `now_unix`, `presence_threshold_s`, and `proc_events_dropped` are passed in
 /// (not read from a clock/global) so the renderer stays pure — same discipline
 /// as `since_unix`.
+// One function per the full Prometheus exposition format, deliberately: each
+// gauge/counter line is independent and the ordering IS the contract this
+// function's own doc table above describes. Splitting it into several
+// sub-100-line helpers would just relocate, not reduce, the line count while
+// making the emission order harder to audit against the doc table.
+#[allow(clippy::too_many_lines)]
+#[must_use]
 pub fn render_metrics(
     snap: &StatusSnapshot,
     metrics: &Metrics,
@@ -222,6 +229,8 @@ pub fn render_metrics(
     presence_threshold_s: i64,
     proc_events_dropped: u64,
 ) -> String {
+    const MONOTONIC_NOTE: &str = "Monotonic for the process lifetime; a daemon restart resets this to 0 — use rate()/increase(), never compare raw values across a restart.";
+
     let mut o = String::with_capacity(1024);
 
     gauge(
@@ -382,8 +391,6 @@ pub fn render_metrics(
     );
 
     // ── counters (#14): durable history journald's short retention can't give ──
-
-    const MONOTONIC_NOTE: &str = "Monotonic for the process lifetime; a daemon restart resets this to 0 — use rate()/increase(), never compare raw values across a restart.";
 
     metric_header(
         &mut o,
@@ -589,6 +596,11 @@ pub enum HttpError {
 ///
 /// Binds with `ConnectInfo<SocketAddr>` wired in so the `/ollama/*` handlers can
 /// read the peer address and reject non-loopback callers.
+///
+/// # Errors
+///
+/// Returns [`HttpError`] if binding the TCP listener or the serve loop itself
+/// fails.
 pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP control surface listening");
@@ -617,6 +629,12 @@ pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
 /// need a unix target. The daemon only ever runs on Linux, but this compiles
 /// equally on the macOS dev host (macOS is unix too), so no non-unix stub is
 /// needed — the crate has never targeted a non-unix host.
+///
+/// # Errors
+///
+/// Returns [`HttpError`] if the parent directory can't be created, a stale
+/// socket file can't be removed, binding the unix listener fails, its mode
+/// can't be set to `0600`, or the serve loop itself fails.
 #[cfg(unix)]
 pub async fn serve_uds(socket_path: &str, app: AppState) -> Result<(), HttpError> {
     use std::os::unix::fs::PermissionsExt;
@@ -889,12 +907,14 @@ fn first_managed_unit(cfg: &Config) -> String {
 /// `/units/*`). Pure — unit-tested. Not on [`guard`]'s hot path (`guard` resolves
 /// the unit directly in one pass); kept as an independent predicate other callers
 /// can use without needing the full `&ManagedUnit`.
+#[must_use]
 pub fn is_managed(cfg: &Config, unit: &str) -> bool {
     cfg.resolved_units().iter().any(|u| u.unit == unit)
 }
 
 /// Whether a peer IP is permitted to call the `/units/*` handlers (loopback
 /// only). Pure — unit-tested.
+#[must_use]
 pub fn is_localhost(peer: std::net::IpAddr) -> bool {
     peer.is_loopback()
 }

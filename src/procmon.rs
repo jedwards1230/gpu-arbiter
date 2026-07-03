@@ -1,4 +1,4 @@
-//! cn_proc process-event listener: subscribes to the kernel's process-event
+//! `cn_proc` process-event listener: subscribes to the kernel's process-event
 //! connector over a netlink socket (`PROC_CN_MCAST_LISTEN`) via `neli` and
 //! turns every fork/exec/exit into a **debounced** [`ReconcileTrigger::ProcEvent`].
 //!
@@ -29,7 +29,7 @@
 //! Each received message is handled in its own `match`: `Ok` → act, `Err` →
 //! `warn!`-and-skip. There is no `unwrap()`/`expect()`/`todo!()` on the hot path.
 //!
-//! **Linux-only**: netlink + cn_proc are Linux kernel interfaces. A non-Linux
+//! **Linux-only**: netlink + `cn_proc` are Linux kernel interfaces. A non-Linux
 //! stub keeps the crate compiling and `cargo test`-able on macOS.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -150,12 +150,13 @@ pub enum ProcMonError {
 /// arbiter. `fork`/everything else are pure noise the level-triggered reconcile
 /// would just re-derive the same answer from, so we drop them at the source to
 /// keep the debounce channel quiet. Pure — unit-tested.
+#[must_use]
 pub fn is_trigger_kind(kind: ProcEventKind) -> bool {
     matches!(kind, ProcEventKind::Exec | ProcEventKind::Exit)
 }
 
-/// Run the cn_proc listener: open the netlink connector socket, subscribe to the
-/// `CN_IDX_PROC` multicast group with `PROC_CN_MCAST_LISTEN`, and forward a
+/// Run the `cn_proc` listener: open the netlink connector socket, subscribe to
+/// the `CN_IDX_PROC` multicast group with `PROC_CN_MCAST_LISTEN`, and forward a
 /// [`ReconcileTrigger::ProcEvent`] on `triggers` for every exec/exit event, for
 /// the lifetime of the daemon.
 ///
@@ -167,6 +168,13 @@ pub fn is_trigger_kind(kind: ProcEventKind) -> bool {
 ///
 /// Returns only on a fatal socket error (the recv loop is infinite otherwise).
 /// Linux-only.
+///
+/// # Errors
+///
+/// Returns [`ProcMonError`] if the netlink socket can't be connected, the
+/// `PROC_CN_MCAST_LISTEN` subscribe message can't be built or sent, or a
+/// non-recoverable `recv` error occurs (a recoverable `ENOBUFS` overflow is
+/// logged and the loop continues — see the module docs).
 #[cfg(target_os = "linux")]
 pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMonError> {
     use neli::connector::{CnMsg, CnMsgBuilder, ProcEventHeader};
@@ -335,9 +343,14 @@ fn kind_of(event: &neli::connector::ProcEvent) -> ProcEventKind {
     }
 }
 
-/// Non-Linux stub: there is no netlink/cn_proc. The future never resolves (it
-/// just parks), so wiring it into a `tokio::select!` in `main` is harmless on a
-/// macOS dev box — the timer + HTTP triggers still drive reconcile.
+/// Non-Linux stub: there is no `netlink`/`cn_proc`. The future never resolves
+/// (it just parks), so wiring it into a `tokio::select!` in `main` is harmless
+/// on a macOS dev box — the timer + HTTP triggers still drive reconcile.
+///
+/// # Errors
+///
+/// Never returns (the future parks forever) — kept `Result`-returning to
+/// match the Linux signature above.
 #[cfg(not(target_os = "linux"))]
 pub async fn run(_triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMonError> {
     std::future::pending::<()>().await;
@@ -350,6 +363,7 @@ pub async fn run(_triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMo
 /// The kernel reports `NONZERO_EXIT` as a distinct discriminant from `EXIT`
 /// (it's the same lifecycle signal, a process leaving — both map to
 /// [`ProcEventKind::Exit`]).
+#[must_use]
 pub fn event_kind_from_what(what: u32) -> ProcEventKind {
     use proc_event_what as w;
     match what {

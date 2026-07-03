@@ -98,7 +98,7 @@ pub enum GpuBackendKind {
 /// By default the tenant is driven by **systemd** (`systemctl stop|start|
 /// is-active|kill`), exactly as the daemon has always behaved. The optional
 /// `*_cmd` fields override that with arbitrary process-control commands so the
-/// daemon can drive OpenRC (Gentoo/Artix/Alpine), runit (Void), or plain
+/// daemon can drive `OpenRC` (Gentoo/Artix/Alpine), runit (Void), or plain
 /// processes — see [`crate::units::Supervisor`]. When **all** `*_cmd` overrides
 /// are absent the tenant is byte-for-byte systemd-driven.
 ///
@@ -124,7 +124,7 @@ pub enum GpuBackendKind {
 /// introspect_cmd = "ollama ps"  # explicit model-list command (optional, overrides kind)
 /// ```
 ///
-/// Or, command-driven (OpenRC example):
+/// Or, command-driven (`OpenRC` example):
 /// ```toml
 /// [[managed_units]]
 /// unit = "ollama"                              # label only; not a systemd unit
@@ -212,6 +212,7 @@ impl ManagedUnit {
     /// A blank/whitespace-only **or** over-length (`> MAX_INTROSPECT_CMD_LEN`)
     /// `introspect_cmd` is treated as unset — resolution falls through to `kind`
     /// and the name heuristic rather than running a bogus command.
+    #[must_use]
     pub fn introspection(&self) -> Introspection {
         if let Some(cmd) = &self.introspect_cmd
             && !cmd.trim().is_empty()
@@ -248,6 +249,7 @@ impl ArgvCmd {
     /// The argv as a slice. `argv()[0]` is the program; the rest are args.
     /// Empty only if a config supplied an empty array / blank string (callers
     /// treat that as a no-op).
+    #[must_use]
     pub fn argv(&self) -> &[String] {
         &self.0
     }
@@ -298,6 +300,11 @@ impl<'de> Deserialize<'de> for ArgvCmd {
 /// | `gpu_backend` | `gpu_arbiter_gpu_backend` |
 /// | `bind` | `gpu_arbiter_bind` |
 /// | `socket_path` | `gpu_arbiter_socket_path` |
+// The bool fields are independent TOML config toggles (1:1 with the table
+// above), not a state machine — splitting them into a builder/bitflags type
+// would break the flat `deny_unknown_fields` TOML schema for no readability
+// win.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -340,7 +347,7 @@ pub struct Config {
     /// eviction.
     pub vram_free_threshold_mb: u64,
     /// Slow backstop reconcile interval (seconds). Detection itself is
-    /// event-driven (cn_proc); this only covers dropped events.
+    /// event-driven (`cn_proc`); this only covers dropped events.
     pub reconcile_interval_s: u64,
 
     // ── detection ──────────────────────────────────────────────────────────
@@ -491,6 +498,7 @@ impl Config {
     /// Borrowed, not cloned: [`Config::units`] is computed once at load time (see
     /// [`Config::from_toml`]), so a reconcile pass or an HTTP request calling this
     /// several times per pass/request costs nothing beyond the initial synthesis.
+    #[must_use]
     pub fn resolved_units(&self) -> &[ManagedUnit] {
         &self.units
     }
@@ -500,6 +508,11 @@ impl Config {
     /// Normalizes [`Config::units`] immediately after deserializing (see
     /// [`synthesize_units`]) so every other constructor of a live `Config`
     /// (`load`, `Default`) produces a consistently-resolved unit list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] if `s` isn't valid TOML, or a known field has
+    /// the wrong type, or an unknown key is present (`deny_unknown_fields`).
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let mut cfg: Config = toml::from_str(s)?;
         cfg.units = synthesize_units(&cfg.ollama_unit, cfg.eager_ollama, &cfg.managed_units);
@@ -508,6 +521,11 @@ impl Config {
 
     /// Load config from a path. A missing file is **not** an error — it yields
     /// [`Config::default`] (the daemon is fully usable with zero config).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] if the file exists but can't be read (permission
+    /// denied, etc.) or fails to parse — see [`Config::from_toml`].
     pub fn load(path: &str) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(s) => Self::from_toml(&s),
@@ -569,10 +587,10 @@ mod tests {
     #[test]
     fn presence_keys_override() {
         let c = Config::from_toml(
-            r#"
+            "
             presence_detection = false
             presence_idle_threshold_s = 120
-            "#,
+            ",
         )
         .unwrap();
         assert!(!c.presence_detection);
@@ -582,10 +600,10 @@ mod tests {
     #[test]
     fn partial_toml_overrides_only_named_keys() {
         let c = Config::from_toml(
-            r#"
+            "
             port = 9000
             eager_ollama = false
-            "#,
+            ",
         )
         .unwrap();
         assert_eq!(c.port, 9000);

@@ -20,19 +20,21 @@ use crate::state::Claim;
 /// The literal marker every Steam game's reaper cmdline carries.
 const STEAM_MARKER: &str = "SteamLaunch AppId=";
 
-/// Extract the Steam AppId from a cmdline if it carries the `SteamLaunch
+/// Extract the Steam `AppId` from a cmdline if it carries the `SteamLaunch
 /// AppId=<id>` marker. Pure.
 ///
-/// The AppId is the run of ASCII digits immediately following the marker.
+/// The `AppId` is the run of ASCII digits immediately following the marker.
 /// Returns `None` if the marker is absent or no digits follow it.
+#[must_use]
 pub fn steam_appid(cmdline: &str) -> Option<String> {
     let rest = cmdline.split_once(STEAM_MARKER)?.1;
-    let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let id: String = rest.chars().take_while(char::is_ascii_digit).collect();
     if id.is_empty() { None } else { Some(id) }
 }
 
 /// First configured pattern whose `match` substring appears in the cmdline.
 /// Pure.
+#[must_use]
 pub fn match_pattern<'a>(cmdline: &str, patterns: &'a [GamePattern]) -> Option<&'a GamePattern> {
     patterns.iter().find(|p| cmdline.contains(&p.match_substr))
 }
@@ -43,6 +45,7 @@ pub fn match_pattern<'a>(cmdline: &str, patterns: &'a [GamePattern]) -> Option<&
 /// Order: Steam (if `detect_steam`) wins over the pattern list. The VRAM
 /// heuristic is handled separately (see [`heuristic_claim`]) because it keys off
 /// GPU process snapshots, not cmdlines.
+#[must_use]
 pub fn classify(cmdline: &str, cfg: &Config) -> Option<Claim> {
     if cfg.detect_steam
         && let Some(id) = steam_appid(cmdline)
@@ -113,6 +116,7 @@ fn strip_unit_suffix(unit: &str) -> &str {
 /// No substring matching anywhere — every check is an exact (case-insensitive)
 /// equality, so a broadly-named allowlist entry can't accidentally exempt an
 /// unrelated process that merely contains it.
+#[must_use]
 pub fn matches_allowlist(proc: &GpuGraphicsProc, allowlist: &[String]) -> bool {
     allowlist.iter().any(|entry| {
         proc.name.eq_ignore_ascii_case(entry)
@@ -135,6 +139,7 @@ pub fn matches_allowlist(proc: &GpuGraphicsProc, allowlist: &[String]) -> bool {
 ///
 /// Safe-by-construction: callers only feed *graphics* procs here, and Ollama is
 /// a *compute* proc — so this physically cannot flag Ollama.
+#[must_use]
 pub fn heuristic_claim(proc: &GpuGraphicsProc, cfg: &Config) -> Option<Claim> {
     if !cfg.vram_heuristic {
         return None;

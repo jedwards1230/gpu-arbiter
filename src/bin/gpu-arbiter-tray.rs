@@ -8,7 +8,7 @@
 //! lives here in the user session (where the session D-Bus — hence the tray host
 //! and notifications — actually exists).
 //!
-//! Pure-Rust, musl-clean: `ksni` (StatusNotifierItem) and `notify-rust` both go
+//! Pure-Rust, musl-clean: `ksni` (`StatusNotifierItem`) and `notify-rust` both go
 //! through `zbus` (no libdbus); `ureq` is built with no TLS (localhost http
 //! only). All three are Linux-only desktop integrations, so the real impl is
 //! `#[cfg(target_os = "linux")]` and the macOS dev build gets a no-op `main`.

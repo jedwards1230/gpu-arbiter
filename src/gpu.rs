@@ -118,6 +118,7 @@ impl GpuBackend {
     /// [`GpuBackend::Nvidia`] (the historical default, so nothing changes where
     /// detection can't see a GPU — e.g. macOS). Detection is best-effort and must
     /// never panic.
+    #[must_use]
     pub fn resolve(kind: crate::config::GpuBackendKind) -> Self {
         use crate::config::GpuBackendKind;
         match kind {
@@ -136,6 +137,11 @@ impl GpuBackend {
     }
 
     /// Total GPU memory usage (MiB). Async; dispatches to the vendor probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError`] if the vendor probe fails: `nvidia-smi` can't be
+    /// spawned, times out, exits non-zero, or its output doesn't parse.
     pub async fn query_memory(self) -> Result<GpuMemory, GpuError> {
         match self {
             GpuBackend::Nvidia => nvidia::query_memory().await,
@@ -148,6 +154,11 @@ impl GpuBackend {
     /// AMD has no simple per-proc VRAM via sysfs → returns an empty `Vec`
     /// best-effort (the heuristic degrades to seeing nothing this pass; it must
     /// not error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError`] on NVIDIA if `nvidia-smi` can't be spawned, times
+    /// out, exits non-zero, or its output doesn't parse. Never errors on AMD.
     pub async fn query_graphics_procs(self) -> Result<Vec<GpuGraphicsProc>, GpuError> {
         match self {
             GpuBackend::Nvidia => nvidia::query_graphics_procs().await,
@@ -159,6 +170,11 @@ impl GpuBackend {
     ///
     /// AMD has no simple per-proc VRAM via sysfs → returns an empty `Vec`
     /// best-effort (per-unit `vram_mb` is simply omitted; it must not error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError`] on NVIDIA if `nvidia-smi` can't be spawned, times
+    /// out, exits non-zero, or its output doesn't parse. Never errors on AMD.
     pub async fn query_compute_procs(self) -> Result<Vec<GpuGraphicsProc>, GpuError> {
         match self {
             GpuBackend::Nvidia => nvidia::query_compute_procs().await,
@@ -171,8 +187,7 @@ impl GpuBackend {
 /// (reads `PATH` + stats files); never panics.
 fn nvidia_smi_on_path() -> bool {
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join("nvidia-smi").is_file()))
-        .unwrap_or(false)
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join("nvidia-smi").is_file()))
 }
 
 /// Best-effort probe for an `amdgpu` DRM card (drives `auto` detection). A card is
@@ -207,6 +222,11 @@ fn amdgpu_card_present() -> bool {
 ///
 /// Expects a single line like `21500, 32768`. Multiple lines (multi-GPU) → the
 /// first line is used.
+///
+/// # Errors
+///
+/// Returns [`GpuError::Parse`] if `out` has no non-blank line, or the
+/// `memory.used`/`memory.total` columns are missing or not integers.
 pub fn parse_memory_csv(out: &str) -> Result<GpuMemory, GpuError> {
     let line = out
         .lines()
@@ -234,6 +254,7 @@ pub fn parse_memory_csv(out: &str) -> Result<GpuMemory, GpuError> {
 ///
 /// Lines that don't parse are skipped (best-effort). `[N/A]` VRAM cells parse
 /// as 0.
+#[must_use]
 pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
     out.lines()
         .filter_map(|line| {
@@ -266,6 +287,11 @@ pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
 /// MiB granularity NVIDIA already reports — sub-MiB remainders are dropped, which
 /// is fine for the free-threshold and attribution use cases. Surrounding
 /// whitespace (the trailing newline sysfs always appends) is trimmed.
+///
+/// # Errors
+///
+/// Returns [`GpuError::Parse`] if either byte-count string isn't a valid
+/// unsigned integer once trimmed.
 pub fn parse_vram_sysfs(used_bytes: &str, total_bytes: &str) -> Result<GpuMemory, GpuError> {
     let used = used_bytes
         .trim()
@@ -435,6 +461,7 @@ mod amd {
 /// Returns `None` when no matching compute proc is seen (so `/status` omits the
 /// field rather than reporting a misleading `0`). On AMD the compute list is
 /// always empty, so this always returns `None` (attribution degrades cleanly).
+#[must_use]
 pub fn vram_mb_matching(compute: &[GpuGraphicsProc], needle: &str) -> Option<u64> {
     let needle = needle.to_ascii_lowercase();
     let mut matched = compute
@@ -457,6 +484,7 @@ pub fn vram_mb_matching(compute: &[GpuGraphicsProc], needle: &str) -> Option<u64
 /// misleading `0` for a unit nothing was ever attributed to) — see
 /// [`unit_vram_sum`] for the eviction-gating counterpart, which needs an
 /// explicit `0` to mean "confirmed drained".
+#[must_use]
 pub fn vram_mb_by_cgroup(compute: &[GpuGraphicsProc], unit_name: &str) -> Option<u64> {
     let mut matched = compute
         .iter()
@@ -501,6 +529,7 @@ fn unit_vram_sum(compute: &[GpuGraphicsProc], unit_name: &str) -> u64 {
 /// - `None` when neither channel is available this poll (the compute query
 ///   failed, or the unit is command-driven with no `vram_match`) — the caller
 ///   falls back to the total-GPU-VRAM gate.
+#[must_use]
 pub fn attribute_unit_vram(
     compute: Option<&[GpuGraphicsProc]>,
     is_systemd: bool,
