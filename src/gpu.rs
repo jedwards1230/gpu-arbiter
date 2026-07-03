@@ -659,8 +659,13 @@ mod tests {
         assert_eq!(GpuBackend::resolve(GpuBackendKind::Amd), GpuBackend::Amd);
     }
 
+    // Smoke test, not a strict assertion: on a host that actually has GPU
+    // tooling (unlike macOS/CI), `resolve(Auto)` legitimately returns either
+    // variant depending on what's installed — the one universal contract this
+    // can assert is "never panics", with the specific-default assertion only
+    // firing when neither probe finds anything (the dev-host/CI case).
     #[test]
-    fn resolve_auto_never_panics_and_defaults_sanely() {
+    fn smoke_resolve_auto_never_panics_and_defaults_sanely() {
         // On macOS / CI there's no nvidia-smi and no /sys/class/drm → auto must
         // fall back to the historical Nvidia default (not panic).
         let b = GpuBackend::resolve(GpuBackendKind::Auto);

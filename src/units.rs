@@ -1214,10 +1214,19 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
     async fn start_by_name_resolves_and_starts() {
         // A Command-driven unit whose start_cmd touches a marker file — resolved
         // purely by name (as the reconcile task does for a ManualStart trigger).
+        // pid + thread id + nanos: pid alone isn't enough (a shared CI runner
+        // can have concurrent `cargo test` invocations), and thread id keeps
+        // this collision-free across parallel test threads within one process
+        // — same scheme as `evict_escalates_when_recheck_cannot_confirm_still_running`
+        // below and `reconcile::tests::marker_path`.
         let marker = std::env::temp_dir().join(format!(
-            "gpu-arbiter-start-by-name-{}-{:?}",
+            "gpu-arbiter-start-by-name-{}-{:?}-{:?}",
             std::process::id(),
+            std::thread::current().id(),
             std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = std::fs::remove_file(&marker);
         let cfg = Config::from_toml(&format!(

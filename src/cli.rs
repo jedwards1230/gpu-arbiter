@@ -651,6 +651,26 @@ pub fn render_status(v: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
+    /// A unique temp file path for a test-written config file, suffixed with
+    /// pid, thread id, and nanos: pid alone collides across concurrent `cargo
+    /// test` invocations on a shared runner (each process's own tests would
+    /// still share one fixed name), and thread id keeps this collision-free
+    /// across parallel test threads within one process (same pid, same
+    /// nanosecond is otherwise possible under cargo test's default parallel
+    /// runner) — same scheme as `reconcile::tests::marker_path` and
+    /// `units::tests`'s marker files.
+    fn unique_temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "gpu-arbiter-{tag}-{}-{:?}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     // ── parse_args ────────────────────────────────────────────────────────────
 
     #[test]
@@ -956,9 +976,9 @@ mod tests {
 
     #[test]
     fn check_config_parse_error_for_malformed_file() {
-        // Write a malformed TOML to a temp path and confirm a typed parse error.
-        let dir = std::env::temp_dir();
-        let path = dir.join("gpu-arbiter-checkcfg-test.toml");
+        // Write a malformed TOML to a unique temp path and confirm a typed
+        // parse error.
+        let path = unique_temp_path("checkcfg-test.toml");
         std::fs::write(&path, "port = \"not_a_number\"").unwrap();
         let err = check_config(path.to_str().unwrap()).unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)));
@@ -967,8 +987,7 @@ mod tests {
 
     #[test]
     fn check_config_ok_for_valid_file() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("gpu-arbiter-checkcfg-valid.toml");
+        let path = unique_temp_path("checkcfg-valid.toml");
         std::fs::write(&path, "port = 49000\n").unwrap();
         let out = check_config(path.to_str().unwrap()).unwrap();
         assert!(out.starts_with("OK: "));
