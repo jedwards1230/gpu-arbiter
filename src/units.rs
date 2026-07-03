@@ -146,6 +146,48 @@ pub enum EvictionOutcome {
     AlreadyClear,
 }
 
+/// The `outcome` label bucket for `gpu_arbiter_evictions_total{unit,outcome}`
+/// (#14). A durable counter, unlike the all-gauge metrics that came before it —
+/// journald on the deployment host rotates in hours, so this is the only record
+/// of whether an eviction was graceful or had to be force-killed once that log
+/// window has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionMetricOutcome {
+    /// [`EvictionOutcome::Freed`] — VRAM drained gracefully.
+    Graceful,
+    /// [`EvictionOutcome::Escalated`] — SIGKILL was issued.
+    Sigkill,
+    /// The eviction attempt itself errored ([`UnitError`]).
+    Error,
+}
+
+impl EvictionMetricOutcome {
+    /// The Prometheus label value (`"graceful"`/`"sigkill"`/`"error"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            EvictionMetricOutcome::Graceful => "graceful",
+            EvictionMetricOutcome::Sigkill => "sigkill",
+            EvictionMetricOutcome::Error => "error",
+        }
+    }
+}
+
+/// Map an [`evict`]/[`evict_by_name`] result to the counter bucket it should
+/// increment, or `None` when nothing was actually evicted
+/// ([`EvictionOutcome::AlreadyClear`] — the unit wasn't running, so no eviction
+/// event occurred and `gpu_arbiter_evictions_total` must not be inflated by a
+/// no-op). Pure — unit-tested; feeds [`crate::state::Metrics::record_eviction`].
+pub fn eviction_metric_outcome(
+    result: &Result<EvictionOutcome, UnitError>,
+) -> Option<EvictionMetricOutcome> {
+    match result {
+        Ok(EvictionOutcome::Freed) => Some(EvictionMetricOutcome::Graceful),
+        Ok(EvictionOutcome::Escalated) => Some(EvictionMetricOutcome::Sigkill),
+        Ok(EvictionOutcome::AlreadyClear) => None,
+        Err(_) => Some(EvictionMetricOutcome::Error),
+    }
+}
+
 /// How long to sleep between `nvidia-smi` polls while waiting for VRAM to drain
 /// after `systemctl stop`. Kept well below the per-second teardown so a graceful
 /// release is caught promptly, yet coarse enough not to hammer `nvidia-smi`.
@@ -827,6 +869,49 @@ mod tests {
             ),
             EvictionStep::Escalate
         );
+    }
+
+    // ── eviction outcome → metric bucket mapping (#14) ──────────────────────
+
+    #[test]
+    fn eviction_metric_outcome_maps_freed_and_escalated() {
+        assert_eq!(
+            eviction_metric_outcome(&Ok(EvictionOutcome::Freed)),
+            Some(EvictionMetricOutcome::Graceful)
+        );
+        assert_eq!(
+            eviction_metric_outcome(&Ok(EvictionOutcome::Escalated)),
+            Some(EvictionMetricOutcome::Sigkill)
+        );
+    }
+
+    #[test]
+    fn eviction_metric_outcome_already_clear_is_not_counted() {
+        // A no-op eviction (unit wasn't running) must not inflate the counter.
+        assert_eq!(
+            eviction_metric_outcome(&Ok(EvictionOutcome::AlreadyClear)),
+            None
+        );
+    }
+
+    #[test]
+    fn eviction_metric_outcome_error_maps_to_error_bucket() {
+        let err = UnitError::Exit {
+            action: "stop",
+            unit: "fake.service".to_string(),
+            detail: "boom".to_string(),
+        };
+        assert_eq!(
+            eviction_metric_outcome(&Err(err)),
+            Some(EvictionMetricOutcome::Error)
+        );
+    }
+
+    #[test]
+    fn eviction_metric_outcome_labels() {
+        assert_eq!(EvictionMetricOutcome::Graceful.label(), "graceful");
+        assert_eq!(EvictionMetricOutcome::Sigkill.label(), "sigkill");
+        assert_eq!(EvictionMetricOutcome::Error.label(), "error");
     }
 
     #[test]

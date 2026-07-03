@@ -50,7 +50,7 @@
 //! on the host.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 /// Shared presence signal, written by the (Linux) watcher task and read by the
 /// snapshot/metrics path. Cheap to clone (`Arc`-backed) and lock-free.
@@ -67,8 +67,10 @@ pub struct PresenceMonitor {
     /// Whether enumeration + watching is currently working. `false` ⇒ presence is
     /// unknown (fail-safe: callers must not suppress alerts on unknown presence).
     healthy: Arc<AtomicBool>,
-    /// Count of physical human-input devices currently watched.
-    device_count: Arc<AtomicI64>,
+    /// Count of physical human-input devices currently watched. `AtomicU32`
+    /// directly (#37) — a device count is never negative, so there's no
+    /// `i64`-then-`max(0) as u32` clamp/cast dance to carry around.
+    device_count: Arc<AtomicU32>,
 }
 
 impl PresenceMonitor {
@@ -79,7 +81,7 @@ impl PresenceMonitor {
         Self {
             last_input: Arc::new(AtomicI64::new(start_unix)),
             healthy: Arc::new(AtomicBool::new(false)),
-            device_count: Arc::new(AtomicI64::new(0)),
+            device_count: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -97,7 +99,7 @@ impl PresenceMonitor {
 
     /// Number of physical human-input devices currently watched.
     pub fn device_count(&self) -> u32 {
-        self.device_count.load(Ordering::Relaxed).max(0) as u32
+        self.device_count.load(Ordering::Relaxed)
     }
 
     /// Whether the monitor is healthy (enumeration + watching working). `false`
@@ -114,10 +116,14 @@ impl PresenceMonitor {
     }
 
     /// Set the watched-device count (watcher task internal). Linux-only writer;
-    /// dead on the non-Linux stub build.
+    /// dead on the non-Linux stub build. `n` (a `Vec`/`HashMap` length) is
+    /// saturated into `u32` rather than truncated — a device count in the
+    /// billions is impossible in practice, but `try_from` keeps that an
+    /// explicit, panic-free decision instead of a silent wraparound.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_device_count(&self, n: usize) {
-        self.device_count.store(n as i64, Ordering::Relaxed);
+        self.device_count
+            .store(u32::try_from(n).unwrap_or(u32::MAX), Ordering::Relaxed);
     }
 }
 

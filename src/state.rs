@@ -80,6 +80,12 @@ pub enum ReconcileTrigger {
     /// The periodic ~30 s backstop timer — recomputes truth even if events
     /// were dropped.
     Timer,
+    /// The one-off synchronous pass `main` runs before spawning the reconcile
+    /// task, HTTP server, or netlink listener — the "a restart never starts a
+    /// managed unit into a live game" guarantee. Distinct from [`Self::Timer`]
+    /// only for [`Self::pass_trigger`]'s metric bucketing; behaviorally it is
+    /// handled identically to every other trigger.
+    Startup,
     /// `POST /units/{unit}/start` (or the `/ollama/start` alias): start `unit`
     /// now via its supervisor. Routed through the reconcile task — the sole
     /// caller of [`crate::units::start`]/[`crate::units::evict`] — so an HTTP
@@ -118,6 +124,23 @@ impl ReconcileTrigger {
             ReconcileTrigger::Timer => "timer",
             ReconcileTrigger::ManualStart { .. } => "manual_start",
             ReconcileTrigger::ManualStop { .. } => "manual_stop",
+            ReconcileTrigger::Startup => "startup",
+        }
+    }
+
+    /// The coarser [`PassTrigger`] metric bucket for this trigger — feeds
+    /// `gpu_arbiter_reconcile_passes_total{trigger}` (#14). Coarser than
+    /// [`Self::label`]: `ManualStart`/`ManualStop` both bucket to
+    /// [`PassTrigger::Manual`] (the metric doesn't need to distinguish a manual
+    /// start from a manual stop, only "an operator drove this pass").
+    pub fn pass_trigger(&self) -> PassTrigger {
+        match self {
+            ReconcileTrigger::ProcEvent => PassTrigger::ProcEvent,
+            ReconcileTrigger::Timer => PassTrigger::Timer,
+            ReconcileTrigger::ManualStart { .. } | ReconcileTrigger::ManualStop { .. } => {
+                PassTrigger::Manual
+            }
+            ReconcileTrigger::Startup => PassTrigger::Startup,
         }
     }
 }
@@ -267,6 +290,119 @@ pub struct ArbiterState {
     /// `true` if the most recent eviction pass had at least one unit fail —
     /// feeds [`StatusSnapshot::degraded`].
     pub degraded: bool,
+    /// Monotonic Prometheus counters (#14) — durable history across
+    /// journald's short retention on the deployment host. See [`Metrics`].
+    pub metrics: Metrics,
+}
+
+/// Monotonic Prometheus counters accumulated over the daemon's process
+/// lifetime, rendered by `gpu_arbiter_evictions_total` /
+/// `gpu_arbiter_unit_restarts_total` / `gpu_arbiter_reconcile_passes_total`
+/// (#14; `gpu_arbiter_proc_events_dropped_total` is tracked separately in
+/// [`crate::procmon`], which has no [`ArbiterState`] access).
+///
+/// Held in [`ArbiterState`] behind its `RwLock`, exactly like every other
+/// field — the reconcile task is the sole writer, so incrementing a counter is
+/// just another brief, synchronous mutation under [`write_state`]. **Never
+/// reset except by a daemon restart**: every `# HELP` line on these metrics
+/// says so explicitly, because a Prometheus consumer must use `rate()`/
+/// `increase()` rather than comparing raw values across a restart.
+#[derive(Debug, Clone, Default)]
+pub struct Metrics {
+    /// Per-unit eviction outcome counts, keyed by unit name.
+    pub evictions: std::collections::HashMap<String, EvictionCounts>,
+    /// Per-unit count of successful managed-unit starts driven by the daemon
+    /// (the ensure-running eager restore — which also covers the
+    /// `gaming → available` restart, see [`crate::reconcile::reconcile`]'s
+    /// `UnitAction::Restart` docs — and a manual `POST /units/{unit}/start`).
+    pub unit_restarts: std::collections::HashMap<String, u64>,
+    /// Reconcile passes run, bucketed by [`PassTrigger`].
+    pub reconcile_passes: ReconcilePassCounts,
+}
+
+impl Metrics {
+    /// Record one eviction attempt's outcome for `unit`. Callers get `outcome`
+    /// from [`crate::units::eviction_metric_outcome`], which already excludes
+    /// the "nothing to evict" case — every call here represents a real
+    /// eviction event.
+    pub fn record_eviction(&mut self, unit: &str, outcome: crate::units::EvictionMetricOutcome) {
+        use crate::units::EvictionMetricOutcome;
+        let counts = self.evictions.entry(unit.to_string()).or_default();
+        match outcome {
+            EvictionMetricOutcome::Graceful => counts.graceful += 1,
+            EvictionMetricOutcome::Sigkill => counts.sigkill += 1,
+            EvictionMetricOutcome::Error => counts.error += 1,
+        }
+    }
+
+    /// Record one successful managed-unit start for `unit`.
+    pub fn record_unit_restart(&mut self, unit: &str) {
+        *self.unit_restarts.entry(unit.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record one reconcile pass under `trigger`'s bucket.
+    pub fn record_reconcile_pass(&mut self, trigger: PassTrigger) {
+        match trigger {
+            PassTrigger::ProcEvent => self.reconcile_passes.proc_event += 1,
+            PassTrigger::Timer => self.reconcile_passes.timer += 1,
+            PassTrigger::Manual => self.reconcile_passes.manual += 1,
+            PassTrigger::Startup => self.reconcile_passes.startup += 1,
+        }
+    }
+}
+
+/// One unit's cumulative eviction outcomes — the `{outcome=...}` label values
+/// for `gpu_arbiter_evictions_total{unit}`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvictionCounts {
+    /// Count of gracefully-freed evictions (VRAM drained within the timeout).
+    pub graceful: u64,
+    /// Count of evictions that needed a SIGKILL escalation.
+    pub sigkill: u64,
+    /// Count of eviction attempts that errored.
+    pub error: u64,
+}
+
+/// Cumulative reconcile-pass counts by trigger category — the `{trigger=...}`
+/// label values for `gpu_arbiter_reconcile_passes_total`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReconcilePassCounts {
+    /// Passes driven by a debounced `cn_proc` exec/exit event.
+    pub proc_event: u64,
+    /// Passes driven by the periodic backstop timer.
+    pub timer: u64,
+    /// Passes driven by a `POST /units/{unit}/start|stop` (or `/ollama/*`
+    /// alias) manual trigger.
+    pub manual: u64,
+    /// The one-off startup pass `main` runs before any other task starts.
+    pub startup: u64,
+}
+
+/// The `trigger` label bucket for `gpu_arbiter_reconcile_passes_total` (#14).
+/// Coarser than [`ReconcileTrigger`] itself — see
+/// [`ReconcileTrigger::pass_trigger`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassTrigger {
+    /// A debounced `cn_proc` exec/exit event.
+    ProcEvent,
+    /// The periodic backstop timer.
+    Timer,
+    /// A manual `POST /units/{unit}/start|stop` (either direction).
+    Manual,
+    /// The one-off startup pass.
+    Startup,
+}
+
+impl PassTrigger {
+    /// The Prometheus label value (`"proc_event"`/`"timer"`/`"manual"`/`"startup"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            PassTrigger::ProcEvent => "proc_event",
+            PassTrigger::Timer => "timer",
+            PassTrigger::Manual => "manual",
+            PassTrigger::Startup => "startup",
+        }
+    }
 }
 
 /// The local-presence view embedded in [`ArbiterState`] / [`StatusSnapshot`],
@@ -297,6 +433,7 @@ impl Default for ArbiterState {
             presence: Presence::default(),
             held: HashSet::new(),
             degraded: false,
+            metrics: Metrics::default(),
         }
     }
 }
@@ -594,5 +731,94 @@ mod tests {
         assert_eq!(s.since, t0);
         s.set_state(State::Gaming); // change
         assert!(s.since >= t0);
+    }
+
+    // ── Metrics (#14) ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn record_eviction_accumulates_per_unit_per_outcome() {
+        use crate::units::EvictionMetricOutcome;
+        let mut m = Metrics::default();
+        m.record_eviction("ollama.service", EvictionMetricOutcome::Graceful);
+        m.record_eviction("ollama.service", EvictionMetricOutcome::Graceful);
+        m.record_eviction("ollama.service", EvictionMetricOutcome::Sigkill);
+        m.record_eviction("vllm.service", EvictionMetricOutcome::Error);
+
+        let ollama = m.evictions["ollama.service"];
+        assert_eq!(ollama.graceful, 2);
+        assert_eq!(ollama.sigkill, 1);
+        assert_eq!(ollama.error, 0);
+        let vllm = m.evictions["vllm.service"];
+        assert_eq!(vllm.error, 1);
+    }
+
+    #[test]
+    fn record_unit_restart_accumulates_per_unit() {
+        let mut m = Metrics::default();
+        m.record_unit_restart("ollama.service");
+        m.record_unit_restart("ollama.service");
+        m.record_unit_restart("vllm.service");
+        assert_eq!(m.unit_restarts["ollama.service"], 2);
+        assert_eq!(m.unit_restarts["vllm.service"], 1);
+    }
+
+    #[test]
+    fn record_reconcile_pass_buckets_by_trigger() {
+        let mut m = Metrics::default();
+        m.record_reconcile_pass(PassTrigger::ProcEvent);
+        m.record_reconcile_pass(PassTrigger::ProcEvent);
+        m.record_reconcile_pass(PassTrigger::Timer);
+        m.record_reconcile_pass(PassTrigger::Manual);
+        m.record_reconcile_pass(PassTrigger::Startup);
+        assert_eq!(m.reconcile_passes.proc_event, 2);
+        assert_eq!(m.reconcile_passes.timer, 1);
+        assert_eq!(m.reconcile_passes.manual, 1);
+        assert_eq!(m.reconcile_passes.startup, 1);
+    }
+
+    #[test]
+    fn reconcile_trigger_pass_bucket_mapping() {
+        // ManualStart/ManualStop both bucket to Manual; every other variant maps
+        // 1:1 to its own PassTrigger.
+        let (start_reply, _) = oneshot::channel();
+        let (stop_reply, _) = oneshot::channel();
+        assert_eq!(
+            ReconcileTrigger::ProcEvent.pass_trigger(),
+            PassTrigger::ProcEvent
+        );
+        assert_eq!(ReconcileTrigger::Timer.pass_trigger(), PassTrigger::Timer);
+        assert_eq!(
+            ReconcileTrigger::Startup.pass_trigger(),
+            PassTrigger::Startup
+        );
+        assert_eq!(
+            ReconcileTrigger::ManualStart {
+                unit: "x".to_string(),
+                reply: start_reply
+            }
+            .pass_trigger(),
+            PassTrigger::Manual
+        );
+        assert_eq!(
+            ReconcileTrigger::ManualStop {
+                unit: "x".to_string(),
+                reply: stop_reply
+            }
+            .pass_trigger(),
+            PassTrigger::Manual
+        );
+    }
+
+    #[test]
+    fn pass_trigger_labels() {
+        assert_eq!(PassTrigger::ProcEvent.label(), "proc_event");
+        assert_eq!(PassTrigger::Timer.label(), "timer");
+        assert_eq!(PassTrigger::Manual.label(), "manual");
+        assert_eq!(PassTrigger::Startup.label(), "startup");
+    }
+
+    #[test]
+    fn reconcile_trigger_label_covers_startup() {
+        assert_eq!(ReconcileTrigger::Startup.label(), "startup");
     }
 }
