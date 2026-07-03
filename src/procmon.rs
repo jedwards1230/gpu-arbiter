@@ -32,9 +32,37 @@
 //! **Linux-only**: netlink + cn_proc are Linux kernel interfaces. A non-Linux
 //! stub keeps the crate compiling and `cargo test`-able on macOS.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tokio::sync::mpsc;
 
 use crate::state::ReconcileTrigger;
+
+/// Cumulative count of dropped-event occurrences since daemon start (#14): one
+/// increment per `ENOBUFS` recv (kernel receive-buffer overflow, see
+/// [`is_enobufs`]) **plus** one per full-trigger-channel `try_send` drop (the
+/// reconcile task is still mid-pass). Both are already logged-and-continued as
+/// non-fatal (see the module docs). Note an `ENOBUFS` occurrence can itself
+/// represent more than one lost kernel event — the kernel doesn't report how
+/// many — so this counts drop *occurrences*, a lower bound on events actually
+/// missed, not an exact per-event tally. Still enough to make "you're missing
+/// events" visible in `/metrics` as `gpu_arbiter_proc_events_dropped_total`,
+/// since journald's short retention on the deployment host otherwise loses the
+/// log lines within hours.
+///
+/// A plain module-level atomic rather than a field on [`crate::state::ArbiterState`]:
+/// `procmon::run` has no access to `ArbiterState` (by design — it only ever holds
+/// a trigger-channel `Sender`, never touches unit/GPU state directly), and a
+/// `Relaxed` counter needs no lock to begin with. `/metrics` reads it directly via
+/// [`proc_events_dropped`]. Never reset except by a daemon restart, exactly like
+/// every other counter in `/metrics`.
+static PROC_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current dropped-event count for `/metrics`. Cheap, lock-free,
+/// cross-platform (stays `0` on non-Linux, where nothing ever increments it).
+pub fn proc_events_dropped() -> u64 {
+    PROC_EVENTS_DROPPED.load(Ordering::Relaxed)
+}
 
 /// `proc_event` `what` discriminants from the kernel's `linux/cn_proc.h`. These
 /// are a **stable kernel ABI** (the bit values have never changed), so we mirror
@@ -215,6 +243,7 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
                     error = %e,
                     "cn_proc recv overflowed (ENOBUFS); dropped some events, continuing (backstop covers the gap)"
                 );
+                PROC_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             Err(source) => {
@@ -253,6 +282,7 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
                             ?kind,
                             "reconcile trigger channel full; dropping (backstop covers it)"
                         );
+                        PROC_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         tracing::info!("reconcile channel closed; cn_proc listener exiting");
@@ -333,6 +363,18 @@ pub fn event_kind_from_what(what: u32) -> ProcEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_events_dropped_is_readable_and_monotonic() {
+        // The real increments only happen inside the Linux-only netlink recv
+        // loop (not independently unit-testable here), so this proves the
+        // read/increment API itself. Doesn't assume a starting value of 0 —
+        // this is a process-wide static, and other tests in this binary may
+        // run concurrently against it.
+        let before = proc_events_dropped();
+        PROC_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+        assert!(proc_events_dropped() > before);
+    }
 
     #[test]
     fn what_maps_exec_and_exit() {

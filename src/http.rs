@@ -31,7 +31,7 @@ use axum::{Router, response::IntoResponse};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::state::{ArbiterState, ReconcileTrigger, StatusSnapshot, read_state};
+use crate::state::{ArbiterState, Metrics, ReconcileTrigger, StatusSnapshot, read_state};
 
 /// Shared application state handed to every handler.
 ///
@@ -81,6 +81,9 @@ pub fn router(app: AppState) -> Router {
 pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
     let guard = read_state(&app.state);
     let snap = guard.snapshot();
+    // Cheap clone of the counters (#14) — small HashMaps, one entry per managed
+    // unit — so the render itself stays lock-free like `snap`.
+    let arbiter_metrics = guard.metrics.clone();
     // Read the state-entered instant straight off live state as whole unix
     // seconds — avoids round-tripping the `/status` RFC-3339 string back to a
     // timestamp. Pre-epoch (never produced) clamps to 0. `i64` (#37), the same
@@ -98,19 +101,32 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let threshold_s = app.cfg.presence_idle_threshold_s as i64;
+    // procmon's dropped-event counter lives outside ArbiterState (#14's
+    // module docs explain why) — read it here, at the same impure edge as
+    // `now_unix`, and pass it in like every other clock/counter read.
+    let proc_events_dropped = crate::procmon::proc_events_dropped();
     (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        render_metrics(&snap, since_unix, now_unix, threshold_s),
+        render_metrics(
+            &snap,
+            &arbiter_metrics,
+            since_unix,
+            now_unix,
+            threshold_s,
+            proc_events_dropped,
+        ),
     )
 }
 
 /// Render the Prometheus text-exposition body from a [`StatusSnapshot`] plus the
 /// unix timestamp (whole seconds) the current state was entered.
 ///
-/// Pure & cross-platform — unit-tested on macOS. Every metric is a gauge:
+/// Pure & cross-platform — unit-tested on macOS.
+///
+/// ## Gauges (point-in-time state)
 ///
 /// - `gpu_arbiter_up` — always `1` (the daemon answered the scrape).
 /// - `gpu_arbiter_build_info{version}` — constant `1`; build in the label.
@@ -135,13 +151,41 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
 ///   devices (virtual streamed devices excluded).
 /// - `gpu_arbiter_input_monitor_up` — `1` if presence detection is healthy.
 ///
-/// `now_unix` and `presence_threshold_s` are passed in (not read from a clock)
-/// so the renderer stays pure — same discipline as `since_unix`.
+/// ## Counters (#14 — durable history a gauge can't provide)
+///
+/// journald on the deployment host rotates in hours, so these are the only
+/// record of eviction/restart/reconcile activity that survives longer than
+/// that. **Monotonic for the life of the process; a daemon restart resets
+/// every one of them to 0** — use `rate()`/`increase()` in Prometheus, never
+/// compare raw values across a restart (each metric's `# HELP` text repeats
+/// this).
+///
+/// - `gpu_arbiter_evictions_total{unit,outcome}` — cumulative eviction
+///   attempts, `outcome` ∈ `graceful`/`sigkill`/`error`. A no-op eviction (the
+///   unit wasn't running) is not counted — see
+///   [`crate::units::eviction_metric_outcome`].
+/// - `gpu_arbiter_unit_restarts_total{unit}` — cumulative successful
+///   managed-unit starts driven by the daemon (the ensure-running eager
+///   restore — which also covers the `gaming → available` restore, see
+///   [`crate::reconcile::reconcile`]'s docs — plus a manual
+///   `POST /units/{unit}/start`).
+/// - `gpu_arbiter_proc_events_dropped_total` — cumulative `cn_proc`
+///   drop-occurrence count: kernel `ENOBUFS` overflow plus full-trigger-channel
+///   `try_send` drops. See [`crate::procmon::proc_events_dropped`]'s docs for
+///   why this is a lower bound, not an exact per-event tally.
+/// - `gpu_arbiter_reconcile_passes_total{trigger}` — cumulative reconcile
+///   passes, `trigger` ∈ `proc_event`/`timer`/`manual`/`startup`.
+///
+/// `now_unix`, `presence_threshold_s`, and `proc_events_dropped` are passed in
+/// (not read from a clock/global) so the renderer stays pure — same discipline
+/// as `since_unix`.
 pub fn render_metrics(
     snap: &StatusSnapshot,
+    metrics: &Metrics,
     since_unix: i64,
     now_unix: i64,
     presence_threshold_s: i64,
+    proc_events_dropped: u64,
 ) -> String {
     let mut o = String::with_capacity(1024);
 
@@ -302,6 +346,105 @@ pub fn render_metrics(
         u8::from(snap.input_monitor_up),
     );
 
+    // ── counters (#14): durable history journald's short retention can't give ──
+
+    const MONOTONIC_NOTE: &str = "Monotonic for the process lifetime; a daemon restart resets this to 0 — use rate()/increase(), never compare raw values across a restart.";
+
+    metric_header(
+        &mut o,
+        "counter",
+        "gpu_arbiter_evictions_total",
+        &format!(
+            "Cumulative eviction attempts by outcome (graceful|sigkill|error). A no-op (nothing to evict) is not counted. {MONOTONIC_NOTE}"
+        ),
+    );
+    // Sorted for deterministic exposition-text order (HashMap iteration order
+    // is otherwise unspecified) — matters for stable diffs/tests, not for
+    // Prometheus itself.
+    let mut eviction_units: Vec<&String> = metrics.evictions.keys().collect();
+    eviction_units.sort();
+    for unit in eviction_units {
+        let counts = &metrics.evictions[unit];
+        sample(
+            &mut o,
+            "gpu_arbiter_evictions_total",
+            &[("unit", unit), ("outcome", "graceful")],
+            counts.graceful,
+        );
+        sample(
+            &mut o,
+            "gpu_arbiter_evictions_total",
+            &[("unit", unit), ("outcome", "sigkill")],
+            counts.sigkill,
+        );
+        sample(
+            &mut o,
+            "gpu_arbiter_evictions_total",
+            &[("unit", unit), ("outcome", "error")],
+            counts.error,
+        );
+    }
+
+    metric_header(
+        &mut o,
+        "counter",
+        "gpu_arbiter_unit_restarts_total",
+        &format!(
+            "Cumulative successful managed-unit starts driven by the daemon (eager restore or manual start). {MONOTONIC_NOTE}"
+        ),
+    );
+    let mut restart_units: Vec<&String> = metrics.unit_restarts.keys().collect();
+    restart_units.sort();
+    for unit in restart_units {
+        sample(
+            &mut o,
+            "gpu_arbiter_unit_restarts_total",
+            &[("unit", unit)],
+            metrics.unit_restarts[unit],
+        );
+    }
+
+    counter(
+        &mut o,
+        "gpu_arbiter_proc_events_dropped_total",
+        &format!(
+            "Cumulative cn_proc drop occurrences (kernel ENOBUFS overflow + full-channel try_send drops); the backstop timer covers the resulting gap. {MONOTONIC_NOTE}"
+        ),
+        &[],
+        proc_events_dropped,
+    );
+
+    metric_header(
+        &mut o,
+        "counter",
+        "gpu_arbiter_reconcile_passes_total",
+        &format!("Cumulative reconcile passes by trigger. {MONOTONIC_NOTE}"),
+    );
+    sample(
+        &mut o,
+        "gpu_arbiter_reconcile_passes_total",
+        &[("trigger", "proc_event")],
+        metrics.reconcile_passes.proc_event,
+    );
+    sample(
+        &mut o,
+        "gpu_arbiter_reconcile_passes_total",
+        &[("trigger", "timer")],
+        metrics.reconcile_passes.timer,
+    );
+    sample(
+        &mut o,
+        "gpu_arbiter_reconcile_passes_total",
+        &[("trigger", "manual")],
+        metrics.reconcile_passes.manual,
+    );
+    sample(
+        &mut o,
+        "gpu_arbiter_reconcile_passes_total",
+        &[("trigger", "startup")],
+        metrics.reconcile_passes.startup,
+    );
+
     o
 }
 
@@ -321,11 +464,27 @@ fn gauge(
     sample(o, name, labels, value);
 }
 
+/// Emit a single-sample counter: the `# HELP`/`# TYPE counter` preamble plus one
+/// `name{labels} value` line (used by `gpu_arbiter_proc_events_dropped_total`,
+/// #14's only counter with no labels). Every other counter has a per-unit or
+/// per-trigger label set — those call [`metric_header`] once and [`sample`] per
+/// line instead, exactly like [`gauge`]'s multi-sample metrics.
+fn counter(
+    o: &mut String,
+    name: &str,
+    help: &str,
+    labels: &[(&str, &str)],
+    value: impl std::fmt::Display,
+) {
+    metric_header(o, "counter", name, help);
+    sample(o, name, labels, value);
+}
+
 /// The two-line `# HELP <name> <help>` / `# TYPE <name> <kind>` preamble every
 /// Prometheus metric needs, emitted **exactly once** per metric name — the
-/// duplication [`gauge`]/[`sample`] replace (previously each of HELP/TYPE/sample
-/// was a separate hand-rolled `writeln!`, so a metric's name string appeared
-/// three times over).
+/// duplication [`gauge`]/[`counter`]/[`sample`] replace (previously each of
+/// HELP/TYPE/sample was a separate hand-rolled `writeln!`, so a metric's name
+/// string appeared three times over).
 fn metric_header(o: &mut String, kind: &str, name: &str, help: &str) {
     use std::fmt::Write as _;
     let _ = writeln!(o, "# HELP {name} {help}");
@@ -700,7 +859,14 @@ mod tests {
             degraded: false,
         };
         // now = last_input + 30s, threshold 600s → present.
-        let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
+        let out = render_metrics(
+            &snap,
+            &Metrics::default(),
+            1_700_000_000,
+            1_700_000_000,
+            600,
+            0,
+        );
 
         assert!(out.contains("gpu_arbiter_up 1"));
         assert!(out.contains("gpu_arbiter_build_info{version=\"1.2.3\"} 1"));
@@ -749,7 +915,14 @@ mod tests {
             degraded: false,
         };
         // now = last_input + 3600s, threshold 600s → absent.
-        let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
+        let out = render_metrics(
+            &snap,
+            &Metrics::default(),
+            1_700_000_000,
+            1_700_000_000,
+            600,
+            0,
+        );
 
         assert!(out.contains("gpu_arbiter_gaming 0"));
         assert!(out.contains("gpu_arbiter_state{state=\"available\"} 1"));
@@ -785,7 +958,14 @@ mod tests {
             input_monitor_up: false,
             degraded: false,
         };
-        let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
+        let out = render_metrics(
+            &snap,
+            &Metrics::default(),
+            1_700_000_000,
+            1_700_000_000,
+            600,
+            0,
+        );
         assert!(out.contains("gpu_arbiter_local_present 0"));
         assert!(out.contains("gpu_arbiter_input_monitor_up 0"));
         assert!(out.contains("gpu_arbiter_physical_input_devices 0"));
@@ -809,7 +989,16 @@ mod tests {
             input_monitor_up: true,
             degraded: false,
         };
-        let out = render_metrics(&snap, 1_700_000_000, 1_700_000_000, 600);
+        // A populated Metrics (#14) + a nonzero drop count so the well-formedness
+        // sweep below also exercises every counter line, not just the gauges.
+        let mut metrics = Metrics::default();
+        metrics.record_eviction(
+            "ollama.service",
+            crate::units::EvictionMetricOutcome::Graceful,
+        );
+        metrics.record_unit_restart("ollama.service");
+        metrics.record_reconcile_pass(crate::state::PassTrigger::Timer);
+        let out = render_metrics(&snap, &metrics, 1_700_000_000, 1_700_000_000, 600, 3);
         for line in out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
             // "metric_name[{labels}] value" — split on the LAST space.
             let (name, value) = line.rsplit_once(' ').expect("sample line has a value");
@@ -833,5 +1022,126 @@ mod tests {
     fn esc_escapes_quote_and_backslash() {
         assert_eq!(esc("steam:440"), "steam:440");
         assert_eq!(esc(r#"a"b\c"#), r#"a\"b\\c"#);
+    }
+
+    // ── counter rendering (#14) ─────────────────────────────────────────────
+
+    fn empty_snapshot() -> StatusSnapshot {
+        StatusSnapshot {
+            version: "0.0.0".into(),
+            state: State::Available,
+            claims: vec![],
+            units: vec![],
+            ollama: UnitStatus::default(),
+            gpu_vram_used_mb: 0,
+            gpu_vram_total_mb: 0,
+            since: "1970-01-01T00:00:00Z".into(),
+            local_input_last_unix: 0,
+            physical_input_devices: 0,
+            input_monitor_up: true,
+            degraded: false,
+        }
+    }
+
+    #[test]
+    fn render_metrics_declares_counter_type_for_new_metrics() {
+        let out = render_metrics(&empty_snapshot(), &Metrics::default(), 0, 0, 600, 0);
+        for name in [
+            "gpu_arbiter_evictions_total",
+            "gpu_arbiter_unit_restarts_total",
+            "gpu_arbiter_proc_events_dropped_total",
+            "gpu_arbiter_reconcile_passes_total",
+        ] {
+            assert!(
+                out.contains(&format!("# TYPE {name} counter")),
+                "missing `# TYPE {name} counter` in:\n{out}"
+            );
+        }
+        // Every existing metric is still declared a gauge (no accidental
+        // reclassification while wiring the new counters in).
+        assert!(out.contains("# TYPE gpu_arbiter_up gauge"));
+        assert!(out.contains("# TYPE gpu_arbiter_state gauge"));
+    }
+
+    #[test]
+    fn render_metrics_evictions_total_per_unit_per_outcome() {
+        use crate::units::EvictionMetricOutcome;
+        let mut metrics = Metrics::default();
+        metrics.record_eviction("ollama.service", EvictionMetricOutcome::Graceful);
+        metrics.record_eviction("ollama.service", EvictionMetricOutcome::Graceful);
+        metrics.record_eviction("ollama.service", EvictionMetricOutcome::Sigkill);
+        metrics.record_eviction("vllm.service", EvictionMetricOutcome::Error);
+        let out = render_metrics(&empty_snapshot(), &metrics, 0, 0, 600, 0);
+
+        assert!(out.contains(
+            "gpu_arbiter_evictions_total{unit=\"ollama.service\",outcome=\"graceful\"} 2"
+        ));
+        assert!(out.contains(
+            "gpu_arbiter_evictions_total{unit=\"ollama.service\",outcome=\"sigkill\"} 1"
+        ));
+        // A unit with zero of a given outcome still gets the sample line at 0
+        // (not omitted) — Prometheus best practice for stable rate() series.
+        assert!(
+            out.contains(
+                "gpu_arbiter_evictions_total{unit=\"ollama.service\",outcome=\"error\"} 0"
+            )
+        );
+        assert!(
+            out.contains("gpu_arbiter_evictions_total{unit=\"vllm.service\",outcome=\"error\"} 1")
+        );
+        // A unit that has never had an eviction event has no series at all
+        // (not zero-populated from the config — Metrics only knows about units
+        // it has actually observed an outcome for).
+        assert!(!out.contains("unit=\"never-evicted.service\""));
+    }
+
+    #[test]
+    fn render_metrics_unit_restarts_total_per_unit() {
+        let mut metrics = Metrics::default();
+        metrics.record_unit_restart("ollama.service");
+        metrics.record_unit_restart("ollama.service");
+        metrics.record_unit_restart("vllm.service");
+        let out = render_metrics(&empty_snapshot(), &metrics, 0, 0, 600, 0);
+        assert!(out.contains("gpu_arbiter_unit_restarts_total{unit=\"ollama.service\"} 2"));
+        assert!(out.contains("gpu_arbiter_unit_restarts_total{unit=\"vllm.service\"} 1"));
+    }
+
+    #[test]
+    fn render_metrics_proc_events_dropped_total_is_the_passed_in_value() {
+        let out = render_metrics(&empty_snapshot(), &Metrics::default(), 0, 0, 600, 42);
+        assert!(out.contains("gpu_arbiter_proc_events_dropped_total 42"));
+    }
+
+    #[test]
+    fn render_metrics_reconcile_passes_total_all_four_triggers() {
+        use crate::state::PassTrigger;
+        let mut metrics = Metrics::default();
+        metrics.record_reconcile_pass(PassTrigger::ProcEvent);
+        metrics.record_reconcile_pass(PassTrigger::ProcEvent);
+        metrics.record_reconcile_pass(PassTrigger::Timer);
+        metrics.record_reconcile_pass(PassTrigger::Manual);
+        metrics.record_reconcile_pass(PassTrigger::Startup);
+        let out = render_metrics(&empty_snapshot(), &metrics, 0, 0, 600, 0);
+        assert!(out.contains("gpu_arbiter_reconcile_passes_total{trigger=\"proc_event\"} 2"));
+        assert!(out.contains("gpu_arbiter_reconcile_passes_total{trigger=\"timer\"} 1"));
+        assert!(out.contains("gpu_arbiter_reconcile_passes_total{trigger=\"manual\"} 1"));
+        assert!(out.contains("gpu_arbiter_reconcile_passes_total{trigger=\"startup\"} 1"));
+    }
+
+    #[test]
+    fn render_metrics_counters_still_render_at_zero_with_no_activity() {
+        // A fresh daemon (no evictions/restarts/passes yet) still exposes the
+        // counter series at their zero default rather than omitting them —
+        // scrapers should see the metric exist from the first scrape.
+        let out = render_metrics(&empty_snapshot(), &Metrics::default(), 0, 0, 600, 0);
+        assert!(out.contains("gpu_arbiter_proc_events_dropped_total 0"));
+        assert!(out.contains("gpu_arbiter_reconcile_passes_total{trigger=\"proc_event\"} 0"));
+        assert!(out.contains("gpu_arbiter_reconcile_passes_total{trigger=\"timer\"} 0"));
+        assert!(out.contains("gpu_arbiter_reconcile_passes_total{trigger=\"manual\"} 0"));
+        assert!(out.contains("gpu_arbiter_reconcile_passes_total{trigger=\"startup\"} 0"));
+        // No unit has ever had an eviction/restart yet, so those two families
+        // legitimately have zero series (nothing to iterate).
+        assert!(!out.contains("gpu_arbiter_evictions_total{"));
+        assert!(!out.contains("gpu_arbiter_unit_restarts_total{"));
     }
 }

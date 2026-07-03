@@ -220,6 +220,12 @@ pub async fn reconcile(
     backend: GpuBackend,
 ) -> Result<(), ReconcileError> {
     let trigger_label = trigger.label();
+    // #14: every pass counts, regardless of what it decides to do — this is the
+    // only durable record of reconcile activity once journald's short retention
+    // has rotated past it.
+    write_state(state)
+        .metrics
+        .record_reconcile_pass(trigger.pass_trigger());
 
     // ── Manual start/stop: a direct action on ONE named unit ──────────────────
     //
@@ -244,8 +250,14 @@ pub async fn reconcile(
                     // Clear the hold (if any) on a successful start: the operator
                     // is bringing the unit back, so the ensure-running post-step
                     // should resume managing it. A failed start leaves any
-                    // existing hold in place — nothing changed.
-                    write_state(state).held.remove(&unit);
+                    // existing hold in place — nothing changed. One lock
+                    // acquisition for both mutations (#14's restart counter
+                    // rides along with the existing hold-clear).
+                    {
+                        let mut guard = write_state(state);
+                        guard.held.remove(&unit);
+                        guard.metrics.record_unit_restart(&unit);
+                    }
                     let _ = reply.send(Ok(()));
                 }
                 Err(e) => {
@@ -263,7 +275,15 @@ pub async fn reconcile(
             // explicit "keep this off" signal; the daemon must not paper over it
             // by restarting the unit on the next pass).
             write_state(state).held.insert(unit.clone());
-            match units::evict_by_name(cfg, backend, &unit).await {
+            let result = units::evict_by_name(cfg, backend, &unit).await;
+            // #14: record before the reply match below consumes `result` — a
+            // manual stop is still an eviction event and must be counted like
+            // any other (see `units::eviction_metric_outcome`'s docs on why
+            // `AlreadyClear` is excluded).
+            if let Some(outcome) = units::eviction_metric_outcome(&result) {
+                write_state(state).metrics.record_eviction(&unit, outcome);
+            }
+            match result {
                 Ok(outcome) => {
                     tracing::info!(unit = %unit, ?outcome, "manual unit stop (held)");
                     let _ = reply.send(Ok(()));
@@ -274,7 +294,7 @@ pub async fn reconcile(
                 }
             }
         }
-        ReconcileTrigger::ProcEvent | ReconcileTrigger::Timer => {}
+        ReconcileTrigger::ProcEvent | ReconcileTrigger::Timer | ReconcileTrigger::Startup => {}
     }
 
     // Slow, off-lock: scan /proc (+ optional GPU procs).
@@ -305,7 +325,7 @@ pub async fn reconcile(
             // the lock DROPPED so `/status` stays responsive across the whole kill
             // window. Gaming wins unconditionally even if one unit errors.
             write_state(state).set_state(State::Evicting);
-            let any_eviction_failed = evict_all_units(cfg, backend).await;
+            let any_eviction_failed = evict_all_units(state, cfg, backend).await;
             if any_eviction_failed {
                 // #6: visibility only — gaming still wins the GPU unconditionally
                 // below. A wedged tenant may still hold VRAM even though `state`
@@ -422,6 +442,11 @@ pub async fn reconcile(
                         tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
                     } else {
                         tracing::info!(unit = %u.unit, "ensure-running: started eager unit (GPU free)");
+                        // #14: this is also the `gaming → available` restore path
+                        // (the post-step subsumes it — see `UnitAction::Restart`'s
+                        // docs above), so one counter covers both triggers of an
+                        // eager restart.
+                        write_state(state).metrics.record_unit_restart(&u.unit);
                     }
                 }
             }
@@ -439,10 +464,24 @@ pub async fn reconcile(
 /// function so the "did anything fail" decision is unit-testable without
 /// needing a real game claim to reach the `Evict` branch (macOS/CI `observe`
 /// is stubbed empty, so nothing ever resolves to `Gaming` there).
-async fn evict_all_units(cfg: &Config, backend: GpuBackend) -> bool {
+///
+/// Also records each unit's eviction outcome into
+/// [`crate::state::Metrics::record_eviction`] (#14) — one brief write-lock
+/// acquisition per unit, interleaved with the (already sequential, already
+/// slow) per-unit `units::evict` shell-outs, so it adds no new contention
+/// pattern over what this loop already had.
+async fn evict_all_units(
+    state: &Arc<RwLock<ArbiterState>>,
+    cfg: &Config,
+    backend: GpuBackend,
+) -> bool {
     let mut any_failed = false;
     for u in cfg.resolved_units() {
-        match units::evict(u, cfg, backend).await {
+        let result = units::evict(u, cfg, backend).await;
+        if let Some(outcome) = units::eviction_metric_outcome(&result) {
+            write_state(state).metrics.record_eviction(&u.unit, outcome);
+        }
+        match result {
             Ok(outcome) => tracing::info!(unit = %u.unit, ?outcome, "evicted unit for gaming"),
             Err(e) => {
                 any_failed = true;
@@ -929,6 +968,144 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
+    // ── metrics recording through the real reconcile() entry point (#14) ──────
+
+    #[tokio::test]
+    async fn manual_start_records_unit_restart_metric() {
+        let marker = marker_path("metrics-manual-start");
+        // is_active_cmd = true: the unit reports running immediately after the
+        // manual start, so the ensure-running post-step that runs later in the
+        // same pass sees it already up and does NOT start it a second time —
+        // isolates this test to the ManualStart handler's own increment.
+        let cfg = ensure_cfg(true, &marker, true);
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "fake.service".to_string(),
+                reply: reply_tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        assert_eq!(read_state(&state).metrics.unit_restarts["fake.service"], 1);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn manual_stop_records_eviction_metric() {
+        let marker = marker_path("metrics-manual-stop");
+        let cfg = Config::from_toml(&format!(
+            r#"
+            eviction_timeout_s = 0
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["touch", "{marker}"]
+            is_active_cmd = "true"
+            "#,
+            marker = marker.display(),
+        ))
+        .unwrap();
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStop {
+                unit: "fake.service".to_string(),
+                reply: reply_tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        // eviction_timeout_s = 0 means `eviction_step` escalates on its very
+        // first poll (elapsed >= 0 always holds); is_active_cmd = "true" is a
+        // static command that always reports running, so the post-escalate
+        // recheck also sees "still running" and drives the SIGKILL fallback
+        // (re-running stop_cmd, since no kill_cmd is configured) — the same
+        // shape as `units::evict_escalates_when_recheck_cannot_confirm_still_running`.
+        // Real outcome is Escalated, not Freed: a manual stop is still counted
+        // like any other eviction (#14), just under the sigkill bucket here.
+        assert_eq!(
+            read_state(&state).metrics.evictions["fake.service"].sigkill,
+            1
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn every_trigger_kind_records_a_reconcile_pass() {
+        // Every trigger — including the one-off Startup pass — increments
+        // exactly its own PassTrigger bucket, regardless of what the pass then
+        // decides to do.
+        let cfg = Config::default();
+        let presence = crate::presence::PresenceMonitor::new(0);
+
+        let state = shared(ArbiterState::new());
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_state(&state).metrics.reconcile_passes.timer, 1);
+
+        let state = shared(ArbiterState::new());
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ProcEvent,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_state(&state).metrics.reconcile_passes.proc_event, 1);
+
+        let state = shared(ArbiterState::new());
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Startup,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_state(&state).metrics.reconcile_passes.startup, 1);
+
+        // Both manual variants bucket to `manual`.
+        let state = shared(ArbiterState::new());
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "not-a-real-unit".to_string(),
+                reply: tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_state(&state).metrics.reconcile_passes.manual, 1);
+    }
+
     #[tokio::test]
     async fn manual_start_unknown_unit_replies_err_and_reconcile_still_succeeds() {
         // An unresolvable unit name (shouldn't happen given http.rs's guard, but
@@ -1167,6 +1344,8 @@ mod tests {
             marker.exists(),
             "ensure-running should have started the stopped eager unit"
         );
+        // #14: the eager start is counted as a unit restart.
+        assert_eq!(read_state(&state).metrics.unit_restarts["fake.service"], 1);
         let _ = std::fs::remove_file(&marker);
     }
 
@@ -1428,7 +1607,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(!evict_all_units(&cfg, GpuBackend::default()).await);
+        let state = shared(ArbiterState::new());
+        assert!(!evict_all_units(&state, &cfg, GpuBackend::default()).await);
+        // AlreadyClear isn't a real eviction (#14) — nothing recorded.
+        assert!(read_state(&state).metrics.evictions.is_empty());
     }
 
     #[tokio::test]
@@ -1444,7 +1626,13 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(evict_all_units(&cfg, GpuBackend::default()).await);
+        let state = shared(ArbiterState::new());
+        assert!(evict_all_units(&state, &cfg, GpuBackend::default()).await);
+        // #14: the failure is counted under the "error" bucket for that unit.
+        assert_eq!(
+            read_state(&state).metrics.evictions["fake.service"].error,
+            1
+        );
     }
 
     #[tokio::test]

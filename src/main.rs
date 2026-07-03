@@ -237,7 +237,7 @@ mod linux {
         //    synchronous pass here; nothing else touches Ollama until it returns
         //    (the reconcile task and HTTP server aren't spawned yet).
         if let Err(e) =
-            reconcile::reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer, backend).await
+            reconcile::reconcile(&state, &cfg, &presence, ReconcileTrigger::Startup, backend).await
         {
             // A failed startup reconcile is non-fatal: we log and continue —
             // the periodic backstop will retry. We do NOT start Ollama on
