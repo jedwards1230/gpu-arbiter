@@ -97,3 +97,27 @@ notify-rust = "4"
 evdev = { version = "0.13", features = ["tokio"] }
 inotify = { version = "0.11", default-features = false, features = ["stream"] }
 tokio-stream = "0.1"
+
+# The `release` profile is what actually ships (the static musl binary built by
+# rust.yml / release.yml) — optimize it for a small, standalone daemon binary
+# over incremental-rebuild speed:
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+# Consistent with the deliberate poisoned-lock-abort policy in state.rs
+# (`read_state`/`write_state`: a poisoned `ArbiterState` lock panics rather than
+# `into_inner()`-recovering unverified state, relying on systemd's
+# `Restart=always` to boot a fresh process). That policy only actually holds
+# under `panic = "abort"`: with the default unwind strategy a panic inside a
+# `tokio::spawn`ed task (reconcile_task, or an axum handler calling
+# `read_state`) unwinds *that task only* — nobody awaits `reconcile_handle`
+# during normal operation (only at shutdown), so the process would otherwise
+# keep running with the reconcile task silently dead and every `/status`
+# request panicking forever, never reaching systemd's supervisor at all.
+# `panic = "abort"` makes any panic anywhere terminate the process immediately,
+# which is what turns "crash and let systemd restart us" into an actual
+# guarantee instead of a comment. No code in this crate uses
+# `std::panic::catch_unwind` to recover from panics (grepped), and `cargo test`
+# is unaffected — it runs under the separate `dev`/`test` profile, not `release`.
+panic = "abort"
