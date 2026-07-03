@@ -61,6 +61,9 @@ Load and validate the resolved config, print
 .BI "OK: " <path>
 (or the typed validation error) and exit 0 on success / 1 on error, without
 starting the daemon. Cross\-platform \(em works on the non\-Linux stub build.
+An unknown or typo'd key at any level
+.RI ( top\-level ", " [[managed_units]] ", or " [[game_patterns]] )
+fails validation naming the offending key, rather than silently defaulting.
 .TP
 .BR status " [" \-\-json ]
 Query a running daemon: read the config for the port, issue
@@ -127,7 +130,12 @@ is already released and the release is treated as graceful; otherwise the unit
 is force\-killed via its supervisor
 .RB ( "systemctl kill -s SIGKILL" ", or the per-unit " kill_cmd )
 and the daemon proceeds regardless \(em gaming wins the GPU unconditionally and a
-game launch must never hang waiting on a tenant.
+game launch must never hang waiting on a tenant. If any managed unit fails to
+evict, the daemon still hands the GPU to gaming, but marks the state
+.B degraded
+until the next clean eviction pass or a clean return to
+.IR available ,
+so an operator can tell a wedged tenant apart from a fully\-reclaimed GPU.
 .SH HTTP CONTROL SURFACE
 A single HTTP port (default 48750) is bound on 0.0.0.0 and restricted to the LAN
 by a firewalld rich rule. The override endpoints under
@@ -139,11 +147,18 @@ back\-compat alias) are additionally localhost\-only.
 .B GET /status
 Full state snapshot: overall state
 .RI ( gaming " | " available " | " evicting ),
-active claims, a per\-managed\-unit array (running flag, reported
+active claims, a per\-managed\-unit array (a tristate
+.B running
+flag \(em true/false/null, the last meaning the daemon couldn't confirm either
+way \(em reported
 .B models[]
-list, attributed VRAM), an
+list, attributed VRAM, and whether the unit is manually
+.BR held ),
+an
 .I ollama
-back\-compat alias block, and total GPU memory.
+back\-compat alias block, total GPU memory, and a top\-level
+.B degraded
+flag (see DETECTION AND EVICTION MODEL).
 .TP
 .B GET /metrics
 Prometheus text\-format exposition.
@@ -155,7 +170,17 @@ Liveness probe.
 Manual override for debugging.
 .I {unit}
 must be one of the configured managed units; an unknown unit is rejected with
-404. Localhost\-only.
+404. Localhost\-only. Both are routed through the same reconcile task that
+drives automatic eviction/restart (never a directly\-racing HTTP handler).
+.B stop
+additionally
+.B holds
+the unit down: without the hold, the ensure\-running self\-heal step would
+restart it on the very next reconcile pass (even the periodic backstop
+timer), making a manual stop a self\-reverting no\-op. A held unit stays down
+across game launches/exits until
+.B start
+(which clears the hold) or a daemon restart \(em holds are in\-memory only.
 .TP
 .B "POST /ollama/start, /ollama/stop"
 Back\-compat alias for the first managed unit. Localhost\-only.
@@ -197,7 +222,11 @@ on an invalid config, and by
 .B status
 when the running daemon cannot be reached.
 .PP
-SIGTERM (systemd stop) and SIGINT (Ctrl\-C) trigger a graceful shutdown.
+SIGTERM (systemd stop) and SIGINT (Ctrl\-C) trigger a real graceful shutdown:
+the reconcile task is asked to stop picking up new triggers, but any pass
+already in flight \(em including an eviction's stop \(-> poll\-VRAM \(->
+SIGKILL window \(em always runs to completion first, bounded by a 15\-second
+join timeout. Only the stateless I/O tasks are terminated immediately.
 .SH NOTES
 The daemon runs only on Linux. The crate still builds and unit\-tests on any host
 (including macOS) via a library/stub split; the pure decision logic is

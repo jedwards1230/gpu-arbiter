@@ -7,6 +7,10 @@
 #
 # Keys map 1:1 to the serde Config struct in src/config.rs. See
 # gpu-arbiter-config(5) for the authoritative reference.
+#
+# An unknown/misspelled key (top-level, per-[[managed_units]], or
+# per-[[game_patterns]]) fails to parse instead of silently doing nothing —
+# run `gpu-arbiter --check-config` after editing this file.
 
 # Master enable. When false, the daemon logs that it is disabled and exits
 # cleanly (a quick disable without touching systemd).

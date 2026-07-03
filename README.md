@@ -41,6 +41,9 @@ delta-maintained, so it self-heals across crashes, restarts, and dropped events.
 - **A periodic timer** (~30 s) also reconciles — backstop for dropped events.
 - **Startup reconciles first** — a restart or boot never starts Ollama into a
   live game.
+- **SIGTERM/SIGINT trigger a real graceful shutdown**: any reconcile pass
+  already in flight — including an eviction's stop → poll-VRAM → SIGKILL
+  window — always runs to completion before the daemon exits.
 
 Detection rules: every Steam game runs under `reaper SteamLaunch AppId=<id>` →
 claim `steam:<appid>` (zero config, covers all Steam games). Non-Steam launchers
@@ -61,9 +64,13 @@ rich rule. `/units/*` (and the `/ollama/*` alias) are additionally localhost-onl
 | POST | `/units/{unit}/start`, `/units/{unit}/stop` | localhost | Manual override (debugging) |
 | POST | `/ollama/start`, `/ollama/stop` | localhost | Back-compat alias for the first managed unit |
 
-State is fully **auto** — derived from observed reality; there is no manual override.
-The `{unit}` must be one of the configured `managed_units`; an unknown unit is
-rejected with `404`, so the endpoint can't drive arbitrary systemd units.
+State is fully **auto** — derived from observed reality; there is no manual
+override of `state` itself. The `{unit}` must be one of the configured
+`managed_units`; an unknown unit is rejected with `404`, so the endpoint can't
+drive arbitrary systemd units. A manual start/stop is handled by the same
+reconcile task that drives automatic eviction/restart (never a directly-racing
+HTTP handler), and `POST /units/{unit}/stop` now **holds** the unit down —
+see [Manual start/stop and holds](#manual-startstop-and-holds) below.
 
 `/status` payload:
 
@@ -72,16 +79,17 @@ rejected with `404`, so the endpoint can't drive arbitrary systemd units.
   "state": "gaming",
   "claims": ["steam:440"],
   "units": [
-    { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
-    { "unit": "vllm.service", "running": false, "models": [] }
+    { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false },
+    { "unit": "vllm.service", "running": null, "models": [], "held": true }
   ],
-  "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
+  "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false },
   "gpu_vram_used_mb": 21500,
   "gpu_vram_total_mb": 32768,
   "since": "2026-06-07T20:00:00Z",
   "local_input_last_unix": 1717790400,
   "physical_input_devices": 2,
-  "input_monitor_up": true
+  "input_monitor_up": true,
+  "degraded": false
 }
 ```
 
@@ -90,6 +98,26 @@ rejected with `404`, so the endpoint can't drive arbitrary systemd units.
 none is named `ollama`), so consumers written against the old singular block keep
 working. `state` is `gaming` | `available` | `evicting` (the transient kill
 window — remote consumers treat `evicting` as busy).
+
+Per-unit `running` is a **tristate**: `true`/`false` are confirmed
+running/stopped, and `null` means the daemon's `is-active` check itself failed
+(a wedged supervisor, a missing `*_cmd` binary) — "couldn't tell", not a
+confirmed answer. `held` is `true` while an operator has manually stopped that
+unit and it hasn't been manually started again (see below). Top-level
+`degraded` is `true` when the most recent eviction had at least one unit fail
+to evict — gaming still won the GPU unconditionally, but a tenant may still be
+holding VRAM.
+
+### Manual start/stop and holds
+
+`POST /units/{unit}/stop` now **holds** the unit down: without a hold, the
+ensure-running self-heal step would restart the unit on the very next
+reconcile pass (even the periodic backstop timer), making a manual stop a
+self-reverting no-op. A held unit stays down across game launches/exits until
+either `POST /units/{unit}/start` (which clears the hold and starts it) or a
+daemon restart (holds are in-memory only — a fresh process re-derives
+everything from observed truth, it does not remember a hold from a prior
+run). `/status` surfaces the hold per-unit via `units[].held`.
 
 `local_input_last_unix` / `physical_input_devices` / `input_monitor_up` report
 **local human presence**: the daemon watches *physical* input devices (keyboard /
@@ -125,7 +153,7 @@ gpu-arbiter --version | --help
 | Flag / subcommand | Purpose |
 |---|---|
 | `-c, --config <PATH>` | Config file path (precedence below) |
-| `--check-config` | Load + validate the resolved config, print `OK: <path>` or the typed error, exit 0/1 |
+| `--check-config` | Load + validate the resolved config, print `OK: <path>` or the typed error, exit 0/1. Rejects unknown/typo'd keys at every level (top-level, `[[managed_units]]`, `[[game_patterns]]`) — a config that parses is a config with no typos, not just no type errors. |
 | `status` | Read the config for the port, GET `http://127.0.0.1:<port>/status`, print a human summary |
 | `status --json` | Print the raw `/status` JSON instead of the summary |
 | `-V, --version` / `-h, --help` | Print version / help and exit |
@@ -147,9 +175,12 @@ Claims:  steam:440
 GPU:     21500 / 32768 MiB VRAM used
 Units:
   ollama.service: stopped
-  vllm.service: stopped
+  vllm.service: unknown
 Daemon:  v0.7.2
 ```
+
+A unit's status line renders `running` / `stopped` / `unknown` (the tristate
+above); when `degraded` is set the summary also prints a `Degraded: ...` line.
 
 ## Configuration
 

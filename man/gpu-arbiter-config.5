@@ -16,6 +16,18 @@ names and leaves the rest at their defaults.
 TOML keys mirror the deployment variable names minus the
 .I gpu_arbiter_
 prefix.
+.PP
+An
+.B unknown or misspelled key
+at any level (top\-level, a
+.B [[managed_units]]
+entry, or a
+.B [[game_patterns]]
+entry) is a
+.B parse error
+naming the offending key, not a silently\-ignored no\-op \(em run
+.B gpu\-arbiter \-\-check\-config
+after editing this file.
 .SH TOP-LEVEL KEYS
 .TP
 .B enabled
@@ -314,11 +326,15 @@ then the name heuristic). The 1024\-byte cap is a footgun guard against an
 operator typo overrunning the OS argv limit; a real command is far shorter.
 Best\-effort: a missing binary, a non\-zero exit, an empty argv, or a query timeout
 yields no models (never an error). The command is
-.B bounded to 10 seconds
-(the shared
-.I SYSTEMCTL_TIMEOUT );
-a custom introspection command that runs longer is killed and silently yields an
-empty list, so keep it fast.
+.B bounded to 2 seconds
+(the
+.I INTROSPECTION_TIMEOUT ,
+tighter than the 10\-second bound on
+.BR stop_cmd / start_cmd / is_active_cmd / kill_cmd ,
+since this query runs on every reconcile pass's
+.I /status
+refresh and must stay fast); a custom introspection command that runs longer
+is killed and silently yields an empty list, so keep it fast.
 .SH INTROSPECTION RESOLUTION
 For each managed unit, the
 .B models[]

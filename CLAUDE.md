@@ -2,7 +2,7 @@
 
 @CONTRIBUTING.md
 
-A Linux root daemon that treats a shared GPU machine as **gaming-first, AI-compute-second**. It detects game launches via the kernel `cn_proc` process-event connector, evicts configured GPU compute tenants (e.g. Ollama) from the GPU, restores them when gaming ends, and exposes an HTTP control surface (default port `48750`) with endpoints for state (`/status`), Prometheus metrics (`/metrics`), liveness (`/healthz`), and localhost-only manual overrides (`POST /units/{unit}/start|stop`). Back-compat `/ollama/start|stop` aliases address the first managed unit.
+A Linux root daemon that treats a shared GPU machine as **gaming-first, AI-compute-second**. It detects game launches via the kernel `cn_proc` process-event connector, evicts configured GPU compute tenants (e.g. Ollama) from the GPU, restores them when gaming ends, and exposes an HTTP control surface (default port `48750`) with endpoints for state (`/status`), Prometheus metrics (`/metrics`), liveness (`/healthz`), and localhost-only manual overrides (`POST /units/{unit}/start|stop`). Back-compat `/ollama/start|stop` aliases address the first managed unit. Manual overrides are routed through the reconcile task (the sole caller of unit start/evict — no handler-vs-reconcile race); a manual `stop` **holds** the unit down (surfaced as `held` in `/status`) until a manual `start` or a daemon restart.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ The crate is structured as a library (`src/lib.rs`) plus two binaries:
 
 | Module | Purpose |
 |--------|---------|
-| `config.rs` | TOML config deserialization with serde defaults |
+| `config.rs` | TOML config deserialization with serde defaults; `deny_unknown_fields` on `Config`/`ManagedUnit`/`GamePattern` — a typo'd key is a parse error, not a silent no-op |
 | `cli.rs` | Argv parser, config-path resolution, `--check-config`, `status` subcommand renderer |
 | `classify.rs` | Cmdline → game-claim classification (Steam, patterns, VRAM heuristic) |
 | `state.rs` | State machine, claim model, `/status` snapshot type |
@@ -25,7 +25,7 @@ The crate is structured as a library (`src/lib.rs`) plus two binaries:
 | `procmon.rs` | Async event-driven `cn_proc` netlink listener — subscribes to kernel process events (exec/exit) and forwards debounced `ReconcileTrigger` messages. Not a polling loop: zero CPU between events; dropped events are covered by the timer backstop. (Linux-only; parks as a stub on macOS.) |
 | `presence.rs` | Optional physical-input-device watcher: epoll-watches `/dev/input/event*` via evdev/inotify to timestamp the last human input event. Excludes virtual Moonlight/Sunshine devices by sysfs parentage. Feeds `local_present` / `input_monitor_up` into the snapshot. (Linux-only; stub on macOS.) |
 
-**Reconciliation model**: level-triggered, K8s-controller style. `reconcile()` observes ground truth (`/proc` scan, optional GPU procs), recomputes the full claim set, and drives managed units. No delta state — self-heals across crashes and dropped events. Triggers: `cn_proc` exec/exit netlink events (primary, sub-second reaction), a ~30 s periodic backstop timer (`reconcile_interval_s`; default 30), startup reconciliation (a restart never starts Ollama into a live game), and `POST /units/{unit}/start|stop` manual HTTP triggers (localhost-only).
+**Reconciliation model**: level-triggered, K8s-controller style. `reconcile()` observes ground truth (`/proc` scan, optional GPU procs), recomputes the full claim set, and drives managed units. No delta state — self-heals across crashes and dropped events. Triggers: `cn_proc` exec/exit netlink events (primary, sub-second reaction), a ~30 s periodic backstop timer (`reconcile_interval_s`; default 30), startup reconciliation (a restart never starts Ollama into a live game), and `POST /units/{unit}/start|stop` manual HTTP triggers (localhost-only) — the HTTP handler enqueues a `ReconcileTrigger::ManualStart`/`ManualStop` (carrying a oneshot reply channel) and awaits the outcome; the reconcile task is the sole caller of `units::start`/`units::evict`. Graceful shutdown (SIGTERM/SIGINT) cancels the reconcile task's own trigger loop rather than `abort()`ing it, so an in-flight eviction always finishes its kill window first.
 
 **Cross-platform invariant**: the daemon is Linux-only at runtime but builds and tests on any host. Linux-only edges are `#[cfg(target_os = "linux")]` with non-Linux stubs. Pure-logic modules (classification, config parse, state transitions) are unit-tested on macOS.
 
