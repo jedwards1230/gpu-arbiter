@@ -298,6 +298,15 @@ pub struct Config {
     /// `ollama_unit` / `eager_ollama` fields synthesize a single entry — see
     /// [`Config::resolved_units`], the one accessor the daemon drives off.
     pub managed_units: Vec<ManagedUnit>,
+    /// The normalized, ordered list the daemon actually drives — `managed_units`
+    /// verbatim, or the legacy-synthesized single entry when it's empty. Computed
+    /// **once**, when the config is loaded/defaulted (see [`Config::from_toml`] /
+    /// [`Default for Config`](#impl-Default-for-Config)), not re-synthesized on
+    /// every [`Config::resolved_units`] call — a single reconcile pass and HTTP
+    /// request each call it multiple times. Not a TOML key: never read from the
+    /// config file, always derived.
+    #[serde(skip)]
+    pub units: Vec<ManagedUnit>,
     /// Seconds to wait for a graceful Ollama teardown before SIGKILL escalation.
     pub eviction_timeout_s: u64,
     /// VRAM-used threshold (MiB) under which the GPU is considered "freed" after
@@ -336,12 +345,17 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let ollama_unit = "ollama.service".to_string();
+        let eager_ollama = true;
+        let managed_units = Vec::new();
+        let units = synthesize_units(&ollama_unit, eager_ollama, &managed_units);
         Self {
             enabled: true,
             port: 48750,
-            ollama_unit: "ollama.service".to_string(),
-            eager_ollama: true,
-            managed_units: Vec::new(),
+            ollama_unit,
+            eager_ollama,
+            managed_units,
+            units,
             eviction_timeout_s: 5,
             vram_free_threshold_mb: 2000,
             reconcile_interval_s: 30,
@@ -378,38 +392,60 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
 }
 
+/// Compute the normalized [`Config::units`] list from the raw `managed_units` /
+/// legacy `ollama_unit` / `eager_ollama` fields. Pure — the sole place the
+/// backward-compatibility synthesis happens, called once per [`Config`]
+/// construction (see [`Config::from_toml`] and `impl Default for Config`).
+///
+/// If `managed_units` is non-empty it's returned verbatim (order preserved —
+/// eviction runs in this order). Otherwise a **one-element** list is synthesized
+/// from `ollama_unit` / `eager_ollama` with `vram_match = "ollama"`, so an
+/// unconfigured daemon (or one still using only the old keys) evicts + attributes
+/// VRAM for Ollama exactly as it did before `managed_units` existed. This is the
+/// backward-compatibility contract.
+fn synthesize_units(
+    ollama_unit: &str,
+    eager_ollama: bool,
+    managed_units: &[ManagedUnit],
+) -> Vec<ManagedUnit> {
+    if managed_units.is_empty() {
+        vec![ManagedUnit {
+            unit: ollama_unit.to_string(),
+            eager_restart: eager_ollama,
+            vram_match: Some("ollama".to_string()),
+            kind: Some("ollama".to_string()),
+            introspect_cmd: None,
+            // Legacy synthesized unit is always systemd-driven (no overrides).
+            stop_cmd: None,
+            start_cmd: None,
+            is_active_cmd: None,
+            kill_cmd: None,
+        }]
+    } else {
+        managed_units.to_vec()
+    }
+}
+
 impl Config {
     /// The ordered list of managed units the daemon actually drives — the single
     /// source of truth for eviction/restart and `/status`.
     ///
-    /// If `managed_units` is non-empty it's returned verbatim (order preserved —
-    /// eviction runs in this order). Otherwise a **one-element** list is
-    /// synthesized from the legacy `ollama_unit` / `eager_ollama` fields with
-    /// `vram_match = "ollama"`, so an unconfigured daemon (or one still using only
-    /// the old keys) evicts + attributes VRAM for Ollama exactly as it did before
-    /// `managed_units` existed. This is the backward-compatibility contract.
-    pub fn resolved_units(&self) -> Vec<ManagedUnit> {
-        if self.managed_units.is_empty() {
-            vec![ManagedUnit {
-                unit: self.ollama_unit.clone(),
-                eager_restart: self.eager_ollama,
-                vram_match: Some("ollama".to_string()),
-                kind: Some("ollama".to_string()),
-                introspect_cmd: None,
-                // Legacy synthesized unit is always systemd-driven (no overrides).
-                stop_cmd: None,
-                start_cmd: None,
-                is_active_cmd: None,
-                kill_cmd: None,
-            }]
-        } else {
-            self.managed_units.clone()
-        }
+    /// Borrowed, not cloned: [`Config::units`] is computed once at load time (see
+    /// [`Config::from_toml`]), so a reconcile pass or an HTTP request calling this
+    /// several times per pass/request costs nothing beyond the initial synthesis.
+    pub fn resolved_units(&self) -> &[ManagedUnit] {
+        &self.units
     }
 
     /// Parse a [`Config`] from a TOML string. Pure — unit-tested on macOS.
+    ///
+    /// Normalizes [`Config::units`] immediately after deserializing (see
+    /// [`synthesize_units`]) so every other constructor of a live `Config`
+    /// (`load`, `Default`) produces a consistently-resolved unit list.
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
-        Ok(toml::from_str(s)?)
+        let mut cfg: Config = toml::from_str(s)?;
+        cfg.units = synthesize_units(&cfg.ollama_unit, cfg.eager_ollama, &cfg.managed_units);
+        Ok(cfg)
     }
 
     /// Load config from a path. A missing file is **not** an error — it yields

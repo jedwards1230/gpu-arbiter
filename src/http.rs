@@ -396,18 +396,11 @@ pub async fn ollama_stop(
 /// Shared start logic: loopback gate → managed-unit gate → start (via the
 /// unit's supervisor — systemd by default, command-driven if configured).
 async fn do_start(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
-    if let Some(deny) = guard(&app.cfg, peer, unit) {
-        return deny;
-    }
-    let Some(managed) = managed_unit(&app.cfg, unit) else {
-        // guard() already verified the unit is managed, so this is unreachable;
-        // a 404 is the safe degenerate response.
-        return (
-            StatusCode::NOT_FOUND,
-            format!("'{unit}' is not a managed unit"),
-        );
+    let managed = match guard(&app.cfg, peer, unit) {
+        Ok(managed) => managed,
+        Err(deny) => return deny,
     };
-    match units::start(&managed).await {
+    match units::start(managed).await {
         Ok(()) => {
             let _ = app.triggers.send(ReconcileTrigger::Manual).await;
             (StatusCode::OK, format!("{unit} start requested"))
@@ -425,17 +418,12 @@ async fn do_start(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, Stri
 /// Shared stop logic: loopback gate → managed-unit gate → evict (via the unit's
 /// supervisor).
 async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
-    if let Some(deny) = guard(&app.cfg, peer, unit) {
-        return deny;
-    }
-    let Some(managed) = managed_unit(&app.cfg, unit) else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("'{unit}' is not a managed unit"),
-        );
+    let managed = match guard(&app.cfg, peer, unit) {
+        Ok(managed) => managed,
+        Err(deny) => return deny,
     };
     let backend = GpuBackend::resolve(app.cfg.gpu_backend);
-    match units::evict(&managed, &app.cfg, backend).await {
+    match units::evict(managed, &app.cfg, backend).await {
         Ok(outcome) => {
             tracing::info!(%unit, ?outcome, "manual unit stop");
             let _ = app.triggers.send(ReconcileTrigger::Manual).await;
@@ -452,23 +440,32 @@ async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, Strin
 }
 
 /// The access gate shared by every `/units/*` (and alias) handler: loopback-only
-/// and the unit must be one the daemon actually manages. Returns `Some(deny)`
-/// with the rejection response, or `None` when the request may proceed. Pure
-/// over `(cfg, peer, unit)` — unit-tested via [`is_localhost`] / [`is_managed`].
-fn guard(cfg: &Config, peer: IpAddr, unit: &str) -> Option<(StatusCode, String)> {
+/// and the unit must be one the daemon actually manages. Returns the resolved
+/// [`crate::config::ManagedUnit`] (carrying any command-override fields) on
+/// success — a single lookup into `cfg.resolved_units()`, so callers never
+/// re-resolve the unit after the gate passes. Returns the rejection response to
+/// send verbatim on failure. Pure over `(cfg, peer, unit)` — unit-tested via
+/// [`is_localhost`] / [`is_managed`].
+fn guard<'c>(
+    cfg: &'c Config,
+    peer: IpAddr,
+    unit: &str,
+) -> Result<&'c crate::config::ManagedUnit, (StatusCode, String)> {
     if !is_localhost(peer) {
-        return Some((
+        return Err((
             StatusCode::FORBIDDEN,
             "unit controls are localhost-only".to_string(),
         ));
     }
-    if !is_managed(cfg, unit) {
-        return Some((
-            StatusCode::NOT_FOUND,
-            format!("'{unit}' is not a managed unit"),
-        ));
-    }
-    None
+    cfg.resolved_units()
+        .iter()
+        .find(|u| u.unit == unit)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("'{unit}' is not a managed unit"),
+            )
+        })
 }
 
 /// The first managed unit's name (what the legacy `/ollama/*` aliases address).
@@ -476,24 +473,17 @@ fn guard(cfg: &Config, peer: IpAddr, unit: &str) -> Option<(StatusCode, String)>
 /// defensive only.
 fn first_managed_unit(cfg: &Config) -> String {
     cfg.resolved_units()
-        .into_iter()
-        .next()
-        .map(|u| u.unit)
+        .first()
+        .map(|u| u.unit.clone())
         .unwrap_or_default()
 }
 
 /// Whether `unit` is one the daemon manages (and may therefore be controlled via
-/// `/units/*`). Pure — unit-tested.
+/// `/units/*`). Pure — unit-tested. Not on [`guard`]'s hot path (`guard` resolves
+/// the unit directly in one pass); kept as an independent predicate other callers
+/// can use without needing the full `&ManagedUnit`.
 pub fn is_managed(cfg: &Config, unit: &str) -> bool {
     cfg.resolved_units().iter().any(|u| u.unit == unit)
-}
-
-/// Resolve a unit *name* to its full [`crate::config::ManagedUnit`] (carrying any
-/// command-override fields), so the manual `/units/*` controls drive it through
-/// the same [`crate::units::Supervisor`] the reconcile loop uses. `None` when the
-/// name isn't managed. Pure.
-fn managed_unit(cfg: &Config, unit: &str) -> Option<crate::config::ManagedUnit> {
-    cfg.resolved_units().into_iter().find(|u| u.unit == unit)
 }
 
 /// Whether a peer IP is permitted to call the `/units/*` handlers (loopback
@@ -563,17 +553,18 @@ mod tests {
         // Non-loopback is forbidden regardless of unit.
         let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
         assert_eq!(
-            guard(&cfg, lan, "ollama.service").map(|(s, _)| s),
-            Some(StatusCode::FORBIDDEN)
+            guard(&cfg, lan, "ollama.service").map_err(|(s, _)| s),
+            Err(StatusCode::FORBIDDEN)
         );
         // Loopback but an unmanaged unit → 404 (can't drive arbitrary units).
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
         assert_eq!(
-            guard(&cfg, lo, "sshd.service").map(|(s, _)| s),
-            Some(StatusCode::NOT_FOUND)
+            guard(&cfg, lo, "sshd.service").map_err(|(s, _)| s),
+            Err(StatusCode::NOT_FOUND)
         );
-        // Loopback + a managed unit → allowed through (None).
-        assert!(guard(&cfg, lo, "ollama.service").is_none());
+        // Loopback + a managed unit → allowed through, resolving that unit.
+        let managed = guard(&cfg, lo, "ollama.service").expect("ollama.service is managed");
+        assert_eq!(managed.unit, "ollama.service");
     }
 
     use crate::state::{State, StatusSnapshot, UnitStatus};

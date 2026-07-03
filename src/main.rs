@@ -180,8 +180,8 @@ mod linux {
 
         let managed_units = cfg
             .resolved_units()
-            .into_iter()
-            .map(|u| u.unit)
+            .iter()
+            .map(|u| u.unit.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         tracing::info!(

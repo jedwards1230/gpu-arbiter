@@ -216,7 +216,7 @@ pub async fn reconcile(
             // window. Gaming wins unconditionally even if one unit errors.
             state.lock().await.set_state(State::Evicting);
             for u in cfg.resolved_units() {
-                match units::evict(&u, cfg, backend).await {
+                match units::evict(u, cfg, backend).await {
                     Ok(outcome) => {
                         tracing::info!(unit = %u.unit, ?outcome, "evicted unit for gaming")
                     }
@@ -262,8 +262,8 @@ pub async fn reconcile(
     // dies while no game is running. Idempotent: `is_running` skips units already
     // up, so steady-state passes are no-ops (and don't spam logs).
     for u in ensure_running_targets(desired, cfg) {
-        if !units::is_running(&u).await.unwrap_or(false) {
-            if let Err(e) = units::start(&u).await {
+        if !units::is_running(u).await.unwrap_or(false) {
+            if let Err(e) = units::start(u).await {
                 tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
             } else {
                 tracing::info!(unit = %u.unit, "ensure-running: started eager unit (GPU free)");
@@ -284,12 +284,12 @@ pub async fn reconcile(
 /// guaranteeing a managed GPU unit is never started into a live game. The caller
 /// still skips any unit already running (idempotence); this function only decides
 /// *which units are eligible*, not whether each is currently up.
-fn ensure_running_targets(desired: State, cfg: &Config) -> Vec<crate::config::ManagedUnit> {
+fn ensure_running_targets(desired: State, cfg: &Config) -> Vec<&crate::config::ManagedUnit> {
     if desired != State::Available {
         return Vec::new();
     }
     cfg.resolved_units()
-        .into_iter()
+        .iter()
         .filter(|u| u.eager_restart)
         .collect()
 }
@@ -314,12 +314,12 @@ async fn refresh_substate(
 
     let mut unit_statuses = Vec::new();
     for u in cfg.resolved_units() {
-        let running = units::is_running(&u).await.unwrap_or(false);
+        let running = units::is_running(u).await.unwrap_or(false);
         // Model listing is generic per-tenant: the introspection backend
         // (`introspect_cmd` / `kind == "ollama"` / `ollama`-named fallback) is
         // resolved from the unit's config. Only queried while the unit is running.
         let models = if running {
-            units::loaded_models(&u).await
+            units::loaded_models(u).await
         } else {
             Vec::new()
         };
@@ -329,7 +329,7 @@ async fn refresh_substate(
             _ => None,
         };
         unit_statuses.push(UnitStatus {
-            unit: u.unit,
+            unit: u.unit.clone(),
             running,
             models,
             vram_mb,
