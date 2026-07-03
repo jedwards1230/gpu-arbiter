@@ -132,10 +132,14 @@ mod linux {
                         state_label(s.state),
                         s.gpu_vram_used_mb,
                         s.gpu_vram_total_mb,
-                        if s.ollama.running {
-                            "running"
-                        } else {
-                            "stopped"
+                        // Tristate (#15): `running: None` means the daemon
+                        // couldn't confirm either way — render that distinctly
+                        // from a confirmed "stopped" rather than defaulting to
+                        // one or the other.
+                        match s.ollama.running {
+                            Some(true) => "running",
+                            Some(false) => "stopped",
+                            None => "unknown",
                         },
                         models,
                         s.since,

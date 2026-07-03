@@ -290,8 +290,14 @@ pub fn render_status(v: &serde_json::Value) -> String {
             let _ = writeln!(o, "Units:");
             for u in units {
                 let unit = u.get("unit").and_then(|s| s.as_str()).unwrap_or("?");
-                let running = u.get("running").and_then(|b| b.as_bool()).unwrap_or(false);
-                let run_str = if running { "running" } else { "stopped" };
+                // Tristate (#15): `running` is JSON `true`/`false`/`null` (the
+                // last meaning the daemon couldn't tell) — the missing-field
+                // case (older/partial payloads) renders the same as `null`.
+                let run_str = match u.get("running").and_then(|b| b.as_bool()) {
+                    Some(true) => "running",
+                    Some(false) => "stopped",
+                    None => "unknown",
+                };
 
                 // VRAM is optional (omitted when unknown).
                 let vram = match u.get("vram_mb").and_then(|n| n.as_u64()) {
@@ -624,5 +630,23 @@ mod tests {
         assert!(out.contains("Units:   (none)"), "{out}");
         assert!(out.contains("Daemon:  v?"), "{out}");
         assert!(out.contains("GPU:     0 / 0 MiB"), "{out}");
+    }
+
+    /// #15: `running: null` (the daemon couldn't confirm either way) renders as
+    /// "unknown", distinct from a confirmed "stopped".
+    #[test]
+    fn render_status_unit_running_null_is_unknown() {
+        let payload = serde_json::json!({
+            "state": "available",
+            "units": [
+                { "unit": "ollama.service", "running": null, "models": [] },
+                { "unit": "vllm.service", "running": false, "models": [] },
+                { "unit": "asr.service", "running": true, "models": [] },
+            ],
+        });
+        let out = render_status(&payload);
+        assert!(out.contains("ollama.service: unknown"), "{out}");
+        assert!(out.contains("vllm.service: stopped"), "{out}");
+        assert!(out.contains("asr.service: running"), "{out}");
     }
 }

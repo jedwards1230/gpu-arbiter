@@ -127,8 +127,11 @@ impl ReconcileTrigger {
 pub struct UnitStatus {
     /// The systemd unit name (`"ollama.service"`).
     pub unit: String,
-    /// Whether the unit is currently active.
-    pub running: bool,
+    /// Whether the unit is currently active. **Tristate**: `None` means the
+    /// `is-active` check itself failed (a wedged supervisor, a missing
+    /// `*_cmd` binary) — "couldn't tell", which must render distinctly from a
+    /// confirmed `false` ("stopped"). Serializes as JSON `null` when unknown.
+    pub running: Option<bool>,
     /// Loaded model names (best-effort; Ollama-only — empty for other units, or
     /// when not running / unknown).
     pub models: Vec<String>,
@@ -496,6 +499,22 @@ mod tests {
     }
 
     #[test]
+    fn unit_status_running_none_serializes_as_json_null() {
+        // #15: unlike `vram_mb` (skip_serializing_if), `running: None` is NOT
+        // omitted — it must appear as an explicit `null` so a consumer can tell
+        // "unknown" apart from a missing/old field.
+        let u = UnitStatus {
+            unit: "ollama.service".into(),
+            running: None,
+            models: vec![],
+            vram_mb: None,
+            held: false,
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains(r#""running":null"#), "{json}");
+    }
+
+    #[test]
     fn evicting_serializes_lowercase_and_vram_present() {
         // The /status contract: `evicting` lowercases, and a known vram_mb is
         // emitted (the inverse of the None-is-skipped case above).
@@ -503,7 +522,7 @@ mod tests {
         s.state = State::Evicting;
         s.units = vec![UnitStatus {
             unit: "ollama.service".into(),
-            running: true,
+            running: Some(true),
             models: vec![],
             vram_mb: Some(21000),
             held: true,
@@ -527,14 +546,14 @@ mod tests {
         s.units = vec![
             UnitStatus {
                 unit: "vllm.service".into(),
-                running: true,
+                running: Some(true),
                 models: vec![],
                 vram_mb: Some(8000),
                 held: false,
             },
             UnitStatus {
                 unit: "ollama.service".into(),
-                running: true,
+                running: Some(true),
                 models: vec!["qwen3:30b".into()],
                 vram_mb: Some(21000),
                 held: false,
@@ -555,7 +574,7 @@ mod tests {
         let mut s = ArbiterState::new();
         s.units = vec![UnitStatus {
             unit: "vllm.service".into(),
-            running: false,
+            running: Some(false),
             models: vec![],
             vram_mb: None,
             held: false,

@@ -483,7 +483,17 @@ pub async fn evict(
                 // is already inactive, the process is gone and its CUDA context
                 // (hence VRAM) released — SIGKILL would hit nothing. Treat that as
                 // a graceful release instead of a misleading `Escalated`.
-                if !is_running(u).await.unwrap_or(true) {
+                // Tristate (#15): when the recheck itself fails, the decision
+                // default is "assume still running" (unsure ⇒ don't block the
+                // SIGKILL escalation on an unconfirmed "it's already gone") —
+                // kept, but logged instead of silently coerced.
+                let still_running = is_running(u)
+                    .await
+                    .inspect_err(|e| {
+                        tracing::warn!(unit = %u.unit, error = %e, "eviction: is_running recheck failed; assuming still running")
+                    })
+                    .unwrap_or(true);
+                if !still_running {
                     return Ok(EvictionOutcome::Freed);
                 }
                 // Unit genuinely still up (orphaned runner outside the cgroup,
@@ -951,5 +961,62 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             .await
             .unwrap();
         assert_eq!(outcome, EvictionOutcome::AlreadyClear);
+    }
+
+    // ── tristate is_running: the recheck-can't-confirm decision (#15) ───────
+
+    #[tokio::test]
+    async fn evict_escalates_when_recheck_cannot_confirm_still_running() {
+        // A self-disarming is_active_cmd script: the FIRST invocation (evict()'s
+        // initial is_running check) succeeds (exit 0 = running) and then `chmod
+        // -x`s its own file, so the SECOND invocation (the post-escalate
+        // recheck) fails to spawn at all (EACCES) — a genuine "couldn't tell",
+        // not just a non-zero "inactive" exit. (A metadata-only chmod, not an
+        // unlink-while-executing, to avoid the ETXTBSY races self-deletion can
+        // hit on overlay filesystems in some CI sandboxes.) The decision default
+        // (#15: unsure ⇒ assume still running, don't skip the SIGKILL
+        // escalation) must still let eviction complete cleanly rather than hang
+        // or panic.
+        let script = std::env::temp_dir().join(format!(
+            "gpu-arbiter-disarm-{}-{:?}-{:?}.sh",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&script, "#!/bin/sh\nchmod -x \"$0\"\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let cfg = Config::from_toml(&format!(
+            r#"
+            eviction_timeout_s = 0
+            [[managed_units]]
+            unit = "fake.service"
+            stop_cmd = ["true"]
+            is_active_cmd = ["{script}"]
+            "#,
+            script = script.display(),
+        ))
+        .unwrap();
+
+        let outcome = evict(&cfg.managed_units[0], &cfg, GpuBackend::default())
+            .await
+            .unwrap();
+        // With eviction_timeout_s = 0 the very first poll escalates immediately
+        // (no real GPU to read), the recheck can't confirm (script now
+        // non-executable), and the unsure-assume-still-running default drives
+        // the SIGKILL fallback (re-running stop_cmd, since no kill_cmd is
+        // configured) rather than a misleading `Freed`.
+        assert_eq!(outcome, EvictionOutcome::Escalated);
+
+        let _ = std::fs::remove_file(&script);
     }
 }

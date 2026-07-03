@@ -376,10 +376,19 @@ pub async fn reconcile(
     let eager_targets = ensure_running_targets(desired, cfg, &held);
     if !eager_targets.is_empty() {
         // Only units NOT already running are actual start candidates
-        // (idempotence — an already-running unit is left alone).
+        // (idempotence — an already-running unit is left alone). Tristate
+        // (#15): when the check itself fails, the decision default is "treat
+        // as stopped and try to start" (unsure ⇒ attempt) — kept, but logged
+        // instead of silently coerced.
         let mut to_start = Vec::new();
         for u in eager_targets {
-            if !units::is_running(u).await.unwrap_or(false) {
+            let confirmed_running = units::is_running(u)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(unit = %u.unit, error = %e, "ensure-running: is_running check failed; treating as stopped and attempting start")
+                })
+                .unwrap_or(false);
+            if !confirmed_running {
                 to_start.push(u);
             }
         }
@@ -502,18 +511,29 @@ async fn refresh_substate(
 
     let mut unit_statuses = Vec::new();
     for u in cfg.resolved_units() {
-        let running = units::is_running(u).await.unwrap_or(false);
+        // Tristate (#15): a failed is-active check is "couldn't tell", not a
+        // confirmed `false` — logged here (the one place this query happens on
+        // the /status refresh path) rather than silently coerced to a definite
+        // answer.
+        let running = units::is_running(u)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(unit = %u.unit, error = %e, "/status refresh: is_running check failed; reporting unknown")
+            })
+            .ok();
         // Model listing is generic per-tenant: the introspection backend
         // (`introspect_cmd` / `kind == "ollama"` / `ollama`-named fallback) is
-        // resolved from the unit's config. Only queried while the unit is running.
-        let models = if running {
+        // resolved from the unit's config. Only queried when confirmed running
+        // (an unknown state gets no models, same as a confirmed-stopped one).
+        let models = if running == Some(true) {
             units::loaded_models(u).await
         } else {
             Vec::new()
         };
-        // Attribute VRAM via the unit's configured `vram_match` substring.
+        // Attribute VRAM via the unit's configured `vram_match` substring —
+        // likewise only when confirmed running.
         let vram_mb = match (running, &u.vram_match, &compute) {
-            (true, Some(needle), Some(procs)) => gpu::vram_mb_matching(procs, needle),
+            (Some(true), Some(needle), Some(procs)) => gpu::vram_mb_matching(procs, needle),
             _ => None,
         };
         unit_statuses.push(UnitStatus {

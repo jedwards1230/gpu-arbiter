@@ -230,11 +230,15 @@ pub fn render_metrics(
     );
     let _ = writeln!(o, "# TYPE gpu_arbiter_unit_running gauge");
     for u in &snap.units {
+        // `running` is a tristate (#15); a gauge has no "unknown" value, so an
+        // unconfirmed unit renders 0 here — same numeric behavior scrapers saw
+        // before the tristate. `/status` (StatusSnapshot JSON) and the CLI/tray
+        // renderers are where "unknown" actually surfaces distinctly.
         let _ = writeln!(
             o,
             "gpu_arbiter_unit_running{{unit=\"{}\"}} {}",
             esc(&u.unit),
-            u8::from(u.running)
+            u8::from(u.running.unwrap_or(false))
         );
     }
     let _ = writeln!(
@@ -637,7 +641,7 @@ mod tests {
             claims: vec!["steam:440".into()],
             units: vec![UnitStatus {
                 unit: "ollama.service".into(),
-                running: false,
+                running: Some(false),
                 models: vec![],
                 vram_mb: None,
                 held: false,
@@ -686,7 +690,7 @@ mod tests {
             claims: vec![],
             units: vec![UnitStatus {
                 unit: "ollama.service".into(),
-                running: true,
+                running: Some(true),
                 models: vec!["qwen3:30b".into()],
                 vram_mb: Some(21000),
                 held: false,
