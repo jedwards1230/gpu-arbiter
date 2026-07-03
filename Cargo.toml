@@ -29,7 +29,9 @@ path = "src/lib.rs"
 # `#[tokio::main]`), macros (`#[tokio::main]`/`#[tokio::test]`/`select!`),
 # process (`tokio::process::Command` shell-outs in units.rs/gpu.rs), signal
 # (`tokio::signal::unix` in main.rs shutdown), sync (mpsc/oneshot channels),
-# time (interval/sleep/timeout), net (the axum `TcpListener` in http.rs). Other
+# time (interval/sleep/timeout), net (the axum `TcpListener` in http.rs and
+# the `UnixListener` control socket), fs (unix-socket setup in http.rs:
+# create_dir_all/remove_file/set_permissions). Other
 # deps (axum, evdev, neli's `async` feature, ksni) pull their own required
 # tokio features transitively via Cargo's feature unification regardless of
 # this list — trimming here narrows what *we* declare, not what ends up built.
@@ -41,6 +43,7 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
     "net",
+    "fs",
 ] }
 # CancellationToken for graceful shutdown (drives the reconcile task's own loop
 # exit instead of `abort()`ing it mid-pass). Pure-Rust, part of the tokio
