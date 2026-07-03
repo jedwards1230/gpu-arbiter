@@ -28,21 +28,24 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Router, response::IntoResponse};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::gpu::GpuBackend;
 use crate::state::{ArbiterState, ReconcileTrigger, StatusSnapshot, read_state};
-use crate::units;
 
 /// Shared application state handed to every handler.
 ///
 /// `state` is the live [`ArbiterState`] (also mutated by the reconcile task);
-/// `triggers` lets the `/units/*` handlers nudge a reconcile; `cfg` is the
-/// (immutable, shared) daemon config those debug handlers use to validate and
-/// address managed units; `backend` is the GPU vendor resolved once at daemon
-/// startup (see [`crate::gpu::GpuBackend::resolve`]), reused by the manual
-/// `POST /units/{unit}/stop` eviction path rather than re-probed per request.
+/// `triggers` lets the `/units/*` handlers enqueue a manual start/stop (and any
+/// other reconcile trigger); `cfg` is the (immutable, shared) daemon config
+/// those debug handlers use to validate and address managed units.
+///
+/// Note there is deliberately no GPU backend or direct `units::` access here:
+/// the reconcile task is the **sole** caller of `units::start`/`units::evict`
+/// (see [`crate::reconcile::reconcile`]'s handling of
+/// [`ReconcileTrigger::ManualStart`]/[`ReconcileTrigger::ManualStop`]) — an HTTP
+/// handler enqueues a trigger and awaits the reply, it never drives a unit
+/// itself.
 #[derive(Clone)]
 pub struct AppState {
     /// Live arbiter state, shared with the reconcile task. `std::sync::RwLock`,
@@ -53,8 +56,6 @@ pub struct AppState {
     pub triggers: mpsc::Sender<ReconcileTrigger>,
     /// Immutable daemon config (for the `/units/*` debug handlers).
     pub cfg: Arc<Config>,
-    /// GPU vendor backend, resolved once at startup.
-    pub backend: GpuBackend,
 }
 
 /// Build the axum [`Router`] for the control surface. Pulled out of [`serve`] so
@@ -411,46 +412,85 @@ pub async fn ollama_stop(
     do_stop(&app, peer.ip(), &unit).await
 }
 
-/// Shared start logic: loopback gate → managed-unit gate → start (via the
-/// unit's supervisor — systemd by default, command-driven if configured).
+/// Shared start logic: loopback gate → managed-unit gate → enqueue a
+/// [`ReconcileTrigger::ManualStart`] and await its outcome.
+///
+/// The actual `units::start` call happens on the reconcile task (see
+/// [`crate::reconcile::reconcile`]) — this handler never drives the unit
+/// itself, removing the handler-vs-reconcile-task race that existed when it
+/// called `units::start` directly.
 async fn do_start(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
     let managed = match guard(&app.cfg, peer, unit) {
         Ok(managed) => managed,
         Err(deny) => return deny,
     };
-    match units::start(managed).await {
-        Ok(()) => {
-            let _ = app.triggers.send(ReconcileTrigger::Manual).await;
-            (StatusCode::OK, format!("{unit} start requested"))
-        }
-        Err(e) => {
-            tracing::warn!(%unit, error = %e, "manual unit start failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{unit} start failed (see daemon logs)"),
-            )
-        }
-    }
+    let unit = managed.unit.clone();
+    enqueue_and_await(
+        app,
+        unit,
+        |unit, reply| ReconcileTrigger::ManualStart { unit, reply },
+        "start",
+    )
+    .await
 }
 
-/// Shared stop logic: loopback gate → managed-unit gate → evict (via the unit's
-/// supervisor).
+/// Shared stop logic: loopback gate → managed-unit gate → enqueue a
+/// [`ReconcileTrigger::ManualStop`] and await its outcome. See [`do_start`].
 async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
     let managed = match guard(&app.cfg, peer, unit) {
         Ok(managed) => managed,
         Err(deny) => return deny,
     };
-    match units::evict(managed, &app.cfg, app.backend).await {
-        Ok(outcome) => {
-            tracing::info!(%unit, ?outcome, "manual unit stop");
-            let _ = app.triggers.send(ReconcileTrigger::Manual).await;
-            (StatusCode::OK, format!("{unit} stop requested"))
-        }
-        Err(e) => {
-            tracing::warn!(%unit, error = %e, "manual unit stop failed");
+    let unit = managed.unit.clone();
+    enqueue_and_await(
+        app,
+        unit,
+        |unit, reply| ReconcileTrigger::ManualStop { unit, reply },
+        "stop",
+    )
+    .await
+}
+
+/// Send a manual trigger for `unit` (built by `variant`, one of
+/// [`ReconcileTrigger::ManualStart`]/[`ReconcileTrigger::ManualStop`]) and wait
+/// for the reconcile task's reply. `verb` ("start"/"stop") only labels the
+/// response text/log lines.
+///
+/// Both failure modes the reconcile task can report — the unit action itself
+/// failing, or the reply channel being dropped (the reconcile task panicked or
+/// isn't running) — collapse to the same `500` the handler always returned for
+/// a failed start/stop; the detail is logged, not echoed to the (untrusted
+/// enough to warrant no detail) HTTP response body.
+async fn enqueue_and_await(
+    app: &AppState,
+    unit: String,
+    variant: impl FnOnce(String, oneshot::Sender<Result<(), ()>>) -> ReconcileTrigger,
+    verb: &str,
+) -> (StatusCode, String) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if app
+        .triggers
+        .send(variant(unit.clone(), reply_tx))
+        .await
+        .is_err()
+    {
+        tracing::error!(%unit, %verb, "manual unit action: reconcile task unreachable (trigger channel closed)");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{unit} {verb} failed (see daemon logs)"),
+        );
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => (StatusCode::OK, format!("{unit} {verb} requested")),
+        Ok(Err(())) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{unit} {verb} failed (see daemon logs)"),
+        ),
+        Err(_) => {
+            tracing::error!(%unit, %verb, "manual unit action: reconcile task dropped the reply channel");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{unit} stop failed (see daemon logs)"),
+                format!("{unit} {verb} failed (see daemon logs)"),
             )
         }
     }

@@ -217,6 +217,51 @@ pub async fn reconcile(
     trigger: ReconcileTrigger,
     backend: GpuBackend,
 ) -> Result<(), ReconcileError> {
+    let trigger_label = trigger.label();
+
+    // ── Manual start/stop: a direct action on ONE named unit ──────────────────
+    //
+    // The reconcile task is the sole caller of `units::start`/`units::evict`
+    // (#2): an HTTP handler no longer drives a unit directly — it enqueues a
+    // `ManualStart`/`ManualStop` trigger and awaits `reply` here instead. That
+    // removes the handler-vs-reconcile-task race that existed when `http.rs`
+    // called into `units` itself: two uncoordinated writers could otherwise
+    // interleave a `systemctl start` from one request with a `systemctl stop`
+    // from a concurrent reconcile pass on the same unit.
+    //
+    // Handled before the observe/decide pipeline below and unconditionally
+    // followed by it (not an early return): a manual override isn't a change to
+    // the observed game-claim truth, but the rest of this pass still runs so
+    // `/status` reflects the fresh consequence right away instead of waiting for
+    // the next trigger.
+    match trigger {
+        ReconcileTrigger::ManualStart { unit, reply } => {
+            match units::start_by_name(cfg, &unit).await {
+                Ok(()) => {
+                    tracing::info!(unit = %unit, "manual unit start");
+                    let _ = reply.send(Ok(()));
+                }
+                Err(e) => {
+                    tracing::warn!(unit = %unit, error = %e, "manual unit start failed");
+                    let _ = reply.send(Err(()));
+                }
+            }
+        }
+        ReconcileTrigger::ManualStop { unit, reply } => {
+            match units::evict_by_name(cfg, backend, &unit).await {
+                Ok(outcome) => {
+                    tracing::info!(unit = %unit, ?outcome, "manual unit stop");
+                    let _ = reply.send(Ok(()));
+                }
+                Err(e) => {
+                    tracing::warn!(unit = %unit, error = %e, "manual unit stop failed");
+                    let _ = reply.send(Err(()));
+                }
+            }
+        }
+        ReconcileTrigger::ProcEvent | ReconcileTrigger::Timer => {}
+    }
+
     // Slow, off-lock: scan /proc (+ optional GPU procs).
     let snap = observe(cfg, backend).await?;
     let claims = claim_set(&snap, cfg);
@@ -229,7 +274,7 @@ pub async fn reconcile(
         let current = guard.state;
         guard.claims = claims;
         tracing::debug!(
-            ?trigger,
+            trigger = trigger_label,
             from = ?current,
             to = ?desired,
             claims = guard.claims.len(),
@@ -610,6 +655,123 @@ mod tests {
         assert_eq!(g.presence.last_input_unix, 1_700_000_500);
         // A fresh monitor that never enumerated is unhealthy (fail-safe default).
         assert!(!g.presence.monitor_up);
+    }
+
+    // ── manual start/stop trigger routing (#2) ────────────────────────────────
+    //
+    // `ManualStart`/`ManualStop` are handled by `reconcile()` itself now — the
+    // reconcile task is the sole caller of `units::start`/`units::evict`. These
+    // drive the real seam via the `Command` supervisor's `*_cmd` overrides
+    // (`marker_path`/`ensure_cfg`, defined below in the ensure-running section)
+    // and assert on both the reply channel's outcome and the actual side effect.
+
+    #[tokio::test]
+    async fn manual_start_trigger_starts_unit_and_replies_ok() {
+        let marker = marker_path("manual-start");
+        let cfg = ensure_cfg(false, &marker, true);
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "fake.service".to_string(),
+                reply: reply_tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply_rx.await.unwrap(), Ok(()));
+        assert!(marker.exists(), "manual start must actually start the unit");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn manual_stop_trigger_evicts_unit_and_replies_ok() {
+        // is_active_cmd = true so evict() actually runs stop_cmd (not the
+        // already-clear fast path); stop_cmd here just touches a marker so the
+        // test can observe it ran.
+        let marker = marker_path("manual-stop");
+        let cfg = Config::from_toml(&format!(
+            r#"
+            eviction_timeout_s = 0
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["touch", "{marker}"]
+            is_active_cmd = "true"
+            "#,
+            marker = marker.display(),
+        ))
+        .unwrap();
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStop {
+                unit: "fake.service".to_string(),
+                reply: reply_tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply_rx.await.unwrap(), Ok(()));
+        assert!(marker.exists(), "manual stop must actually evict the unit");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn manual_start_unknown_unit_replies_err_and_reconcile_still_succeeds() {
+        // An unresolvable unit name (shouldn't happen given http.rs's guard, but
+        // must degrade to a typed failure, never a panic or a stuck reconcile).
+        let cfg = Config::default();
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "not-a-real-unit".to_string(),
+                reply: reply_tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply_rx.await.unwrap(), Err(()));
+    }
+
+    #[tokio::test]
+    async fn manual_trigger_still_runs_the_rest_of_the_pass() {
+        // A manual trigger isn't an early return: /status per-unit substate is
+        // still refreshed in the same pass (refresh_substate runs after the
+        // manual action), so a caller sees a fresh view immediately.
+        let cfg = ensure_cfg(true, &marker_path("unused"), true);
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "fake.service".to_string(),
+                reply: reply_tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_state(&state).units.len(), 1);
     }
 
     // ── ensure-running post-step (boot / self-heal) ───────────────────────────

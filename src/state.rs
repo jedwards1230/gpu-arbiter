@@ -8,6 +8,7 @@
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 /// A single observed reason the GPU is claimed for gaming.
 ///
@@ -65,15 +66,54 @@ pub enum State {
 
 /// Why a reconcile pass was triggered. Fed over the `mpsc` of triggers into the
 /// single reconcile task that owns state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `ManualStart`/`ManualStop` carry a one-shot reply channel, so this type is
+/// deliberately **not** `Clone`/`PartialEq` (a [`oneshot::Sender`] is neither) —
+/// nothing in the daemon needs to duplicate or compare a trigger, only match on
+/// it. Use [`ReconcileTrigger::label`] where a `Debug`-free, payload-free
+/// identifier is needed (e.g. after a `match` has already taken `reply`).
+#[derive(Debug)]
 pub enum ReconcileTrigger {
     /// A cn_proc exec/exit event (debounced) — the millisecond accelerator.
     ProcEvent,
     /// The periodic ~30 s backstop timer — recomputes truth even if events
     /// were dropped.
     Timer,
-    /// A manual `POST /ollama/*` or other explicit nudge.
-    Manual,
+    /// `POST /units/{unit}/start` (or the `/ollama/start` alias): start `unit`
+    /// now via its supervisor. Routed through the reconcile task — the sole
+    /// caller of [`crate::units::start`]/[`crate::units::evict`] — so an HTTP
+    /// handler never races the reconcile task driving the same unit. The
+    /// handler awaits `reply` for the outcome.
+    ManualStart {
+        /// The managed unit to start (already validated by the HTTP handler
+        /// against [`crate::config::Config::resolved_units`]).
+        unit: String,
+        /// Where to send the outcome (`Ok` on a successful start).
+        reply: oneshot::Sender<Result<(), ()>>,
+    },
+    /// `POST /units/{unit}/stop` (or the `/ollama/stop` alias): evict `unit` now
+    /// via its supervisor. The handler awaits `reply` for the outcome.
+    ManualStop {
+        /// The managed unit to stop (already validated).
+        unit: String,
+        /// Where to send the outcome (`Ok` on a successful — or already-clear —
+        /// eviction).
+        reply: oneshot::Sender<Result<(), ()>>,
+    },
+}
+
+impl ReconcileTrigger {
+    /// A short, stable label for logging. Reads only the discriminant — safe to
+    /// call even for `ManualStart`/`ManualStop` after a `match` has already
+    /// taken `reply` out, since it never touches the payload.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ReconcileTrigger::ProcEvent => "proc_event",
+            ReconcileTrigger::Timer => "timer",
+            ReconcileTrigger::ManualStart { .. } => "manual_start",
+            ReconcileTrigger::ManualStop { .. } => "manual_stop",
+        }
+    }
 }
 
 /// One managed unit's observed sub-state, embedded in [`StatusSnapshot`].

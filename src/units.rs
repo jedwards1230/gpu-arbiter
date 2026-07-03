@@ -368,6 +368,42 @@ async fn ollama_loaded_models() -> Vec<String> {
     }
 }
 
+/// Resolve `unit` (a name) against `cfg.resolved_units()`. Used by the
+/// name-only entry points ([`start_by_name`]/[`evict_by_name`]) the reconcile
+/// task drives a `ManualStart`/`ManualStop` trigger through — the HTTP handler
+/// only has a `String`, not an already-borrowed `&ManagedUnit`, by the time it
+/// crosses the trigger channel.
+///
+/// In practice this never misses: `http.rs`'s `guard()` already validates the
+/// unit name against this same [`Config`] before enqueueing the trigger, and
+/// the daemon has no config-reload path (no SIGHUP) that could change
+/// `resolved_units()` out from under a live `Arc<Config>`. Still a typed error,
+/// not a panic or silent no-op, in case that invariant is ever broken.
+fn resolve_unit<'c>(cfg: &'c Config, unit: &str) -> Result<&'c ManagedUnit, UnitError> {
+    cfg.resolved_units()
+        .iter()
+        .find(|u| u.unit == unit)
+        .ok_or_else(|| UnitError::Exit {
+            action: "resolve",
+            unit: unit.to_string(),
+            detail: "unit is not (or no longer) managed".to_string(),
+        })
+}
+
+/// [`start`], resolving `unit` by name against `cfg` first. See [`resolve_unit`].
+pub async fn start_by_name(cfg: &Config, unit: &str) -> Result<(), UnitError> {
+    start(resolve_unit(cfg, unit)?).await
+}
+
+/// [`evict`], resolving `unit` by name against `cfg` first. See [`resolve_unit`].
+pub async fn evict_by_name(
+    cfg: &Config,
+    backend: GpuBackend,
+    unit: &str,
+) -> Result<EvictionOutcome, UnitError> {
+    evict(resolve_unit(cfg, unit)?, cfg, backend).await
+}
+
 /// Start `u` (eager warm-up after a verified `gaming → available` transition),
 /// via its resolved [`Supervisor`]. A non-zero start exit is a real failure.
 pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
@@ -853,5 +889,67 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         u.stop_cmd = Some(crate::config::ArgvCmd(vec!["true".to_string()]));
         let r = is_running(&u).await;
         assert!(matches!(r, Err(UnitError::Exit { .. })));
+    }
+
+    // ── name-only resolution (start_by_name / evict_by_name) ───────────────
+
+    #[tokio::test]
+    async fn start_by_name_resolves_and_starts() {
+        // A Command-driven unit whose start_cmd touches a marker file — resolved
+        // purely by name (as the reconcile task does for a ManualStart trigger).
+        let marker = std::env::temp_dir().join(format!(
+            "gpu-arbiter-start-by-name-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let cfg = Config::from_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["touch", "{marker}"]
+            stop_cmd = ["true"]
+            is_active_cmd = "true"
+            "#,
+            marker = marker.display(),
+        ))
+        .unwrap();
+        start_by_name(&cfg, "fake.service").await.unwrap();
+        assert!(marker.exists());
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn start_by_name_unknown_unit_is_typed_error() {
+        let cfg = Config::default();
+        let err = start_by_name(&cfg, "not-a-real-unit").await.unwrap_err();
+        assert!(matches!(err, UnitError::Exit { .. }));
+    }
+
+    #[tokio::test]
+    async fn evict_by_name_unknown_unit_is_typed_error() {
+        let cfg = Config::default();
+        let err = evict_by_name(&cfg, GpuBackend::default(), "not-a-real-unit")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UnitError::Exit { .. }));
+    }
+
+    #[tokio::test]
+    async fn evict_by_name_already_clear_when_not_running() {
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = "false"
+            "#,
+        )
+        .unwrap();
+        let outcome = evict_by_name(&cfg, GpuBackend::default(), "fake.service")
+            .await
+            .unwrap();
+        assert_eq!(outcome, EvictionOutcome::AlreadyClear);
     }
 }

@@ -268,7 +268,6 @@ mod linux {
             state: state.clone(),
             triggers: triggers_tx.clone(),
             cfg: cfg.clone(),
-            backend,
         };
         let http_handle = tokio::spawn(async move {
             if let Err(e) = http::serve(addr, app).await {
@@ -299,12 +298,15 @@ mod linux {
     ///
     /// Two trigger sources are merged with `tokio::select!`:
     /// - the **periodic backstop** `interval` (covers dropped netlink events),
-    /// - the **trigger channel** (`ProcEvent` / `Manual`).
+    /// - the **trigger channel** (`ProcEvent` / `Timer` / `ManualStart` /
+    ///   `ManualStop`).
     ///
     /// `ProcEvent`s are **debounced**: the first one starts a `DEBOUNCE` deadline
     /// and we keep draining the channel until it elapses, collapsing a launch
-    /// storm into a single reconcile. `Manual`/`Timer` reconcile immediately
-    /// (they're deliberate, low-rate, latency-sensitive).
+    /// storm into a single reconcile. Every other trigger — `Timer` and the two
+    /// manual variants — reconciles immediately (they're deliberate, low-rate,
+    /// latency-sensitive; a manual start/stop is also carrying a reply channel an
+    /// HTTP handler is awaiting, so it must never sit in the debounce window).
     async fn reconcile_task(
         state: Arc<RwLock<ArbiterState>>,
         cfg: Arc<Config>,
@@ -329,10 +331,13 @@ mod linux {
                 },
             };
 
-            // Debounce ONLY ProcEvent bursts. Deliberate triggers act now. A
-            // deliberate trigger arriving mid-window is returned so it isn't lost
-            // (the log then reflects the trigger that actually drove the pass).
-            let effective = if trigger == ReconcileTrigger::ProcEvent {
+            // Debounce ONLY ProcEvent bursts. Deliberate triggers (Timer, and the
+            // two manual variants) act now. A deliberate trigger arriving
+            // mid-window is returned so it isn't lost (the log then reflects the
+            // trigger that actually drove the pass) — load-bearing for
+            // ManualStart/ManualStop, whose `reply` channel an HTTP handler is
+            // awaiting.
+            let effective = if matches!(trigger, ReconcileTrigger::ProcEvent) {
                 debounce_proc_events(&mut triggers).await
             } else {
                 trigger
@@ -353,11 +358,13 @@ mod linux {
     /// caller should reconcile with.
     ///
     /// Returns [`ReconcileTrigger::ProcEvent`] when the window elapses (or the
-    /// channel closes) with only proc events seen. A `Manual`/`Timer` trigger
-    /// arriving mid-window is **returned** (not dropped) so it actually
-    /// drives the immediate reconcile — `recv()` consumed it from the channel, so
-    /// returning it is the only way it isn't silently lost. Deadline is fixed (not
-    /// sliding) so sustained churn can't defer the reconcile indefinitely.
+    /// channel closes) with only proc events seen. A `Timer`/`ManualStart`/
+    /// `ManualStop` trigger arriving mid-window is **returned** (not dropped) so
+    /// it actually drives the immediate reconcile — `recv()` consumed it from the
+    /// channel, so returning it is the only way it isn't silently lost (and for
+    /// the manual variants, the only way their `reply` channel isn't leaked).
+    /// Deadline is fixed (not sliding) so sustained churn can't defer the
+    /// reconcile indefinitely.
     async fn debounce_proc_events(
         triggers: &mut mpsc::Receiver<ReconcileTrigger>,
     ) -> ReconcileTrigger {
