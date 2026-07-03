@@ -31,7 +31,7 @@ use crate::classify::GpuGraphicsProc;
 /// fallen off the bus, a stuck ioctl) is a real, well-known NVIDIA failure mode in
 /// which `nvidia-smi` blocks indefinitely. Bounding the call guarantees the
 /// eviction poll loop (and therefore a game launch) can never hang on it — a
-/// timeout surfaces as a [`GpuError::Command`], which the eviction path treats as
+/// timeout surfaces as a [`GpuError::Timeout`], which the eviction path treats as
 /// "not yet free" and escalates past. Generous enough that a healthy call (tens
 /// of ms) never trips it.
 const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(2);
@@ -50,10 +50,46 @@ pub struct GpuMemory {
 /// GPU query errors.
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
-    /// A vendor command could not be spawned / exited non-zero (NVIDIA
-    /// `nvidia-smi`), or a sysfs read failed (AMD).
-    #[error("gpu command failed: {0}")]
-    Command(String),
+    /// A vendor command could not be spawned (NVIDIA `nvidia-smi`), or a sysfs
+    /// path could not be read (AMD). The underlying [`std::io::Error`] is kept as
+    /// the source, so callers can inspect `ErrorKind`/`raw_os_error` (e.g. a
+    /// missing `nvidia-smi` binary surfaces as `ErrorKind::NotFound`) instead of
+    /// only a formatted message.
+    #[error("{context}: {source}")]
+    Io {
+        /// What was being attempted (e.g. `"spawning nvidia-smi"`).
+        context: String,
+        /// The underlying IO failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A vendor command ran and exited non-zero.
+    #[error("{command} exited {status}: {stderr}")]
+    Exit {
+        /// The command that failed (e.g. `"nvidia-smi"`).
+        command: &'static str,
+        /// Its exit status.
+        status: std::process::ExitStatus,
+        /// Trimmed stderr.
+        stderr: String,
+    },
+    /// A vendor command exceeded its bound. Every shell-out is time-boxed (see
+    /// [`NVIDIA_SMI_TIMEOUT`]) so a wedged GPU/driver hang can never stall the
+    /// eviction loop; this is that bound firing, distinct from a spawn/exit
+    /// failure.
+    #[error("{command} timed out after {elapsed:?}")]
+    Timeout {
+        /// The command that timed out (e.g. `"nvidia-smi"`).
+        command: &'static str,
+        /// The configured bound that elapsed.
+        elapsed: Duration,
+    },
+    /// No AMD DRM card exposing `mem_info_vram_*` sysfs counters was found.
+    #[error("no amdgpu card with mem_info_vram_* under {0}")]
+    NoAmdCard(String),
+    /// The `spawn_blocking` task running the AMD sysfs read panicked.
+    #[error("amd sysfs read task panicked: {0}")]
+    TaskPanicked(#[from] tokio::task::JoinError),
     /// Vendor output did not parse.
     #[error("parsing gpu output: {0}")]
     Parse(String),
@@ -254,7 +290,7 @@ mod nvidia {
     /// driven by tokio's reactor, so it never blocks the runtime.
     ///
     /// Linux-only at *runtime* (no `nvidia-smi` on macOS), but compiles everywhere:
-    /// the spawn failure (binary absent) surfaces as [`GpuError::Command`].
+    /// the spawn failure (binary absent) surfaces as [`GpuError::Io`].
     async fn run_nvidia_smi(args: &[&str]) -> Result<String, GpuError> {
         let fut = tokio::process::Command::new("nvidia-smi")
             .args(args)
@@ -262,17 +298,21 @@ mod nvidia {
         // A hung nvidia-smi must never wedge the eviction loop — bound it.
         let out = tokio::time::timeout(NVIDIA_SMI_TIMEOUT, fut)
             .await
-            .map_err(|_| {
-                GpuError::Command(format!("nvidia-smi timed out after {NVIDIA_SMI_TIMEOUT:?}"))
+            .map_err(|_| GpuError::Timeout {
+                command: "nvidia-smi",
+                elapsed: NVIDIA_SMI_TIMEOUT,
             })?
-            .map_err(|e| GpuError::Command(format!("spawning nvidia-smi: {e}")))?;
+            .map_err(|source| GpuError::Io {
+                context: "spawning nvidia-smi".to_string(),
+                source,
+            })?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(GpuError::Command(format!(
-                "nvidia-smi exited {}: {}",
-                out.status,
-                stderr.trim()
-            )));
+            return Err(GpuError::Exit {
+                command: "nvidia-smi",
+                status: out.status,
+                stderr: stderr.trim().to_string(),
+            });
         }
         String::from_utf8(out.stdout)
             .map_err(|e| GpuError::Parse(format!("nvidia-smi stdout not UTF-8: {e}")))
@@ -332,21 +372,21 @@ mod amd {
     /// files. Async (the blocking reads run via `spawn_blocking`).
     ///
     /// Best-effort: a missing/unreadable sysfs node surfaces as a typed
-    /// [`GpuError::Command`] (so `query_memory` callers fail-soft exactly as they
-    /// do for a missing `nvidia-smi`). The read itself is trivial filesystem work
+    /// [`GpuError::Io`] (so `query_memory` callers fail-soft exactly as they do
+    /// for a missing `nvidia-smi`). The read itself is trivial filesystem work
     /// but is taken off the runtime to honor the "no blocking on async threads"
     /// invariant the `/proc` scan already follows.
     pub async fn query_memory() -> Result<GpuMemory, GpuError> {
-        tokio::task::spawn_blocking(read_vram_blocking)
-            .await
-            .map_err(|e| GpuError::Command(format!("amd sysfs read task panicked: {e}")))?
+        tokio::task::spawn_blocking(read_vram_blocking).await?
     }
 
     /// Synchronous sysfs read of the first card with `mem_info_vram_used`. Called
     /// via `spawn_blocking`.
     fn read_vram_blocking() -> Result<GpuMemory, GpuError> {
-        let entries = std::fs::read_dir(DRM_BASE)
-            .map_err(|e| GpuError::Command(format!("reading {DRM_BASE}: {e}")))?;
+        let entries = std::fs::read_dir(DRM_BASE).map_err(|source| GpuError::Io {
+            context: format!("reading {DRM_BASE}"),
+            source,
+        })?;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -366,9 +406,7 @@ mod amd {
             };
             return parse_vram_sysfs(&used, &total);
         }
-        Err(GpuError::Command(format!(
-            "no amdgpu card with mem_info_vram_* under {DRM_BASE}"
-        )))
+        Err(GpuError::NoAmdCard(DRM_BASE.to_string()))
     }
 }
 
@@ -554,24 +592,36 @@ mod tests {
 
     #[tokio::test]
     async fn nvidia_query_memory_errors_when_nvidia_smi_absent() {
-        // On macOS / CI there is no nvidia-smi on PATH → spawn fails → Command
-        // error (never a panic). On a real GPU host this would succeed; the test
-        // only asserts the no-binary path is a clean typed error.
+        // On macOS / CI there is no nvidia-smi on PATH → spawn fails with a
+        // typed `Io` error carrying the underlying `ErrorKind::NotFound` (never
+        // a panic). On a real GPU host this would succeed; the test only
+        // asserts the no-binary path is a clean typed error with a real source.
         if nvidia_smi_on_path() {
             return; // skip on a host that actually has nvidia-smi
         }
         let err = GpuBackend::Nvidia.query_memory().await.unwrap_err();
-        assert!(matches!(err, GpuError::Command(_)));
+        match err {
+            GpuError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected GpuError::Io, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn amd_query_memory_errors_without_sysfs() {
-        // On macOS / CI there is no /sys/class/drm → a clean typed Command error,
-        // never a panic. (On a real AMD host this would succeed.)
+        // On macOS / CI there is no /sys/class/drm → a clean typed error, never a
+        // panic: `Io` if the directory itself is missing (macOS), `NoAmdCard` if
+        // it exists but no card exposes the VRAM counters (a non-AMD Linux host).
+        // (On a real AMD host this would succeed.)
         let res = GpuBackend::Amd.query_memory().await;
-        // Either it found an AMD card (real Linux+AMD host) or it surfaced a typed
-        // error — never a panic.
-        assert!(res.is_ok() || matches!(res.unwrap_err(), GpuError::Command(_)));
+        assert!(
+            res.is_ok()
+                || matches!(
+                    res.unwrap_err(),
+                    GpuError::Io { .. } | GpuError::NoAmdCard(_)
+                )
+        );
     }
 
     #[tokio::test]

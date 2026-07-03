@@ -79,11 +79,40 @@ pub enum ProcEventKind {
 /// to the backstop timer). Per-message parse errors are **not** modeled here —
 /// neli's checked deserializer surfaces them inline in the recv loop where they
 /// are `warn!`-and-skipped, never propagated.
+///
+/// Both variants box their source rather than naming a concrete `neli` error
+/// type: `neli` is a **Linux-only** dependency (see `Cargo.toml`), but this
+/// enum — like every type in this module — must still compile on macOS for the
+/// non-Linux stub below. A boxed `dyn Error` still preserves the real
+/// source chain (`ErrorKind`/`raw_os_error` included, for the socket variant's
+/// underlying `std::io::Error`) for callers that walk `Error::source()`,
+/// without naming `neli` at the type level.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcMonError {
-    /// The netlink socket could not be opened / the multicast subscribe failed.
-    #[error("opening cn_proc netlink socket: {0}")]
-    Socket(String),
+    /// Opening the netlink socket, or the send/recv used to subscribe/listen,
+    /// failed. Wraps `neli`'s own `SocketError` (which itself carries the
+    /// underlying `std::io::Error` in its `Io` variant), rather than
+    /// flattening it into a string.
+    #[error("{action} cn_proc netlink socket: {source}")]
+    Socket {
+        /// What was being attempted (`"connecting"`, `"sending subscribe on"`,
+        /// `"receiving from"`).
+        action: &'static str,
+        /// The underlying `neli` socket failure.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// Building the subscribe message/header failed — a `neli` builder
+    /// invariant (e.g. a required field left unset), never a socket/OS
+    /// failure.
+    #[error("building {what}: {source}")]
+    Build {
+        /// What was being built (`"subscribe message"`, `"subscribe header"`).
+        what: &'static str,
+        /// The underlying builder failure.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Whether a [`ProcEventKind`] should fire a reconcile trigger.
@@ -128,7 +157,10 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
         Some(pid),
         Groups::new_bitmask(CnMsgIdx::Proc.into()),
     )
-    .map_err(|e| ProcMonError::Socket(format!("connect: {e}")))?;
+    .map_err(|source| ProcMonError::Socket {
+        action: "connecting",
+        source: Box::new(source),
+    })?;
 
     // Subscribe: send a CnMsg carrying PROC_CN_MCAST_LISTEN so the kernel starts
     // multicasting proc events to us.
@@ -142,15 +174,24 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
                 .val(CnMsgVal::Proc)
                 .payload(ProcCnMcastOp::Listen)
                 .build()
-                .map_err(|e| ProcMonError::Socket(format!("build subscribe msg: {e}")))?,
+                .map_err(|source| ProcMonError::Build {
+                    what: "subscribe message",
+                    source: Box::new(source),
+                })?,
         ))
         .build()
-        .map_err(|e| ProcMonError::Socket(format!("build subscribe header: {e}")))?;
+        .map_err(|source| ProcMonError::Build {
+            what: "subscribe header",
+            source: Box::new(source),
+        })?;
 
     socket
         .send(&subscribe)
         .await
-        .map_err(|e| ProcMonError::Socket(format!("send subscribe: {e}")))?;
+        .map_err(|source| ProcMonError::Socket {
+            action: "sending subscribe on",
+            source: Box::new(source),
+        })?;
 
     tracing::info!("cn_proc listener subscribed (PROC_CN_MCAST_LISTEN)");
 
@@ -176,7 +217,12 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
                 );
                 continue;
             }
-            Err(e) => return Err(ProcMonError::Socket(format!("recv: {e}"))),
+            Err(source) => {
+                return Err(ProcMonError::Socket {
+                    action: "receiving from",
+                    source: Box::new(source),
+                });
+            }
         };
 
         for msg in iter {

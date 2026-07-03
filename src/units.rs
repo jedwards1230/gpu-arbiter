@@ -33,15 +33,47 @@ use crate::gpu::{GpuBackend, GpuMemory};
 /// Managed-unit control errors.
 #[derive(Debug, thiserror::Error)]
 pub enum UnitError {
-    /// A process-control invocation (systemd or command-driven) failed.
-    #[error("{action} {unit} failed: {detail}")]
-    Systemctl {
+    /// A process-control invocation (`systemctl <verb>`, or a configured
+    /// `*_cmd` override for a non-systemd [`Supervisor`]) could not be spawned.
+    /// The underlying [`std::io::Error`] is preserved as the source, so callers
+    /// can inspect `ErrorKind`/`raw_os_error` (e.g. a misconfigured `*_cmd`
+    /// binary surfaces as `ErrorKind::NotFound`) instead of only a formatted
+    /// message. Named `Control`, not `Systemctl`: it also covers OpenRC/runit/
+    /// plain-command supervisors, not just systemd.
+    #[error("{action} {unit}: spawning failed: {source}")]
+    Control {
         /// The control verb (start/stop/kill/is-active).
-        action: String,
+        action: &'static str,
         /// The unit name.
         unit: String,
-        /// Failure detail.
+        /// The underlying spawn failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A process-control invocation ran and exited non-zero (or, for
+    /// [`Supervisor::Command`], had no configured argv for the verb — there's
+    /// nothing to run, and silently no-op-ing a start/stop the caller expected
+    /// to happen would be worse than a typed error).
+    #[error("{action} {unit} failed: {detail}")]
+    Exit {
+        /// The control verb (start/stop/kill/is-active).
+        action: &'static str,
+        /// The unit name.
+        unit: String,
+        /// Failure detail (trimmed stderr, or why nothing ran).
         detail: String,
+    },
+    /// A process-control invocation exceeded [`SYSTEMCTL_TIMEOUT`]. A wedged
+    /// init system (stuck D-Bus, hung PID 1 transaction) must never hang the
+    /// single reconcile task, so every control invocation is time-boxed.
+    #[error("{action} {unit} timed out after {elapsed:?}")]
+    Timeout {
+        /// The control verb (start/stop/kill/is-active).
+        action: &'static str,
+        /// The unit name.
+        unit: String,
+        /// The configured bound that elapsed.
+        elapsed: Duration,
     },
     /// The GPU query during the eviction wait failed.
     #[error("gpu query during eviction: {0}")]
@@ -182,8 +214,8 @@ pub fn parse_ollama_ps(out: &str) -> Vec<String> {
 }
 
 /// Run `systemctl <action> <unit>`; map a non-zero exit / spawn failure into a
-/// typed [`UnitError::Systemctl`]. Async. The systemd default path.
-async fn systemctl(action: &str, unit: &str) -> Result<std::process::Output, UnitError> {
+/// typed [`UnitError`]. Async. The systemd default path.
+async fn systemctl(action: &'static str, unit: &str) -> Result<std::process::Output, UnitError> {
     run_argv(
         action,
         unit,
@@ -194,15 +226,16 @@ async fn systemctl(action: &str, unit: &str) -> Result<std::process::Output, Uni
 }
 
 /// Spawn a shell-free argv (`prog argv...`) plus a final `unit_arg`, bound by
-/// [`SYSTEMCTL_TIMEOUT`]; map a spawn failure / timeout into a typed
-/// [`UnitError::Systemctl`]. **Never** routes through a shell.
+/// [`SYSTEMCTL_TIMEOUT`]; map an empty argv / timeout / spawn failure into a
+/// typed [`UnitError`] ([`UnitError::Exit`] / [`UnitError::Timeout`] /
+/// [`UnitError::Control`] respectively). **Never** routes through a shell.
 ///
 /// `action`/`unit` only label the error. The systemd path passes
 /// `["systemctl", "<verb>"]` + the unit as `unit_arg`; the command path passes
 /// the configured argv with `unit_arg` empty (the unit is already baked into the
 /// argv).
 async fn run_argv(
-    action: &str,
+    action: &'static str,
     unit: &str,
     argv: &[String],
     unit_arg: &str,
@@ -211,8 +244,8 @@ async fn run_argv(
         // Empty argv (e.g. a Command supervisor missing this verb) — nothing to
         // run. Surface as a typed error so callers don't silently no-op a
         // start/stop they expected to happen.
-        return Err(UnitError::Systemctl {
-            action: action.to_string(),
+        return Err(UnitError::Exit {
+            action,
             unit: unit.to_string(),
             detail: "empty command (no override configured for this verb)".to_string(),
         });
@@ -226,15 +259,15 @@ async fn run_argv(
     // A wedged init system / hung command must never hang the reconcile task.
     tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut)
         .await
-        .map_err(|_| UnitError::Systemctl {
-            action: action.to_string(),
+        .map_err(|_| UnitError::Timeout {
+            action,
             unit: unit.to_string(),
-            detail: format!("timed out after {SYSTEMCTL_TIMEOUT:?}"),
+            elapsed: SYSTEMCTL_TIMEOUT,
         })?
-        .map_err(|e| UnitError::Systemctl {
-            action: action.to_string(),
+        .map_err(|source| UnitError::Control {
+            action,
             unit: unit.to_string(),
-            detail: format!("spawn failed: {e}"),
+            source,
         })
 }
 
@@ -336,8 +369,8 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(UnitError::Systemctl {
-            action: "start".to_string(),
+        Err(UnitError::Exit {
+            action: "start",
             unit: u.unit.clone(),
             detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         })
@@ -382,8 +415,8 @@ pub async fn evict(
     // request dying is accepted by design.
     let stop = stop_unit(&sup, &u.unit).await?;
     if !stop.status.success() {
-        return Err(UnitError::Systemctl {
-            action: "stop".to_string(),
+        return Err(UnitError::Exit {
+            action: "stop",
             unit: u.unit.clone(),
             detail: String::from_utf8_lossy(&stop.stderr).trim().to_string(),
         });
@@ -465,8 +498,8 @@ async fn kill_unit(sup: &Supervisor, unit: &str) -> Result<(), UnitError> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(UnitError::Systemctl {
-            action: "kill".to_string(),
+        Err(UnitError::Exit {
+            action: "kill",
             unit: unit.to_string(),
             detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         })
@@ -611,7 +644,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         // as a typed error rather than a panic. On a systemd host this returns a
         // real bool. Either way: not a panic. (Default supervisor = Systemd.)
         let r = is_running(&systemd_unit("ollama.service")).await;
-        assert!(r.is_ok() || matches!(r, Err(UnitError::Systemctl { .. })));
+        assert!(r.is_ok() || matches!(r, Err(UnitError::Control { .. })));
     }
 
     fn unit(name: &str, kind: Option<&str>, introspect_cmd: Option<&str>) -> ManagedUnit {
@@ -812,6 +845,6 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         // Force Command resolution by also setting another override.
         u.stop_cmd = Some(crate::config::ArgvCmd(vec!["true".to_string()]));
         let r = is_running(&u).await;
-        assert!(matches!(r, Err(UnitError::Systemctl { .. })));
+        assert!(matches!(r, Err(UnitError::Exit { .. })));
     }
 }
