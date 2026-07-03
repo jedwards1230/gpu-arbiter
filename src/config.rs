@@ -921,20 +921,35 @@ mod tests {
         assert_eq!(c.game_patterns[0].match_substr, "Heroic");
     }
 
-    /// Config contract guard: this is the **verbatim** output of a deployment
-    /// template rendered with stock defaults (plus two `game_patterns` exercising
-    /// the loop and the `\`/`"` escaping). If the daemon's serde schema and the
-    /// rendered file ever drift apart, this parse fails — keeping the
-    /// deployment contract honest. Regenerate from the template, do not hand-edit.
+    /// Config contract guard: this is the **verbatim** output of the current
+    /// deployment template (`homelab-ansible` `roles/desktop-common/templates/
+    /// gpu-arbiter/config.toml.j2`, fixed in homelab-ansible#195) rendered with
+    /// realistic desktop-1 values — **two** `[[managed_units]]` entries (Ollama +
+    /// an ASR runner, both carrying `vram_match`) and two `[[game_patterns]]`
+    /// entries (exercising the loop and the `\`/`"` escaping). If the daemon's
+    /// serde schema and the rendered file ever drift apart, this parse fails —
+    /// keeping the deployment contract honest. Regenerate from the template, do
+    /// not hand-edit.
+    ///
+    /// Root scalars (`enabled` through `gpu_allowlist`) all render **before**
+    /// both table headers — this is the corrected ordering. See
+    /// [`unknown_key_after_managed_units_table_is_rejected`] just below for what
+    /// happens (and why) when they don't (#35).
     #[test]
     fn parses_rendered_ansible_template() {
         let rendered = r#"# Managed by Ansible - DO NOT EDIT MANUALLY
 # gpu-arbiter daemon config. Keys map 1:1 to the serde Config struct in
 # gpu-arbiter src/config.rs (TOML key = gpu_arbiter_* var minus the prefix).
+#
+# TOML ordering is load-bearing: every root-level bare key MUST appear before
+# the first table header ([[managed_units]] / [[game_patterns]]) — a bare key
+# after a table header belongs to THAT table, not the root. gpu-arbiter
+# >= 0.10.0 parses with deny_unknown_fields and rejects a misplaced key
+# outright (0.9.0 silently discarded them, which hid exactly this bug).
 
 # String values are escaped (`\` and `"`) so a quote in any Ansible var can't
 # break out of its TOML string and inject arbitrary config.
-enabled = false
+enabled = true
 port = 48750
 ollama_unit = "ollama.service"
 eager_ollama = true
@@ -948,11 +963,20 @@ vram_heuristic = false
 vram_game_threshold_mb = 4000
 gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
 
+# Multi-tenant eviction (v0.3.0+). When this list is present it TAKES PRECEDENCE
+# over the legacy ollama_unit/eager_ollama keys above. Eviction runs in order.
+[[managed_units]]
+unit = "ollama.service"
+eager_restart = true
+vram_match = "ollama"
+[[managed_units]]
+unit = "asr-runner.service"
+eager_restart = false
+vram_match = "asr-runner"
 
 [[game_patterns]]
 name = "heroic"
 match = "Heroic"
-
 
 [[game_patterns]]
 name = "quo\"te\\back"
@@ -960,8 +984,12 @@ match = "Has\"Quote\\Back"
 "#;
         let c = Config::from_toml(rendered).expect("rendered Ansible config must parse");
 
-        // Every serde field is populated by the rendered file (the contract).
-        assert!(!c.enabled); // Ansible default is feature-off.
+        // Every root-level serde field is populated by the rendered file (the
+        // contract) — asserted against the actual values, not just "it parses",
+        // so a future fixture that regresses back to the broken ordering (where
+        // these would silently read as defaults on the pre-deny_unknown_fields
+        // daemon) fails loudly here too.
+        assert!(c.enabled);
         assert_eq!(c.port, 48750);
         assert_eq!(c.ollama_unit, "ollama.service");
         assert!(c.eager_ollama);
@@ -975,11 +1003,87 @@ match = "Has\"Quote\\Back"
             c.gpu_allowlist,
             vec!["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
         );
+
+        // The motivating multi-unit case (#35): two managed units, evicted in
+        // declared order, each independently carrying its own `vram_match`.
+        assert_eq!(c.managed_units.len(), 2);
+        let units = c.resolved_units();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].unit, "ollama.service");
+        assert!(units[0].eager_restart);
+        assert_eq!(units[0].vram_match.as_deref(), Some("ollama"));
+        assert_eq!(units[1].unit, "asr-runner.service");
+        assert!(!units[1].eager_restart);
+        assert_eq!(units[1].vram_match.as_deref(), Some("asr-runner"));
+
         // The `match` TOML key (serde-renamed) and `\`/`"` escaping round-trip.
         assert_eq!(c.game_patterns.len(), 2);
         assert_eq!(c.game_patterns[0].name, "heroic");
         assert_eq!(c.game_patterns[0].match_substr, "Heroic");
         assert_eq!(c.game_patterns[1].name, "quo\"te\\back");
         assert_eq!(c.game_patterns[1].match_substr, "Has\"Quote\\Back");
+    }
+
+    /// Negative companion to [`parses_rendered_ansible_template`] (#35): the
+    /// **pre-homelab-ansible#195** template rendered the detection keys
+    /// (`detect_steam`/`vram_heuristic`/`vram_game_threshold_mb`/`gpu_allowlist`)
+    /// *below* the `[[managed_units]]` tables. In TOML, a bare `key = value`
+    /// belongs to the most recently opened table — there is no "back to root"
+    /// without an explicit `[table]`/top-level marker — so those four keys
+    /// deserialized as fields of the *last* `[[managed_units]]` entry
+    /// (`asr-runner.service`) instead of the `Config` root. `ManagedUnit` also
+    /// carries `#[serde(deny_unknown_fields)]`, so gpu-arbiter >= 0.10.0 fails
+    /// to parse this file outright — which is exactly what crash-looped
+    /// desktop-1 on the v0.10.0 rollout (0.9.0's absence of
+    /// `deny_unknown_fields` had silently dropped the misplaced keys instead,
+    /// masking the bug rather than fixing it). This fixture is the verbatim
+    /// output of that old template with the same values as the corrected fixture
+    /// above — it must fail, and the error must name the first misplaced key,
+    /// `detect_steam`.
+    #[test]
+    fn unknown_key_after_managed_units_table_is_rejected() {
+        let rendered = r#"# Managed by Ansible - DO NOT EDIT MANUALLY
+# gpu-arbiter daemon config. Keys map 1:1 to the serde Config struct in
+# gpu-arbiter src/config.rs (TOML key = gpu_arbiter_* var minus the prefix).
+
+# String values are escaped (`\` and `"`) so a quote in any Ansible var can't
+# break out of its TOML string and inject arbitrary config.
+enabled = true
+port = 48750
+ollama_unit = "ollama.service"
+eager_ollama = true
+eviction_timeout_s = 5
+vram_free_threshold_mb = 2000
+reconcile_interval_s = 30
+
+# Multi-tenant eviction (v0.3.0+). When this list is present it TAKES PRECEDENCE
+# over the legacy ollama_unit/eager_ollama keys above. Eviction runs in order.
+[[managed_units]]
+unit = "ollama.service"
+eager_restart = true
+vram_match = "ollama"
+[[managed_units]]
+unit = "asr-runner.service"
+eager_restart = false
+vram_match = "asr-runner"
+
+# --- detection ---
+detect_steam = true
+vram_heuristic = false
+vram_game_threshold_mb = 4000
+gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
+
+[[game_patterns]]
+name = "heroic"
+match = "Heroic"
+"#;
+        let err = Config::from_toml(rendered).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("detect_steam"),
+            "error should name the first key misplaced into the trailing \
+             [[managed_units]] table (asr-runner.service), not silently apply \
+             defaults or attribute to a different unit: {err}"
+        );
     }
 }

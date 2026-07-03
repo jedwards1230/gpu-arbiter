@@ -69,13 +69,6 @@
 # owning systemd unit when cgroup attribution resolved one.
 #gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
 
-# Cmdline-substring patterns for non-Steam launchers. Repeat the table per
-# launcher. `name` becomes the claim `pattern:<name>`; `match` is the substring
-# matched against a process cmdline.
-#[[game_patterns]]
-#name = "heroic"
-#match = "Heroic"
-
 # --- presence ----------------------------------------------------------------
 
 # Watch physical input devices (keyboard/mouse/gamepad) to report local at-desk
@@ -87,6 +80,25 @@
 # Seconds of physical-input silence after which local presence is reported as
 # absent (local_present = 0).
 #presence_idle_threshold_s = 600
+
+# ------------------------------------------------------------------------------
+# NOTE: every root-level key above this line MUST stay above this line. TOML
+# assigns a bare `key = value` to the most recently opened table, not the file
+# root — so an uncommented root key placed after one of the [[game_patterns]]
+# or [[managed_units]] tables below would silently join THAT table instead of
+# Config, and (since every table here carries deny_unknown_fields) fail to
+# parse rather than apply. This bit a real deploy: see gpu-arbiter#35 /
+# homelab-ansible#195, and the `parses_rendered_ansible_template` /
+# `unknown_key_after_managed_units_table_is_rejected` contract tests in
+# src/config.rs.
+# ------------------------------------------------------------------------------
+
+# Cmdline-substring patterns for non-Steam launchers. Repeat the table per
+# launcher. `name` becomes the claim `pattern:<name>`; `match` is the substring
+# matched against a process cmdline.
+#[[game_patterns]]
+#name = "heroic"
+#match = "Heroic"
 
 # --- managed units -----------------------------------------------------------
 #
