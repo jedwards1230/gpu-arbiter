@@ -262,8 +262,7 @@ mod linux {
         let has_keys = has_key_type
             && dev
                 .supported_keys()
-                .map(|keys| keys.iter().next().is_some())
-                .unwrap_or(false);
+                .is_some_and(|keys| keys.iter().next().is_some());
         InputCaps {
             has_keys,
             has_rel: events.contains(EventType::RELATIVE),
