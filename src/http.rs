@@ -40,7 +40,9 @@ use crate::units;
 /// `state` is the live [`ArbiterState`] (also mutated by the reconcile task);
 /// `triggers` lets the `/units/*` handlers nudge a reconcile; `cfg` is the
 /// (immutable, shared) daemon config those debug handlers use to validate and
-/// address managed units.
+/// address managed units; `backend` is the GPU vendor resolved once at daemon
+/// startup (see [`crate::gpu::GpuBackend::resolve`]), reused by the manual
+/// `POST /units/{unit}/stop` eviction path rather than re-probed per request.
 #[derive(Clone)]
 pub struct AppState {
     /// Live arbiter state, shared with the reconcile task.
@@ -49,6 +51,8 @@ pub struct AppState {
     pub triggers: mpsc::Sender<ReconcileTrigger>,
     /// Immutable daemon config (for the `/units/*` debug handlers).
     pub cfg: Arc<Config>,
+    /// GPU vendor backend, resolved once at startup.
+    pub backend: GpuBackend,
 }
 
 /// Build the axum [`Router`] for the control surface. Pulled out of [`serve`] so
@@ -422,8 +426,7 @@ async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, Strin
         Ok(managed) => managed,
         Err(deny) => return deny,
     };
-    let backend = GpuBackend::resolve(app.cfg.gpu_backend);
-    match units::evict(managed, &app.cfg, backend).await {
+    match units::evict(managed, &app.cfg, app.backend).await {
         Ok(outcome) => {
             tracing::info!(%unit, ?outcome, "manual unit stop");
             let _ = app.triggers.send(ReconcileTrigger::Manual).await;

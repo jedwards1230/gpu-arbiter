@@ -177,16 +177,20 @@ pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> anyhow::Result<Proc
 /// `gaming → available` restart is **verified** — `claim_set` is recomputed from
 /// a fresh observation, so an orphaned game child keeps the state `gaming` and
 /// the managed units stay off.
+///
+/// `backend` is resolved **once**, at daemon startup (see `main`'s
+/// `async_main`) — not re-probed every pass. This is a deliberate behavior
+/// change from re-resolving `cfg.gpu_backend` on every call: re-probing let
+/// `auto`-detection flip vendors mid-run (e.g. a transient `nvidia-smi` PATH
+/// hiccup), which no downstream code expects. `Copy`, so threading it through
+/// every pass costs nothing.
 pub async fn reconcile(
     state: &Arc<Mutex<ArbiterState>>,
     cfg: &Config,
     presence: &crate::presence::PresenceMonitor,
     trigger: ReconcileTrigger,
+    backend: GpuBackend,
 ) -> anyhow::Result<()> {
-    // Resolve the GPU vendor backend once per pass (a cheap Copy probe). Threaded
-    // through every GPU query so the whole pass talks to one vendor.
-    let backend = GpuBackend::resolve(cfg.gpu_backend);
-
     // Slow, off-lock: scan /proc (+ optional GPU procs).
     let snap = observe(cfg, backend).await?;
     let claims = claim_set(&snap, cfg);
@@ -495,9 +499,15 @@ mod tests {
         s.state = State::Gaming;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
-            .await
-            .unwrap();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
         let g = state.lock().await;
         assert_eq!(g.state, State::Available);
         assert!(g.claims.is_empty());
@@ -523,9 +533,15 @@ mod tests {
         .unwrap();
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
-            .await
-            .unwrap();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
         let g = state.lock().await;
         assert_eq!(g.units.len(), 2);
         // Order matches the configured (eviction) order.
@@ -542,9 +558,15 @@ mod tests {
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(1_700_000_000);
         presence.record_input(1_700_000_500);
-        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
-            .await
-            .unwrap();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
         let g = state.lock().await;
         assert_eq!(g.presence.last_input_unix, 1_700_000_500);
         // A fresh monitor that never enumerated is unhealthy (fail-safe default).
@@ -611,9 +633,15 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
-            .await
-            .unwrap();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(state.lock().await.state, State::Available);
         assert!(
             marker.exists(),
@@ -632,9 +660,15 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
-            .await
-            .unwrap();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
         assert!(
             !marker.exists(),
             "ensure-running must not start a unit already reported running"
@@ -652,9 +686,15 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
-            .await
-            .unwrap();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
         assert!(
             !marker.exists(),
             "a non-eager unit must not be auto-started"
@@ -684,9 +724,15 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
-            .await
-            .unwrap();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
         assert!(
             marker.exists(),
             "a start should be attempted when is_running can't confirm the unit is up"
@@ -713,9 +759,15 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
-            .await
-            .expect("reconcile must succeed even when an eager unit's start fails");
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .expect("reconcile must succeed even when an eager unit's start fails");
         // State still settles Available — a failed start doesn't corrupt state.
         assert_eq!(state.lock().await.state, State::Available);
     }
@@ -732,9 +784,15 @@ mod tests {
         s.state = State::Gaming;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer)
-            .await
-            .unwrap();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(state.lock().await.state, State::Available);
         assert!(marker.exists());
         let _ = std::fs::remove_file(&marker);

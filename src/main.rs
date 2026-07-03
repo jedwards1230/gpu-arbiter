@@ -135,6 +135,7 @@ mod linux {
     use std::time::Duration;
 
     use gpu_arbiter::config::Config;
+    use gpu_arbiter::gpu::GpuBackend;
     use gpu_arbiter::http::{self, AppState};
     use gpu_arbiter::presence::{self, PresenceMonitor};
     use gpu_arbiter::procmon;
@@ -167,6 +168,14 @@ mod linux {
         //    --config / GPU_ARBITER_CONFIG / the built-in default by the caller.
         let cfg = Arc::new(Config::load(&config_path)?);
         tracing::info!(config_path = %config_path, "loaded config");
+
+        // Resolve the GPU vendor **once**, here at startup, and thread the
+        // `Copy` value through every reconcile pass and the HTTP manual-stop
+        // path. Re-probing per pass (the old behavior) let `auto`-detection
+        // flip vendors mid-run; a single resolution keeps the whole daemon
+        // lifetime talking to one vendor, matching the config doc's contract.
+        let backend = GpuBackend::resolve(cfg.gpu_backend);
+        tracing::info!(?backend, "resolved GPU backend");
 
         // Honor the master `enabled` switch: a manual `enabled = false` in the
         // config (a quick disable without touching systemd) exits cleanly instead
@@ -210,7 +219,8 @@ mod linux {
         //    restart or boot must never start Ollama into a live game. Run one
         //    synchronous pass here; nothing else touches Ollama until it returns
         //    (the reconcile task and HTTP server aren't spawned yet).
-        if let Err(e) = reconcile::reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer).await
+        if let Err(e) =
+            reconcile::reconcile(&state, &cfg, &presence, ReconcileTrigger::Timer, backend).await
         {
             // A failed startup reconcile is non-fatal: we log and continue —
             // the periodic backstop will retry. We do NOT start Ollama on
@@ -239,6 +249,7 @@ mod linux {
             cfg.clone(),
             presence.clone(),
             triggers_rx,
+            backend,
         ));
 
         // 5. cn_proc netlink listener → ProcEvent triggers.
@@ -257,6 +268,7 @@ mod linux {
             state: state.clone(),
             triggers: triggers_tx.clone(),
             cfg: cfg.clone(),
+            backend,
         };
         let http_handle = tokio::spawn(async move {
             if let Err(e) = http::serve(addr, app).await {
@@ -298,6 +310,7 @@ mod linux {
         cfg: Arc<Config>,
         presence: PresenceMonitor,
         mut triggers: mpsc::Receiver<ReconcileTrigger>,
+        backend: GpuBackend,
     ) {
         let mut interval =
             tokio::time::interval(Duration::from_secs(cfg.reconcile_interval_s.max(1)));
@@ -328,7 +341,8 @@ mod linux {
             // reconcile() manages the state lock internally — it holds it only
             // for brief mutations and DROPS it across the slow eviction/shell-out
             // window so `/status` never blocks (see reconcile docs).
-            if let Err(e) = reconcile::reconcile(&state, &cfg, &presence, effective).await {
+            if let Err(e) = reconcile::reconcile(&state, &cfg, &presence, effective, backend).await
+            {
                 tracing::error!(error = %e, "reconcile pass failed");
             }
         }
