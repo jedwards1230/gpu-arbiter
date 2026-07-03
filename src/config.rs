@@ -385,9 +385,15 @@ pub struct Config {
     /// Path to the unix control socket that serves the write path (`POST
     /// /units/{unit}/start|stop`, `/ollama/start|stop`) — the sanctioned
     /// control surface (local-only, no bearer tokens). Bound mode `0600`,
-    /// root-owned: the socket file's permissions ARE the auth boundary, not
-    /// an in-process check (unix-socket peers carry no `SocketAddr` to gate
-    /// on). Default `/run/gpu-arbiter.sock`. The TCP `/units/*`/`/ollama/*`
+    /// root-owned, inside a mode-`0700` root-owned parent directory (see
+    /// [`crate::http::serve_uds`] — the parent directory closes a
+    /// bind-then-chmod permission race and is itself part of the auth
+    /// boundary, not just the socket file's own mode). Default
+    /// `/run/gpu-arbiter/gpu-arbiter.sock` — a dedicated subdirectory of
+    /// `/run`, not bare `/run` itself, specifically so the daemon (or
+    /// systemd's `RuntimeDirectory=`, see `packaging/gpu-arbiter.service`)
+    /// has a directory of its own to lock down to `0700` rather than relying
+    /// solely on the socket file's mode. The TCP `/units/*`/`/ollama/*`
     /// routes keep working (loopback-gated) for back-compat but are
     /// deprecated in favor of this socket. An **empty string** disables the
     /// unix socket entirely.
@@ -401,9 +407,13 @@ fn default_bind() -> IpAddr {
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 
-/// serde default for [`Config::socket_path`].
+/// serde default for [`Config::socket_path`]: `/run/gpu-arbiter/gpu-arbiter.sock`.
+///
+/// A dedicated subdirectory of `/run` (not bare `/run/gpu-arbiter.sock`, the
+/// pre-#61 default) — see [`crate::http::serve_uds`]'s docs for why the
+/// parent directory itself needs to be lockable to mode `0700`.
 fn default_socket_path() -> String {
-    "/run/gpu-arbiter.sock".to_string()
+    "/run/gpu-arbiter/gpu-arbiter.sock".to_string()
 }
 
 impl Default for Config {
@@ -554,12 +564,13 @@ mod tests {
         assert!(c.presence_detection);
         assert_eq!(c.presence_idle_threshold_s, 600);
         // #22/#17: bind defaults to every interface (unchanged historical
-        // behavior); the unix control socket defaults to /run/gpu-arbiter.sock.
+        // behavior); the unix control socket defaults to a dedicated,
+        // lockable-to-0700 subdirectory of /run (#61).
         assert_eq!(
             c.bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         );
-        assert_eq!(c.socket_path, "/run/gpu-arbiter.sock");
+        assert_eq!(c.socket_path, "/run/gpu-arbiter/gpu-arbiter.sock");
     }
 
     #[test]

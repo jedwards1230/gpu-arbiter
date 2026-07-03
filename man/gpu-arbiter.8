@@ -252,9 +252,9 @@ transports: a
 .B unix control socket
 .RB ( socket_path ,
 default
-.IR /run/gpu-arbiter.sock ,
-mode 0600 root\-owned) \(em the sanctioned surface, local\-root\-only, no bearer
-tokens, the socket file's permissions being the entire auth boundary \(em and,
+.IR /run/gpu-arbiter/gpu-arbiter.sock ,
+mode 0600 root\-owned, inside a mode 0700 root\-owned parent directory) \(em
+the sanctioned surface, local\-root\-only, no bearer tokens \(em and,
 .BR deprecated ,
 the same TCP port (additionally localhost\-only there), kept for back\-compat
 with

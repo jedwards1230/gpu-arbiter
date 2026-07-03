@@ -22,10 +22,12 @@
 //! (`/units/*`, `/ollama/*`) is served twice:
 //!
 //! - a **unix domain socket** ([`crate::config::Config::socket_path`],
-//!   default `/run/gpu-arbiter.sock`, mode `0600` root-owned) — the
-//!   sanctioned control surface. The socket file's permissions ARE the auth
-//!   boundary (local root only, no bearer tokens, no `SocketAddr` to gate
-//!   on for a unix peer); see [`write_router`] / [`serve_uds`].
+//!   default `/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned,
+//!   inside a mode-`0700` root-owned parent directory) — the sanctioned
+//!   control surface. The socket file's permissions (and its parent
+//!   directory's — see [`serve_uds`]'s docs) ARE the auth boundary (local
+//!   root only, no bearer tokens, no `SocketAddr` to gate on for a unix
+//!   peer); see [`write_router`] / [`serve_uds`].
 //! - the **TCP** port, kept working for back-compat (the tray and existing
 //!   scripts) but **deprecated** — it additionally rejects any client whose
 //!   peer address is not loopback, enforced in-process via [`ConnectInfo`] so
@@ -615,26 +617,46 @@ pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
 /// Serve [`write_router`] (the manual start/stop write path — #17) on a unix
 /// domain socket at `socket_path` until the process exits.
 ///
-/// - Creates the parent directory if missing (`/run` always exists under
-///   systemd, but a custom `socket_path` may name a subdirectory).
+/// - Creates the parent directory (mode `0700`, root-owned — see below) if
+///   missing. The default `socket_path`
+///   ([`crate::config::default_socket_path`]) is
+///   `/run/gpu-arbiter/gpu-arbiter.sock`, a dedicated subdirectory rather
+///   than bare `/run`, specifically so this directory exists and is ours to
+///   lock down; a custom `socket_path` may also name a (possibly nested)
+///   subdirectory.
 /// - Removes a stale socket file left by an unclean prior shutdown before
 ///   binding (a leftover file makes `bind` fail with `AddrInUse`).
 /// - Sets the socket file mode to `0600` **after** binding (the mode a
 ///   freshly-created unix socket gets is umask-dependent, so this pins it
-///   explicitly) — root-owned (the daemon runs as root), so this is the
-///   entire auth boundary for the write path: any other local root process
-///   can reach it, no other user/process can.
+///   explicitly) — root-owned (the daemon runs as root), so this is
+///   *additional* hardening for the write path's auth boundary, not the
+///   whole of it (see the parent-directory note below).
 ///
-/// `#[cfg(unix)]`: `tokio::net::UnixListener` and the `0600`-mode step both
-/// need a unix target. The daemon only ever runs on Linux, but this compiles
-/// equally on the macOS dev host (macOS is unix too), so no non-unix stub is
-/// needed — the crate has never targeted a non-unix host.
+/// **The parent directory is part of the auth boundary, not just the
+/// post-bind `0600` file mode (#61):** between `UnixListener::bind()`
+/// creating the socket file (with an umask-derived, potentially
+/// world-connectable mode under a permissive umask) and the `set_permissions`
+/// call above pinning it to `0600`, the listener is already accepting
+/// connections — a window during which another local user could connect
+/// before the mode is locked down. Creating the parent directory at mode
+/// `0700` (root-only traversal) closes that window structurally: no other
+/// user can even resolve the socket path to attempt a connection during it,
+/// regardless of the file's own mode at any instant. The post-bind chmod
+/// above is kept as belt-and-braces (defense in depth for a `socket_path`
+/// pointed at a pre-existing, more permissive directory), not the sole
+/// defense.
+///
+/// `#[cfg(unix)]`: `tokio::net::UnixListener`, `tokio::fs::DirBuilder::mode`,
+/// and the `0600`-mode step all need a unix target. The daemon only ever runs
+/// on Linux, but this compiles equally on the macOS dev host (macOS is unix
+/// too), so no non-unix stub is needed — the crate has never targeted a
+/// non-unix host.
 ///
 /// # Errors
 ///
-/// Returns [`HttpError`] if the parent directory can't be created, a stale
-/// socket file can't be removed, binding the unix listener fails, its mode
-/// can't be set to `0600`, or the serve loop itself fails.
+/// Returns [`HttpError`] if the parent directory can't be created at mode
+/// `0700`, a stale socket file can't be removed, binding the unix listener
+/// fails, its mode can't be set to `0600`, or the serve loop itself fails.
 #[cfg(unix)]
 pub async fn serve_uds(socket_path: &str, app: AppState) -> Result<(), HttpError> {
     use std::os::unix::fs::PermissionsExt;
@@ -643,7 +665,17 @@ pub async fn serve_uds(socket_path: &str, app: AppState) -> Result<(), HttpError
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        tokio::fs::create_dir_all(parent).await?;
+        // `recursive(true)` covers a nested custom `socket_path` (matching the
+        // old `create_dir_all` behavior) and is also what makes this a no-op
+        // when systemd's `RuntimeDirectory=`/`RuntimeDirectoryMode=0700` (see
+        // packaging/gpu-arbiter.service) already created the directory before
+        // the daemon started — `DirBuilder::create` only applies `mode` to
+        // directories it actually creates, so a pre-existing, already-0700
+        // directory is left untouched rather than re-chmod'd.
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder.create(parent).await?;
     }
     match tokio::fs::remove_file(path).await {
         Ok(()) => tracing::debug!(socket = socket_path, "removed stale control socket"),
@@ -1312,5 +1344,122 @@ mod tests {
         // legitimately have zero series (nothing to iterate).
         assert!(!out.contains("gpu_arbiter_evictions_total{"));
         assert!(!out.contains("gpu_arbiter_unit_restarts_total{"));
+    }
+
+    // ── unix control socket parent-directory hardening (#61) ───────────────
+
+    /// A short-as-possible unique temp directory path for a `UnixListener`
+    /// bind test. Deliberately NOT `std::env::temp_dir()` (as the rest of the
+    /// crate's tests use — e.g. `units::tests::start_by_name_resolves_and_starts`'s
+    /// marker path): on macOS that resolves under `/var/folders/<hash>/...`,
+    /// long enough that appending even a short unique suffix plus
+    /// `/gpu-arbiter.sock` overflows `sockaddr_un.sun_path` (108 bytes on
+    /// Linux, 104 on macOS/BSD) and `bind()` fails with `ENAMETOOLONG` before
+    /// ever creating the socket file — not a real-world concern (the daemon's
+    /// actual default/configured paths are short), but exactly what would
+    /// happen here. `/tmp` is short on every unix `cargo test` runs on.
+    fn short_unique_socket_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::path::PathBuf::from("/tmp").join(format!(
+            "ga-{label}-{}-{}",
+            std::process::id(),
+            nanos % 1_000_000_000
+        ))
+    }
+
+    #[tokio::test]
+    async fn serve_uds_creates_0700_parent_dir_and_0600_socket() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = short_unique_socket_dir("new");
+        let _ = std::fs::remove_dir_all(&dir);
+        let socket_path = dir.join("gpu-arbiter.sock").to_string_lossy().into_owned();
+
+        let app = AppState {
+            state: Arc::new(RwLock::new(ArbiterState::new())),
+            triggers: mpsc::channel(1).0,
+            cfg: Arc::new(Config::default()),
+        };
+        let handle = tokio::spawn(async move {
+            let _ = serve_uds(&socket_path, app).await;
+        });
+
+        // Poll for the socket file to appear rather than a fixed sleep — bind
+        // + chmod is fast, but not instant, and a fixed sleep would either
+        // flake under load or waste time in the common case.
+        let socket_file = dir.join("gpu-arbiter.sock");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !socket_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "serve_uds never created the socket file within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The parent directory: mode 0700 (root-only traversal), created by
+        // serve_uds itself — the auth-boundary-closing fix (#61).
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "parent directory must be mode 0700");
+
+        // The socket file itself: still pinned to 0600 (belt-and-braces,
+        // unchanged from before #61).
+        let socket_mode = std::fs::metadata(&socket_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(socket_mode, 0o600, "socket file must be mode 0600");
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn serve_uds_leaves_a_preexisting_parent_dir_mode_untouched() {
+        // Mirrors what systemd's RuntimeDirectory=/RuntimeDirectoryMode=0700
+        // does before the daemon even starts (see packaging/gpu-arbiter.service):
+        // the parent directory already exists. `DirBuilder::create` with
+        // `recursive(true)` must be a no-op on an existing directory, not an
+        // error and not a re-chmod — assert a deliberately-different
+        // pre-existing mode survives untouched.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = short_unique_socket_dir("preexisting");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let socket_path = dir.join("gpu-arbiter.sock").to_string_lossy().into_owned();
+        let app = AppState {
+            state: Arc::new(RwLock::new(ArbiterState::new())),
+            triggers: mpsc::channel(1).0,
+            cfg: Arc::new(Config::default()),
+        };
+        let handle = tokio::spawn(async move {
+            let _ = serve_uds(&socket_path, app).await;
+        });
+
+        let socket_file = dir.join("gpu-arbiter.sock");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !socket_file.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "serve_uds never created the socket file within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o750,
+            "a pre-existing parent directory's mode must not be altered"
+        );
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -57,12 +57,15 @@ not instead of, the firewalld rich rule.
 .TP
 .B socket_path
 String (filesystem path). Default
-.BR """/run/gpu-arbiter.sock""" .
+.BR """/run/gpu-arbiter/gpu-arbiter.sock""" .
 Path to the unix control socket serving the write path
 .RB ( "POST /units/{unit}/start|stop" ", " /ollama/start|stop ),
 created mode 0600, root\-owned \(em the sanctioned control surface (local root
-only, no bearer tokens; the socket file's permissions are the entire auth
-boundary). The parent directory is created if missing; a stale socket file
+only, no bearer tokens). The parent directory is created if missing at mode
+0700, root\-owned, and is itself part of the auth boundary, not just the
+socket file's own mode: it closes the brief window between the socket file
+being created (bind) and its mode being pinned to 0600 (chmod), during which
+another local user could otherwise attempt a connection. A stale socket file
 from an unclean prior shutdown is removed before binding. An
 .B empty string
 disables the unix socket entirely (the write path is then reachable only via

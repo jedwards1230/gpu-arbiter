@@ -60,7 +60,8 @@ configurable bind is defense-in-depth *on top of*, not instead of, that rule).
 
 The **write** path (`POST /units/{unit}/start|stop`, `/ollama/*`) is served
 twice: on a **unix control socket** (`socket_path`, default
-`/run/gpu-arbiter.sock`, mode `0600` root-owned) — the sanctioned surface,
+`/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned, inside a
+mode-`0700` root-owned parent directory) — the sanctioned surface,
 local-root-only, no bearer tokens — and, **deprecated**, on the same TCP port
 (loopback-only) for back-compat with the tray and any existing scripts. Both
 transports validate `{unit}` against `managed_units` before touching
@@ -87,7 +88,7 @@ see [Manual start/stop and holds](#manual-startstop-and-holds) below.
 Talk to the unix socket with any HTTP client that supports one, e.g.:
 
 ```sh
-curl --unix-socket /run/gpu-arbiter.sock -X POST http://localhost/units/ollama.service/stop
+curl --unix-socket /run/gpu-arbiter/gpu-arbiter.sock -X POST http://localhost/units/ollama.service/stop
 ```
 
 `/status` payload:
@@ -282,7 +283,7 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 | `enabled` | `true` | Master enable |
 | `port` | `48750` | HTTP listen port |
 | `bind` | `"0.0.0.0"` | TCP bind address for the read-only surface + deprecated TCP write routes |
-| `socket_path` | `"/run/gpu-arbiter.sock"` | Unix control socket path for the write path (mode `0600`, root-owned); empty string disables it |
+| `socket_path` | `"/run/gpu-arbiter/gpu-arbiter.sock"` | Unix control socket path for the write path (mode `0600`, root-owned, inside a mode-`0700` root-owned parent directory); empty string disables it |
 | `managed_units` | _(synthesized from `ollama_unit`)_ | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
 | `ollama_unit` | `"ollama.service"` | **Legacy** single managed unit (used when `managed_units` is unset) |
 | `eager_ollama` | `true` | **Legacy** restart-on-gaming-end for the single unit |
