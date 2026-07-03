@@ -1,4 +1,4 @@
-//! cn_proc process-event listener: subscribes to the kernel's process-event
+//! `cn_proc` process-event listener: subscribes to the kernel's process-event
 //! connector over a netlink socket (`PROC_CN_MCAST_LISTEN`) via `neli` and
 //! turns every fork/exec/exit into a **debounced** [`ReconcileTrigger::ProcEvent`].
 //!
@@ -29,12 +29,40 @@
 //! Each received message is handled in its own `match`: `Ok` → act, `Err` →
 //! `warn!`-and-skip. There is no `unwrap()`/`expect()`/`todo!()` on the hot path.
 //!
-//! **Linux-only**: netlink + cn_proc are Linux kernel interfaces. A non-Linux
+//! **Linux-only**: netlink + `cn_proc` are Linux kernel interfaces. A non-Linux
 //! stub keeps the crate compiling and `cargo test`-able on macOS.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 
 use crate::state::ReconcileTrigger;
+
+/// Cumulative count of dropped-event occurrences since daemon start (#14): one
+/// increment per `ENOBUFS` recv (kernel receive-buffer overflow, see
+/// [`is_enobufs`]) **plus** one per full-trigger-channel `try_send` drop (the
+/// reconcile task is still mid-pass). Both are already logged-and-continued as
+/// non-fatal (see the module docs). Note an `ENOBUFS` occurrence can itself
+/// represent more than one lost kernel event — the kernel doesn't report how
+/// many — so this counts drop *occurrences*, a lower bound on events actually
+/// missed, not an exact per-event tally. Still enough to make "you're missing
+/// events" visible in `/metrics` as `gpu_arbiter_proc_events_dropped_total`,
+/// since journald's short retention on the deployment host otherwise loses the
+/// log lines within hours.
+///
+/// A plain module-level atomic rather than a field on [`crate::state::ArbiterState`]:
+/// `procmon::run` has no access to `ArbiterState` (by design — it only ever holds
+/// a trigger-channel `Sender`, never touches unit/GPU state directly), and a
+/// `Relaxed` counter needs no lock to begin with. `/metrics` reads it directly via
+/// [`proc_events_dropped`]. Never reset except by a daemon restart, exactly like
+/// every other counter in `/metrics`.
+static PROC_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current dropped-event count for `/metrics`. Cheap, lock-free,
+/// cross-platform (stays `0` on non-Linux, where nothing ever increments it).
+pub fn proc_events_dropped() -> u64 {
+    PROC_EVENTS_DROPPED.load(Ordering::Relaxed)
+}
 
 /// `proc_event` `what` discriminants from the kernel's `linux/cn_proc.h`. These
 /// are a **stable kernel ABI** (the bit values have never changed), so we mirror
@@ -79,11 +107,40 @@ pub enum ProcEventKind {
 /// to the backstop timer). Per-message parse errors are **not** modeled here —
 /// neli's checked deserializer surfaces them inline in the recv loop where they
 /// are `warn!`-and-skipped, never propagated.
+///
+/// Both variants box their source rather than naming a concrete `neli` error
+/// type: `neli` is a **Linux-only** dependency (see `Cargo.toml`), but this
+/// enum — like every type in this module — must still compile on macOS for the
+/// non-Linux stub below. A boxed `dyn Error` still preserves the real
+/// source chain (`ErrorKind`/`raw_os_error` included, for the socket variant's
+/// underlying `std::io::Error`) for callers that walk `Error::source()`,
+/// without naming `neli` at the type level.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcMonError {
-    /// The netlink socket could not be opened / the multicast subscribe failed.
-    #[error("opening cn_proc netlink socket: {0}")]
-    Socket(String),
+    /// Opening the netlink socket, or the send/recv used to subscribe/listen,
+    /// failed. Wraps `neli`'s own `SocketError` (which itself carries the
+    /// underlying `std::io::Error` in its `Io` variant), rather than
+    /// flattening it into a string.
+    #[error("{action} cn_proc netlink socket: {source}")]
+    Socket {
+        /// What was being attempted (`"connecting"`, `"sending subscribe on"`,
+        /// `"receiving from"`).
+        action: &'static str,
+        /// The underlying `neli` socket failure.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// Building the subscribe message/header failed — a `neli` builder
+    /// invariant (e.g. a required field left unset), never a socket/OS
+    /// failure.
+    #[error("building {what}: {source}")]
+    Build {
+        /// What was being built (`"subscribe message"`, `"subscribe header"`).
+        what: &'static str,
+        /// The underlying builder failure.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Whether a [`ProcEventKind`] should fire a reconcile trigger.
@@ -93,12 +150,13 @@ pub enum ProcMonError {
 /// arbiter. `fork`/everything else are pure noise the level-triggered reconcile
 /// would just re-derive the same answer from, so we drop them at the source to
 /// keep the debounce channel quiet. Pure — unit-tested.
+#[must_use]
 pub fn is_trigger_kind(kind: ProcEventKind) -> bool {
     matches!(kind, ProcEventKind::Exec | ProcEventKind::Exit)
 }
 
-/// Run the cn_proc listener: open the netlink connector socket, subscribe to the
-/// `CN_IDX_PROC` multicast group with `PROC_CN_MCAST_LISTEN`, and forward a
+/// Run the `cn_proc` listener: open the netlink connector socket, subscribe to
+/// the `CN_IDX_PROC` multicast group with `PROC_CN_MCAST_LISTEN`, and forward a
 /// [`ReconcileTrigger::ProcEvent`] on `triggers` for every exec/exit event, for
 /// the lifetime of the daemon.
 ///
@@ -110,6 +168,13 @@ pub fn is_trigger_kind(kind: ProcEventKind) -> bool {
 ///
 /// Returns only on a fatal socket error (the recv loop is infinite otherwise).
 /// Linux-only.
+///
+/// # Errors
+///
+/// Returns [`ProcMonError`] if the netlink socket can't be connected, the
+/// `PROC_CN_MCAST_LISTEN` subscribe message can't be built or sent, or a
+/// non-recoverable `recv` error occurs (a recoverable `ENOBUFS` overflow is
+/// logged and the loop continues — see the module docs).
 #[cfg(target_os = "linux")]
 pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMonError> {
     use neli::connector::{CnMsg, CnMsgBuilder, ProcEventHeader};
@@ -128,7 +193,10 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
         Some(pid),
         Groups::new_bitmask(CnMsgIdx::Proc.into()),
     )
-    .map_err(|e| ProcMonError::Socket(format!("connect: {e}")))?;
+    .map_err(|source| ProcMonError::Socket {
+        action: "connecting",
+        source: Box::new(source),
+    })?;
 
     // Subscribe: send a CnMsg carrying PROC_CN_MCAST_LISTEN so the kernel starts
     // multicasting proc events to us.
@@ -142,15 +210,24 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
                 .val(CnMsgVal::Proc)
                 .payload(ProcCnMcastOp::Listen)
                 .build()
-                .map_err(|e| ProcMonError::Socket(format!("build subscribe msg: {e}")))?,
+                .map_err(|source| ProcMonError::Build {
+                    what: "subscribe message",
+                    source: Box::new(source),
+                })?,
         ))
         .build()
-        .map_err(|e| ProcMonError::Socket(format!("build subscribe header: {e}")))?;
+        .map_err(|source| ProcMonError::Build {
+            what: "subscribe header",
+            source: Box::new(source),
+        })?;
 
     socket
         .send(&subscribe)
         .await
-        .map_err(|e| ProcMonError::Socket(format!("send subscribe: {e}")))?;
+        .map_err(|source| ProcMonError::Socket {
+            action: "sending subscribe on",
+            source: Box::new(source),
+        })?;
 
     tracing::info!("cn_proc listener subscribed (PROC_CN_MCAST_LISTEN)");
 
@@ -174,9 +251,15 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
                     error = %e,
                     "cn_proc recv overflowed (ENOBUFS); dropped some events, continuing (backstop covers the gap)"
                 );
+                PROC_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            Err(e) => return Err(ProcMonError::Socket(format!("recv: {e}"))),
+            Err(source) => {
+                return Err(ProcMonError::Socket {
+                    action: "receiving from",
+                    source: Box::new(source),
+                });
+            }
         };
 
         for msg in iter {
@@ -207,6 +290,7 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
                             ?kind,
                             "reconcile trigger channel full; dropping (backstop covers it)"
                         );
+                        PROC_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         tracing::info!("reconcile channel closed; cn_proc listener exiting");
@@ -237,6 +321,11 @@ fn is_enobufs(err: &neli::err::SocketError) -> bool {
 
 /// Map a parsed neli [`ProcEvent`][neli::connector::ProcEvent] to our
 /// [`ProcEventKind`]. Linux-only (the neli type only exists there).
+///
+/// `neli::connector::ProcEvent` (as of neli 0.7.4) is **not** `#[non_exhaustive]`,
+/// so this is spelled out exhaustively rather than with a `_` catch-all: a neli
+/// upgrade adding a new `cn_proc` event variant becomes a compile error here
+/// (forcing a deliberate classification), not a silent fold into `Other`.
 #[cfg(target_os = "linux")]
 fn kind_of(event: &neli::connector::ProcEvent) -> ProcEventKind {
     use neli::connector::ProcEvent;
@@ -244,13 +333,24 @@ fn kind_of(event: &neli::connector::ProcEvent) -> ProcEventKind {
         ProcEvent::Fork { .. } => ProcEventKind::Fork,
         ProcEvent::Exec { .. } => ProcEventKind::Exec,
         ProcEvent::Exit { .. } => ProcEventKind::Exit,
-        _ => ProcEventKind::Other,
+        ProcEvent::Ack { .. }
+        | ProcEvent::Uid { .. }
+        | ProcEvent::Gid { .. }
+        | ProcEvent::Sid { .. }
+        | ProcEvent::Ptrace { .. }
+        | ProcEvent::Comm { .. }
+        | ProcEvent::Coredump { .. } => ProcEventKind::Other,
     }
 }
 
-/// Non-Linux stub: there is no netlink/cn_proc. The future never resolves (it
-/// just parks), so wiring it into a `tokio::select!` in `main` is harmless on a
-/// macOS dev box — the timer + HTTP triggers still drive reconcile.
+/// Non-Linux stub: there is no `netlink`/`cn_proc`. The future never resolves
+/// (it just parks), so wiring it into a `tokio::select!` in `main` is harmless
+/// on a macOS dev box — the timer + HTTP triggers still drive reconcile.
+///
+/// # Errors
+///
+/// Never returns (the future parks forever) — kept `Result`-returning to
+/// match the Linux signature above.
 #[cfg(not(target_os = "linux"))]
 pub async fn run(_triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMonError> {
     std::future::pending::<()>().await;
@@ -263,6 +363,7 @@ pub async fn run(_triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMo
 /// The kernel reports `NONZERO_EXIT` as a distinct discriminant from `EXIT`
 /// (it's the same lifecycle signal, a process leaving — both map to
 /// [`ProcEventKind::Exit`]).
+#[must_use]
 pub fn event_kind_from_what(what: u32) -> ProcEventKind {
     use proc_event_what as w;
     match what {
@@ -276,6 +377,18 @@ pub fn event_kind_from_what(what: u32) -> ProcEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_events_dropped_is_readable_and_monotonic() {
+        // The real increments only happen inside the Linux-only netlink recv
+        // loop (not independently unit-testable here), so this proves the
+        // read/increment API itself. Doesn't assume a starting value of 0 —
+        // this is a process-wide static, and other tests in this binary may
+        // run concurrently against it.
+        let before = proc_events_dropped();
+        PROC_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+        assert!(proc_events_dropped() > before);
+    }
 
     #[test]
     fn what_maps_exec_and_exit() {

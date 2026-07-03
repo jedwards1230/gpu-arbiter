@@ -31,7 +31,7 @@ use crate::classify::GpuGraphicsProc;
 /// fallen off the bus, a stuck ioctl) is a real, well-known NVIDIA failure mode in
 /// which `nvidia-smi` blocks indefinitely. Bounding the call guarantees the
 /// eviction poll loop (and therefore a game launch) can never hang on it — a
-/// timeout surfaces as a [`GpuError::Command`], which the eviction path treats as
+/// timeout surfaces as a [`GpuError::Timeout`], which the eviction path treats as
 /// "not yet free" and escalates past. Generous enough that a healthy call (tens
 /// of ms) never trips it.
 const NVIDIA_SMI_TIMEOUT: Duration = Duration::from_secs(2);
@@ -50,10 +50,46 @@ pub struct GpuMemory {
 /// GPU query errors.
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
-    /// A vendor command could not be spawned / exited non-zero (NVIDIA
-    /// `nvidia-smi`), or a sysfs read failed (AMD).
-    #[error("gpu command failed: {0}")]
-    Command(String),
+    /// A vendor command could not be spawned (NVIDIA `nvidia-smi`), or a sysfs
+    /// path could not be read (AMD). The underlying [`std::io::Error`] is kept as
+    /// the source, so callers can inspect `ErrorKind`/`raw_os_error` (e.g. a
+    /// missing `nvidia-smi` binary surfaces as `ErrorKind::NotFound`) instead of
+    /// only a formatted message.
+    #[error("{context}: {source}")]
+    Io {
+        /// What was being attempted (e.g. `"spawning nvidia-smi"`).
+        context: String,
+        /// The underlying IO failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A vendor command ran and exited non-zero.
+    #[error("{command} exited {status}: {stderr}")]
+    Exit {
+        /// The command that failed (e.g. `"nvidia-smi"`).
+        command: &'static str,
+        /// Its exit status.
+        status: std::process::ExitStatus,
+        /// Trimmed stderr.
+        stderr: String,
+    },
+    /// A vendor command exceeded its bound. Every shell-out is time-boxed (see
+    /// [`NVIDIA_SMI_TIMEOUT`]) so a wedged GPU/driver hang can never stall the
+    /// eviction loop; this is that bound firing, distinct from a spawn/exit
+    /// failure.
+    #[error("{command} timed out after {elapsed:?}")]
+    Timeout {
+        /// The command that timed out (e.g. `"nvidia-smi"`).
+        command: &'static str,
+        /// The configured bound that elapsed.
+        elapsed: Duration,
+    },
+    /// No AMD DRM card exposing `mem_info_vram_*` sysfs counters was found.
+    #[error("no amdgpu card with mem_info_vram_* under {0}")]
+    NoAmdCard(String),
+    /// The `spawn_blocking` task running the AMD sysfs read panicked.
+    #[error("amd sysfs read task panicked: {0}")]
+    TaskPanicked(#[from] tokio::task::JoinError),
     /// Vendor output did not parse.
     #[error("parsing gpu output: {0}")]
     Parse(String),
@@ -82,6 +118,7 @@ impl GpuBackend {
     /// [`GpuBackend::Nvidia`] (the historical default, so nothing changes where
     /// detection can't see a GPU — e.g. macOS). Detection is best-effort and must
     /// never panic.
+    #[must_use]
     pub fn resolve(kind: crate::config::GpuBackendKind) -> Self {
         use crate::config::GpuBackendKind;
         match kind {
@@ -100,6 +137,11 @@ impl GpuBackend {
     }
 
     /// Total GPU memory usage (MiB). Async; dispatches to the vendor probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError`] if the vendor probe fails: `nvidia-smi` can't be
+    /// spawned, times out, exits non-zero, or its output doesn't parse.
     pub async fn query_memory(self) -> Result<GpuMemory, GpuError> {
         match self {
             GpuBackend::Nvidia => nvidia::query_memory().await,
@@ -112,6 +154,11 @@ impl GpuBackend {
     /// AMD has no simple per-proc VRAM via sysfs → returns an empty `Vec`
     /// best-effort (the heuristic degrades to seeing nothing this pass; it must
     /// not error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError`] on NVIDIA if `nvidia-smi` can't be spawned, times
+    /// out, exits non-zero, or its output doesn't parse. Never errors on AMD.
     pub async fn query_graphics_procs(self) -> Result<Vec<GpuGraphicsProc>, GpuError> {
         match self {
             GpuBackend::Nvidia => nvidia::query_graphics_procs().await,
@@ -123,11 +170,36 @@ impl GpuBackend {
     ///
     /// AMD has no simple per-proc VRAM via sysfs → returns an empty `Vec`
     /// best-effort (per-unit `vram_mb` is simply omitted; it must not error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError`] on NVIDIA if `nvidia-smi` can't be spawned, times
+    /// out, exits non-zero, or its output doesn't parse. Never errors on AMD.
     pub async fn query_compute_procs(self) -> Result<Vec<GpuGraphicsProc>, GpuError> {
         match self {
             GpuBackend::Nvidia => nvidia::query_compute_procs().await,
             GpuBackend::Amd => Ok(Vec::new()),
         }
+    }
+
+    /// Whether this backend can attribute **per-process** VRAM at all (#61).
+    ///
+    /// `false` on AMD is a *structural* fact about the backend, distinct from
+    /// [`query_compute_procs`](Self::query_compute_procs) returning
+    /// `Ok(vec![])` on AMD — that empty `Ok` is indistinguishable, at the call
+    /// site, from "queried successfully and genuinely found nothing", which is
+    /// exactly the shape a real "this unit is fully drained" reading takes.
+    /// Before this method existed, eviction gating
+    /// ([`crate::units::unit_vram_reading`]) trusted that empty-`Ok` as
+    /// `Attributed(0)` — "drained" — on the very first poll, silently skipping
+    /// the drain wait on every AMD host, because it never queried this at all;
+    /// it inferred capability from whether the *unit* has an attribution
+    /// channel (`is_systemd`/`vram_match`), not whether the *backend* can
+    /// answer that channel's query in the first place. Callers that need "can
+    /// this poll possibly attribute VRAM to a unit" must check both.
+    #[must_use]
+    pub fn attribution_capable(self) -> bool {
+        matches!(self, GpuBackend::Nvidia)
     }
 }
 
@@ -135,8 +207,7 @@ impl GpuBackend {
 /// (reads `PATH` + stats files); never panics.
 fn nvidia_smi_on_path() -> bool {
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join("nvidia-smi").is_file()))
-        .unwrap_or(false)
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join("nvidia-smi").is_file()))
 }
 
 /// Best-effort probe for an `amdgpu` DRM card (drives `auto` detection). A card is
@@ -171,6 +242,11 @@ fn amdgpu_card_present() -> bool {
 ///
 /// Expects a single line like `21500, 32768`. Multiple lines (multi-GPU) → the
 /// first line is used.
+///
+/// # Errors
+///
+/// Returns [`GpuError::Parse`] if `out` has no non-blank line, or the
+/// `memory.used`/`memory.total` columns are missing or not integers.
 pub fn parse_memory_csv(out: &str) -> Result<GpuMemory, GpuError> {
     let line = out
         .lines()
@@ -198,6 +274,7 @@ pub fn parse_memory_csv(out: &str) -> Result<GpuMemory, GpuError> {
 ///
 /// Lines that don't parse are skipped (best-effort). `[N/A]` VRAM cells parse
 /// as 0.
+#[must_use]
 pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
     out.lines()
         .filter_map(|line| {
@@ -209,7 +286,15 @@ pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
             let pid = cols.next()?.parse::<i32>().ok()?;
             let name = cols.next()?.to_string();
             let vram_mb = cols.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            Some(GpuGraphicsProc { pid, name, vram_mb })
+            Some(GpuGraphicsProc {
+                pid,
+                name,
+                vram_mb,
+                // Cgroup attribution (#7) is a separate enrichment pass
+                // (`crate::cgroup::attribute_units`) — the raw CSV parse never
+                // knows about it.
+                owning_unit: None,
+            })
         })
         .collect()
 }
@@ -222,6 +307,11 @@ pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
 /// MiB granularity NVIDIA already reports — sub-MiB remainders are dropped, which
 /// is fine for the free-threshold and attribution use cases. Surrounding
 /// whitespace (the trailing newline sysfs always appends) is trimmed.
+///
+/// # Errors
+///
+/// Returns [`GpuError::Parse`] if either byte-count string isn't a valid
+/// unsigned integer once trimmed.
 pub fn parse_vram_sysfs(used_bytes: &str, total_bytes: &str) -> Result<GpuMemory, GpuError> {
     let used = used_bytes
         .trim()
@@ -254,7 +344,7 @@ mod nvidia {
     /// driven by tokio's reactor, so it never blocks the runtime.
     ///
     /// Linux-only at *runtime* (no `nvidia-smi` on macOS), but compiles everywhere:
-    /// the spawn failure (binary absent) surfaces as [`GpuError::Command`].
+    /// the spawn failure (binary absent) surfaces as [`GpuError::Io`].
     async fn run_nvidia_smi(args: &[&str]) -> Result<String, GpuError> {
         let fut = tokio::process::Command::new("nvidia-smi")
             .args(args)
@@ -262,17 +352,21 @@ mod nvidia {
         // A hung nvidia-smi must never wedge the eviction loop — bound it.
         let out = tokio::time::timeout(NVIDIA_SMI_TIMEOUT, fut)
             .await
-            .map_err(|_| {
-                GpuError::Command(format!("nvidia-smi timed out after {NVIDIA_SMI_TIMEOUT:?}"))
+            .map_err(|_| GpuError::Timeout {
+                command: "nvidia-smi",
+                elapsed: NVIDIA_SMI_TIMEOUT,
             })?
-            .map_err(|e| GpuError::Command(format!("spawning nvidia-smi: {e}")))?;
+            .map_err(|source| GpuError::Io {
+                context: "spawning nvidia-smi".to_string(),
+                source,
+            })?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(GpuError::Command(format!(
-                "nvidia-smi exited {}: {}",
-                out.status,
-                stderr.trim()
-            )));
+            return Err(GpuError::Exit {
+                command: "nvidia-smi",
+                status: out.status,
+                stderr: stderr.trim().to_string(),
+            });
         }
         String::from_utf8(out.stdout)
             .map_err(|e| GpuError::Parse(format!("nvidia-smi stdout not UTF-8: {e}")))
@@ -332,21 +426,21 @@ mod amd {
     /// files. Async (the blocking reads run via `spawn_blocking`).
     ///
     /// Best-effort: a missing/unreadable sysfs node surfaces as a typed
-    /// [`GpuError::Command`] (so `query_memory` callers fail-soft exactly as they
-    /// do for a missing `nvidia-smi`). The read itself is trivial filesystem work
+    /// [`GpuError::Io`] (so `query_memory` callers fail-soft exactly as they do
+    /// for a missing `nvidia-smi`). The read itself is trivial filesystem work
     /// but is taken off the runtime to honor the "no blocking on async threads"
     /// invariant the `/proc` scan already follows.
     pub async fn query_memory() -> Result<GpuMemory, GpuError> {
-        tokio::task::spawn_blocking(read_vram_blocking)
-            .await
-            .map_err(|e| GpuError::Command(format!("amd sysfs read task panicked: {e}")))?
+        tokio::task::spawn_blocking(read_vram_blocking).await?
     }
 
     /// Synchronous sysfs read of the first card with `mem_info_vram_used`. Called
     /// via `spawn_blocking`.
     fn read_vram_blocking() -> Result<GpuMemory, GpuError> {
-        let entries = std::fs::read_dir(DRM_BASE)
-            .map_err(|e| GpuError::Command(format!("reading {DRM_BASE}: {e}")))?;
+        let entries = std::fs::read_dir(DRM_BASE).map_err(|source| GpuError::Io {
+            context: format!("reading {DRM_BASE}"),
+            source,
+        })?;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -366,9 +460,7 @@ mod amd {
             };
             return parse_vram_sysfs(&used, &total);
         }
-        Err(GpuError::Command(format!(
-            "no amdgpu card with mem_info_vram_* under {DRM_BASE}"
-        )))
+        Err(GpuError::NoAmdCard(DRM_BASE.to_string()))
     }
 }
 
@@ -379,9 +471,17 @@ mod amd {
 /// matches. Pure helper over an observed compute-proc list, driven by each unit's
 /// configured `vram_match`.
 ///
+/// **Fallback path (#7):** cgroup attribution ([`vram_mb_by_cgroup`]) is the
+/// primary attribution channel for a systemd-supervised unit — it can't be
+/// fooled by a wrapper binary (a venv interpreter, a launcher script) the way
+/// this name-substring match can. This function remains the only channel for
+/// command-driven (`*_cmd`) units and non-systemd hosts, where no cgroup path
+/// resolves to a configured unit name at all.
+///
 /// Returns `None` when no matching compute proc is seen (so `/status` omits the
 /// field rather than reporting a misleading `0`). On AMD the compute list is
 /// always empty, so this always returns `None` (attribution degrades cleanly).
+#[must_use]
 pub fn vram_mb_matching(compute: &[GpuGraphicsProc], needle: &str) -> Option<u64> {
     let needle = needle.to_ascii_lowercase();
     let mut matched = compute
@@ -391,6 +491,76 @@ pub fn vram_mb_matching(compute: &[GpuGraphicsProc], needle: &str) -> Option<u64
         .peekable();
     matched.peek()?; // no matching compute proc → None (don't report a misleading 0)
     Some(matched.sum())
+}
+
+/// Best-effort VRAM (MiB) attributed to a managed unit via cgroup PID
+/// resolution (#7) — the primary `/status` attribution channel for a
+/// systemd-supervised unit. Pure helper over a compute-proc list already
+/// enriched by [`crate::cgroup::attribute_units`].
+///
+/// Sums every compute proc whose [`GpuGraphicsProc::owning_unit`] resolved to
+/// exactly `unit_name`. Same "`None` when nothing matched" contract as
+/// [`vram_mb_matching`] (so `/status` omits the field instead of asserting a
+/// misleading `0` for a unit nothing was ever attributed to) — see
+/// [`unit_vram_sum`] for the eviction-gating counterpart, which needs an
+/// explicit `0` to mean "confirmed drained".
+#[must_use]
+pub fn vram_mb_by_cgroup(compute: &[GpuGraphicsProc], unit_name: &str) -> Option<u64> {
+    let mut matched = compute
+        .iter()
+        .filter(|p| p.owning_unit.as_deref() == Some(unit_name))
+        .map(|p| p.vram_mb)
+        .peekable();
+    matched.peek()?;
+    Some(matched.sum())
+}
+
+/// Sum of VRAM (MiB) among `compute` procs whose cgroup resolved to
+/// `unit_name` — an **explicit** `0` when the compute-proc query succeeded
+/// but nothing currently maps to the unit. Pure.
+///
+/// Unlike [`vram_mb_by_cgroup`], a genuine zero here *is* the signal callers
+/// want: [`attribute_unit_vram`] (eviction gating, #8) needs to distinguish
+/// "the unit's process is confirmed gone" from "we have no idea", which
+/// `Option`-collapsing zero-into-`None` would erase.
+fn unit_vram_sum(compute: &[GpuGraphicsProc], unit_name: &str) -> u64 {
+    compute
+        .iter()
+        .filter(|p| p.owning_unit.as_deref() == Some(unit_name))
+        .map(|p| p.vram_mb)
+        .sum()
+}
+
+/// Attribute one managed unit's own VRAM (MiB) for an eviction-gating poll
+/// (#8). Pure — the decision core [`crate::units::eviction_step`] builds its
+/// [`crate::units::UnitVramReading`] from.
+///
+/// Precedence:
+/// - `is_systemd` (the unit's resolved [`crate::units::Supervisor`] is
+///   [`Supervisor::Systemd`](crate::units::Supervisor::Systemd)): trust cgroup
+///   attribution unconditionally once the compute-proc query itself succeeded
+///   this poll — a systemd unit's live process is always under its own
+///   cgroup, so a zero-sum match is a trustworthy "fully drained" signal, not
+///   "couldn't tell". `vram_match` is not consulted (cgroup is strictly more
+///   reliable for a systemd unit — see [`vram_mb_matching`]'s docs).
+/// - otherwise (command-driven `*_cmd` unit, no cgroup path structurally
+///   resolves to it): fall back to `vram_match`, if configured, again with an
+///   explicit `0` for "no matching proc this poll".
+/// - `None` when neither channel is available this poll (the compute query
+///   failed, or the unit is command-driven with no `vram_match`) — the caller
+///   falls back to the total-GPU-VRAM gate.
+#[must_use]
+pub fn attribute_unit_vram(
+    compute: Option<&[GpuGraphicsProc]>,
+    is_systemd: bool,
+    unit_name: &str,
+    vram_match: Option<&str>,
+) -> Option<u64> {
+    let procs = compute?;
+    if is_systemd {
+        return Some(unit_vram_sum(procs, unit_name));
+    }
+    vram_match.map(|needle| vram_mb_matching(procs, needle).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -509,8 +679,25 @@ mod tests {
         assert_eq!(GpuBackend::resolve(GpuBackendKind::Amd), GpuBackend::Amd);
     }
 
+    // ── per-process attribution capability (#61) ────────────────────────────
+
     #[test]
-    fn resolve_auto_never_panics_and_defaults_sanely() {
+    fn nvidia_is_attribution_capable_amd_is_not() {
+        // The structural fact eviction gating gates on: AMD's
+        // `query_compute_procs` returning `Ok(vec![])` must never be mistaken
+        // for "queried successfully, unit confirmed drained" — see this
+        // method's docs.
+        assert!(GpuBackend::Nvidia.attribution_capable());
+        assert!(!GpuBackend::Amd.attribution_capable());
+    }
+
+    // Smoke test, not a strict assertion: on a host that actually has GPU
+    // tooling (unlike macOS/CI), `resolve(Auto)` legitimately returns either
+    // variant depending on what's installed — the one universal contract this
+    // can assert is "never panics", with the specific-default assertion only
+    // firing when neither probe finds anything (the dev-host/CI case).
+    #[test]
+    fn smoke_resolve_auto_never_panics_and_defaults_sanely() {
         // On macOS / CI there's no nvidia-smi and no /sys/class/drm → auto must
         // fall back to the historical Nvidia default (not panic).
         let b = GpuBackend::resolve(GpuBackendKind::Auto);
@@ -552,26 +739,152 @@ mod tests {
         assert_eq!(vram_mb_matching(&[], "ollama"), None);
     }
 
+    // ── cgroup attribution (#7) ─────────────────────────────────────────────
+
+    /// A compute proc with a resolved owning unit — the shape
+    /// `crate::cgroup::attribute_units` produces.
+    fn attributed(
+        pid: i32,
+        name: &str,
+        vram_mb: u64,
+        owning_unit: Option<&str>,
+    ) -> GpuGraphicsProc {
+        GpuGraphicsProc {
+            pid,
+            name: name.to_string(),
+            vram_mb,
+            owning_unit: owning_unit.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn vram_by_cgroup_sums_matching_unit_ignores_name() {
+        // The motivating live bug: the process name never contains "asr" or
+        // "parakeet", but cgroup attribution finds it anyway.
+        let procs = vec![
+            attributed(
+                1,
+                "/opt/asr-runner/venv/bin/python",
+                6000,
+                Some("asr-runner.service"),
+            ),
+            attributed(2, "/usr/local/bin/ollama", 21000, Some("ollama.service")),
+            attributed(3, "some-other-proc", 500, None),
+        ];
+        assert_eq!(vram_mb_by_cgroup(&procs, "asr-runner.service"), Some(6000));
+        assert_eq!(vram_mb_by_cgroup(&procs, "ollama.service"), Some(21000));
+    }
+
+    #[test]
+    fn vram_by_cgroup_none_when_no_owning_unit_matches() {
+        let procs = vec![attributed(1, "python", 4000, None)];
+        assert_eq!(vram_mb_by_cgroup(&procs, "asr-runner.service"), None);
+        assert_eq!(vram_mb_by_cgroup(&[], "asr-runner.service"), None);
+    }
+
+    // ── eviction-gating attribution (#8) ────────────────────────────────────
+
+    #[test]
+    fn attribute_unit_vram_systemd_trusts_cgroup_even_at_zero() {
+        // A systemd unit whose process has already exited (or was never GPU
+        // resident) — the compute query succeeded, cgroup attribution found
+        // no match, and that IS the freed signal: Some(0), not None.
+        let procs = vec![attributed(1, "other-proc", 999, Some("other.service"))];
+        assert_eq!(
+            attribute_unit_vram(Some(&procs), true, "ollama.service", None),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn attribute_unit_vram_systemd_ignores_vram_match_precedence() {
+        // Even when vram_match is ALSO configured, cgroup wins for a systemd
+        // unit — vram_match is never consulted.
+        let procs = vec![attributed(
+            1,
+            "totally-unrelated-name",
+            5000,
+            Some("ollama.service"),
+        )];
+        assert_eq!(
+            attribute_unit_vram(Some(&procs), true, "ollama.service", Some("ollama")),
+            Some(5000)
+        );
+    }
+
+    #[test]
+    fn attribute_unit_vram_command_driven_falls_back_to_vram_match() {
+        // A command-driven unit (is_systemd = false) has no cgroup path that
+        // could resolve to it — vram_match is the only channel.
+        let procs = parse_graphics_procs_csv("1, /usr/local/bin/ollama, 21000\n");
+        assert_eq!(
+            attribute_unit_vram(Some(&procs), false, "ollama", Some("ollama")),
+            Some(21000)
+        );
+        // No match this poll → confirmed drained (explicit 0, not None).
+        let empty: Vec<GpuGraphicsProc> = Vec::new();
+        assert_eq!(
+            attribute_unit_vram(Some(&empty), false, "ollama", Some("ollama")),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn attribute_unit_vram_command_driven_without_vram_match_is_none() {
+        // No cgroup channel (command-driven) AND no vram_match configured →
+        // structurally no attribution this poll; caller must fall back to
+        // total GPU VRAM.
+        let procs = parse_graphics_procs_csv("1, /usr/local/bin/ollama, 21000\n");
+        assert_eq!(
+            attribute_unit_vram(Some(&procs), false, "ollama", None),
+            None
+        );
+    }
+
+    #[test]
+    fn attribute_unit_vram_none_when_compute_query_failed() {
+        assert_eq!(
+            attribute_unit_vram(None, true, "ollama.service", Some("ollama")),
+            None
+        );
+        assert_eq!(
+            attribute_unit_vram(None, false, "ollama", Some("ollama")),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn nvidia_query_memory_errors_when_nvidia_smi_absent() {
-        // On macOS / CI there is no nvidia-smi on PATH → spawn fails → Command
-        // error (never a panic). On a real GPU host this would succeed; the test
-        // only asserts the no-binary path is a clean typed error.
+        // On macOS / CI there is no nvidia-smi on PATH → spawn fails with a
+        // typed `Io` error carrying the underlying `ErrorKind::NotFound` (never
+        // a panic). On a real GPU host this would succeed; the test only
+        // asserts the no-binary path is a clean typed error with a real source.
         if nvidia_smi_on_path() {
             return; // skip on a host that actually has nvidia-smi
         }
         let err = GpuBackend::Nvidia.query_memory().await.unwrap_err();
-        assert!(matches!(err, GpuError::Command(_)));
+        match err {
+            GpuError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected GpuError::Io, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn amd_query_memory_errors_without_sysfs() {
-        // On macOS / CI there is no /sys/class/drm → a clean typed Command error,
-        // never a panic. (On a real AMD host this would succeed.)
+        // On macOS / CI there is no /sys/class/drm → a clean typed error, never a
+        // panic: `Io` if the directory itself is missing (macOS), `NoAmdCard` if
+        // it exists but no card exposes the VRAM counters (a non-AMD Linux host).
+        // (On a real AMD host this would succeed.)
         let res = GpuBackend::Amd.query_memory().await;
-        // Either it found an AMD card (real Linux+AMD host) or it surfaced a typed
-        // error — never a panic.
-        assert!(res.is_ok() || matches!(res.unwrap_err(), GpuError::Command(_)));
+        assert!(
+            res.is_ok()
+                || matches!(
+                    res.unwrap_err(),
+                    GpuError::Io { .. } | GpuError::NoAmdCard(_)
+                )
+        );
     }
 
     #[tokio::test]

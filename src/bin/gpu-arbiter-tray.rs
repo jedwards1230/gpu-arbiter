@@ -8,7 +8,7 @@
 //! lives here in the user session (where the session D-Bus — hence the tray host
 //! and notifications — actually exists).
 //!
-//! Pure-Rust, musl-clean: `ksni` (StatusNotifierItem) and `notify-rust` both go
+//! Pure-Rust, musl-clean: `ksni` (`StatusNotifierItem`) and `notify-rust` both go
 //! through `zbus` (no libdbus); `ureq` is built with no TLS (localhost http
 //! only). All three are Linux-only desktop integrations, so the real impl is
 //! `#[cfg(target_os = "linux")]` and the macOS dev build gets a no-op `main`.
@@ -62,12 +62,22 @@ mod linux {
 
     /// A 22×22 ARGB32 filled circle in the given color. `data` is ARGB32 in
     /// network (big-endian) byte order, as ksni requires.
+    // `S` is a tiny fixed constant (22) — every `i32 -> f32` cast below is
+    // exact (f32's 24-bit mantissa losslessly represents every integer up to
+    // 2^24), so `clippy::cast_precision_loss` has nothing to warn about in
+    // practice; there's no lossless std conversion for int->float to satisfy
+    // it structurally, so this is a justified allow rather than a rewrite.
+    #[allow(clippy::cast_precision_loss)]
     fn dot_icon(r: u8, g: u8, b: u8) -> Icon {
         const S: i32 = 22;
         let cx = (S as f32 - 1.0) / 2.0;
         let cy = (S as f32 - 1.0) / 2.0;
         let radius = (S as f32 / 2.0) - 1.5;
-        let mut data = Vec::with_capacity((S * S * 4) as usize);
+        // S is a small positive compile-time constant, so S*S*4 always fits
+        // usize on every supported target — try_from over a bare `as` keeps
+        // the (unreachable) overflow case an explicit decision, not a silent
+        // wraparound.
+        let mut data = Vec::with_capacity(usize::try_from(S * S * 4).unwrap_or(0));
         for y in 0..S {
             for x in 0..S {
                 let dx = x as f32 - cx;
@@ -132,10 +142,14 @@ mod linux {
                         state_label(s.state),
                         s.gpu_vram_used_mb,
                         s.gpu_vram_total_mb,
-                        if s.ollama.running {
-                            "running"
-                        } else {
-                            "stopped"
+                        // Tristate (#15): `running: None` means the daemon
+                        // couldn't confirm either way — render that distinctly
+                        // from a confirmed "stopped" rather than defaulting to
+                        // one or the other.
+                        match s.ollama.running {
+                            Some(true) => "running",
+                            Some(false) => "stopped",
+                            None => "unknown",
                         },
                         models,
                         s.since,
@@ -186,6 +200,14 @@ mod linux {
 
     // --- HTTP (sync ureq, no TLS) --------------------------------------------
 
+    // `clippy::redundant_closure_for_method_calls` (pedantic) would ask for
+    // `ToString::to_string` in place of the two `|e| e.to_string()` closures
+    // below. Kept as closures deliberately: this fn only builds under
+    // `#[cfg(target_os = "linux")]`, so a bare-fn-item rewrite here can't be
+    // locally type-checked on the macOS dev host before Linux CI runs — the
+    // closures are unambiguously correct, and the stylistic win is small
+    // enough not to risk an unverifiable Linux-only compile break over it.
+    #[allow(clippy::redundant_closure_for_method_calls)]
     fn fetch_status() -> Result<StatusSnapshot, String> {
         ureq::get(status_url())
             .call()

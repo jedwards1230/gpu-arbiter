@@ -2,7 +2,7 @@
 
 @CONTRIBUTING.md
 
-A Linux root daemon that treats a shared GPU machine as **gaming-first, AI-compute-second**. It detects game launches via the kernel `cn_proc` process-event connector, evicts configured GPU compute tenants (e.g. Ollama) from the GPU, restores them when gaming ends, and exposes an HTTP control surface (default port `48750`) with endpoints for state (`/status`), Prometheus metrics (`/metrics`), liveness (`/healthz`), and localhost-only manual overrides (`POST /units/{unit}/start|stop`). Back-compat `/ollama/start|stop` aliases address the first managed unit.
+A Linux root daemon that treats a shared GPU machine as **gaming-first, AI-compute-second**. It detects game launches via the kernel `cn_proc` process-event connector, evicts configured GPU compute tenants (e.g. Ollama) from the GPU, restores them when gaming ends, and exposes an HTTP control surface: a TCP port (default `48750`, bind address configurable via `bind`) for the read-only endpoints (`/status`, `/metrics`, `/healthz`) plus deprecated loopback-gated TCP write routes, and a **unix control socket** (`socket_path`, default `/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned in a mode-`0700` parent directory) as the sanctioned write path — `POST /units/{unit}/start|stop` plus `/ollama/start|stop` back-compat aliases addressing the first managed unit. Manual overrides (either transport) are routed through the reconcile task (the sole caller of unit start/evict — no handler-vs-reconcile race); a manual `stop` **holds** the unit down (surfaced as `held` in `/status`) until a manual `start` or a daemon restart, and a manual `start` is **rejected with 409** while a game holds the GPU (state `gaming`/`evicting` — never start a tenant into a live game). CLI composition: `status [-q|--json]`, `wait [--for available|claimed]`, and `watch [--json]` poll `/status` against `--url`/`GPU_ARBITER_URL`/local-config precedence. SIGHUP logs a restart-required notice rather than hot-reloading config (an immutable `Arc<Config>` is threaded through every task).
 
 ## Architecture
 
@@ -14,18 +14,19 @@ The crate is structured as a library (`src/lib.rs`) plus two binaries:
 
 | Module | Purpose |
 |--------|---------|
-| `config.rs` | TOML config deserialization with serde defaults |
-| `cli.rs` | Argv parser, config-path resolution, `--check-config`, `status` subcommand renderer |
+| `config.rs` | TOML config deserialization with serde defaults; `deny_unknown_fields` on `Config`/`ManagedUnit`/`GamePattern` — a typo'd key is a parse error, not a silent no-op |
+| `cli.rs` | Argv parser (`Result<Command, UsageError>`), config-path/daemon-URL resolution, `--check-config`, and the `status`/`wait`/`watch` renderers |
 | `classify.rs` | Cmdline → game-claim classification (Steam, patterns, VRAM heuristic) |
 | `state.rs` | State machine, claim model, `/status` snapshot type |
 | `gpu.rs` | GPU backend abstraction (NVIDIA via `nvidia-smi`, AMD via `/sys/class/drm/`) |
 | `units.rs` | Managed-unit lifecycle (stop → poll VRAM → SIGKILL). Abstracts the init system via `Supervisor` — default is systemd (`systemctl`), but per-unit `*_cmd` overrides enable OpenRC, runit, or plain process control. Each tenant follows the identical eviction loop regardless of backend. |
 | `reconcile.rs` | Reconciliation authority: `/proc` scan → claim set → drive managed units. Responds to multiple trigger sources: `cn_proc` exec/exit events, the periodic backstop timer, daemon startup, and HTTP POST manual triggers. |
-| `http.rs` | axum HTTP server: `GET /status /metrics /healthz`, `POST /units/{unit}/start|stop` |
+| `http.rs` | axum HTTP: TCP server (`GET /status /metrics /healthz` + deprecated `POST /units/{unit}/start|stop`) and a unix-socket server (`write_router`/`serve_uds`) serving only the write path — the sanctioned control surface (#17) |
 | `procmon.rs` | Async event-driven `cn_proc` netlink listener — subscribes to kernel process events (exec/exit) and forwards debounced `ReconcileTrigger` messages. Not a polling loop: zero CPU between events; dropped events are covered by the timer backstop. (Linux-only; parks as a stub on macOS.) |
 | `presence.rs` | Optional physical-input-device watcher: epoll-watches `/dev/input/event*` via evdev/inotify to timestamp the last human input event. Excludes virtual Moonlight/Sunshine devices by sysfs parentage. Feeds `local_present` / `input_monitor_up` into the snapshot. (Linux-only; stub on macOS.) |
+| `cgroup.rs` | cgroup-based PID → systemd-unit attribution: parses `/proc/<pid>/cgroup` to resolve the owning unit for a GPU process, independent of the process's own name/binary. Feeds `/status` per-unit VRAM (`reconcile.rs`), per-unit eviction gating (`units.rs`), and `gpu_allowlist` unit matching (`classify.rs`). (Linux-only; stub on macOS.) |
 
-**Reconciliation model**: level-triggered, K8s-controller style. `reconcile()` observes ground truth (`/proc` scan, optional GPU procs), recomputes the full claim set, and drives managed units. No delta state — self-heals across crashes and dropped events. Triggers: `cn_proc` exec/exit netlink events (primary, sub-second reaction), a ~30 s periodic backstop timer (`reconcile_interval_s`; default 30), startup reconciliation (a restart never starts Ollama into a live game), and `POST /units/{unit}/start|stop` manual HTTP triggers (localhost-only).
+**Reconciliation model**: level-triggered, K8s-controller style. `reconcile()` observes ground truth (`/proc` scan, optional GPU procs), recomputes the full claim set, and drives managed units. No delta state — self-heals across crashes and dropped events. Triggers: `cn_proc` exec/exit netlink events (primary, sub-second reaction), a ~30 s periodic backstop timer (`reconcile_interval_s`; default 30), startup reconciliation (a restart never starts Ollama into a live game), and `POST /units/{unit}/start|stop` manual HTTP triggers (localhost-only) — the HTTP handler enqueues a `ReconcileTrigger::ManualStart`/`ManualStop` (carrying a oneshot reply channel) and awaits the outcome; the reconcile task is the sole caller of `units::start`/`units::evict`. Graceful shutdown (SIGTERM/SIGINT) cancels the reconcile task's own trigger loop rather than `abort()`ing it, so an in-flight eviction always finishes its kill window first.
 
 **Cross-platform invariant**: the daemon is Linux-only at runtime but builds and tests on any host. Linux-only edges are `#[cfg(target_os = "linux")]` with non-Linux stubs. Pure-logic modules (classification, config parse, state transitions) are unit-tested on macOS.
 
@@ -40,7 +41,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ## Toolchain
 
-Pinned via `rust-toolchain.toml` to `stable`, Rust ≥ 1.88 (edition 2024 — needs let-chains). Components: `rustfmt`, `clippy`.
+Pinned via `rust-toolchain.toml` to an exact version (currently 1.96.1), Rust ≥ 1.88 (edition 2024 — needs let-chains; `rust-version` in `Cargo.toml` is the MSRV floor, the toolchain pin is the exact version CI/contributors build with). Components: `rustfmt`, `clippy`.
 
 ## CI workflows (`.github/workflows/`)
 
@@ -61,6 +62,7 @@ The annotated example at `packaging/config.example.toml` is the authoritative re
 - **Detection** — `detect_steam` (on by default), `[[game_patterns]]` (cmdline substrings for non-Steam launchers), `vram_heuristic` (opt-in heavy-graphics-proc detection), `gpu_allowlist`.
 - **Presence** — `presence_detection`, `presence_idle_threshold_s` (default 600 s).
 - **GPU backend** — `gpu_backend`: `"auto"` (default), `"nvidia"`, or `"amd"`.
+- **Control surface** — `bind` (TCP bind address, default `0.0.0.0`), `socket_path` (unix control-socket path, default `/run/gpu-arbiter/gpu-arbiter.sock`; empty string disables it).
 
 **Tray binary config**: `gpu-arbiter-tray` reads `GPU_ARBITER_URL` (default `http://127.0.0.1:48750`) to locate the daemon. No config file — all state is polled from the daemon's `/status` endpoint every 2 s.
 
@@ -75,7 +77,7 @@ The annotated example at `packaging/config.example.toml` is the authoritative re
 ## Runtime requirements (Linux only)
 
 - Root / `CAP_NET_ADMIN` (for `cn_proc` netlink socket and `systemctl`)
-- NVIDIA: `nvidia-smi` on `PATH`; AMD: no extra tooling (reads `/sys/class/drm/card*/device/mem_info_vram_*`). **AMD limitation**: sysfs exposes no per-process VRAM interface, so the opt-in VRAM heuristic is blind on AMD and per-unit VRAM in `/status` is always empty — eviction itself works identically on both vendors.
+- NVIDIA: `nvidia-smi` on `PATH`; AMD: no extra tooling (reads `/sys/class/drm/card*/device/mem_info_vram_*`). **AMD limitation**: sysfs exposes no per-process VRAM interface, so the opt-in VRAM heuristic is blind on AMD and per-unit VRAM in `/status` is always empty. Eviction still completes correctly on both vendors, but not identically: `GpuBackend::attribution_capable()` routes AMD straight to the legacy total-GPU-VRAM gate (never a per-unit `Attributed` reading — see the eviction-gating seen-nonzero note in `units.rs`), where NVIDIA gets the precise per-unit gate.
 - systemd (default); non-systemd hosts use per-unit `*_cmd` overrides
 
 ## Conventions

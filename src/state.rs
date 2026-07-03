@@ -5,9 +5,11 @@
 //! agents) code against. They are pure and cross-platform — no Linux-only
 //! imports — so they unit-test on macOS.
 
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 /// A single observed reason the GPU is claimed for gaming.
 ///
@@ -19,7 +21,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Claim {
     /// A Steam game: cmdline contained `SteamLaunch AppId=<id>`. Holds the
-    /// AppId. Serializes as `steam:<appid>`.
+    /// `AppId`. Serializes as `steam:<appid>`.
     Steam(String),
     /// A non-Steam launcher matched by a configured cmdline substring pattern.
     /// Holds the pattern's `name`. Serializes as `pattern:<name>`.
@@ -32,6 +34,7 @@ pub enum Claim {
 impl Claim {
     /// Render the flat `/status` token (`steam:440`, `pattern:heroic`,
     /// `gpu:12345`).
+    #[must_use]
     pub fn token(&self) -> String {
         match self {
             Claim::Steam(id) => format!("steam:{id}"),
@@ -63,17 +66,112 @@ pub enum State {
     Evicting,
 }
 
+/// Why a manual unit action ([`ReconcileTrigger::ManualStart`]/
+/// [`ReconcileTrigger::ManualStop`]) was refused or failed — the error half of
+/// the reply the reconcile task sends back over the trigger's oneshot channel,
+/// typed so the HTTP layer can map each cause to the right status code
+/// instead of collapsing everything to a 500.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualActionError {
+    /// The unit action itself was attempted and failed (the start/stop
+    /// control command errored — detail is in the daemon log). HTTP: `500`.
+    Failed,
+    /// A manual start was **rejected without being attempted** because a game
+    /// currently holds the GPU (state is [`State::Gaming`] or
+    /// [`State::Evicting`]) — the never-start-a-managed-unit-into-a-live-game
+    /// invariant (the same one startup reconciliation enforces) applies to
+    /// operators too. Any manual hold on the unit is left in place. HTTP:
+    /// `409 Conflict`.
+    GpuHeldByGame,
+}
+
 /// Why a reconcile pass was triggered. Fed over the `mpsc` of triggers into the
 /// single reconcile task that owns state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `ManualStart`/`ManualStop` carry a one-shot reply channel, so this type is
+/// deliberately **not** `Clone`/`PartialEq` (a [`oneshot::Sender`] is neither) —
+/// nothing in the daemon needs to duplicate or compare a trigger, only match on
+/// it. Use [`ReconcileTrigger::label`] where a `Debug`-free, payload-free
+/// identifier is needed (e.g. after a `match` has already taken `reply`).
+#[derive(Debug)]
 pub enum ReconcileTrigger {
-    /// A cn_proc exec/exit event (debounced) — the millisecond accelerator.
+    /// A `cn_proc` exec/exit event (debounced) — the millisecond accelerator.
     ProcEvent,
     /// The periodic ~30 s backstop timer — recomputes truth even if events
     /// were dropped.
     Timer,
-    /// A manual `POST /ollama/*` or other explicit nudge.
-    Manual,
+    /// The one-off synchronous pass `main` runs before spawning the reconcile
+    /// task, HTTP server, or netlink listener — the "a restart never starts a
+    /// managed unit into a live game" guarantee. Distinct from [`Self::Timer`]
+    /// only for [`Self::pass_trigger`]'s metric bucketing; behaviorally it is
+    /// handled identically to every other trigger.
+    Startup,
+    /// `POST /units/{unit}/start` (or the `/ollama/start` alias): start `unit`
+    /// now via its supervisor. Routed through the reconcile task — the sole
+    /// caller of [`crate::units::start`]/[`crate::units::evict`] — so an HTTP
+    /// handler never races the reconcile task driving the same unit.
+    /// **Rejected** (with [`ManualActionError::GpuHeldByGame`], any hold left
+    /// in place) while the current state is [`State::Gaming`] or
+    /// [`State::Evicting`] — a manual start must never start a managed unit
+    /// into a live game, the same invariant startup reconciliation enforces.
+    /// On a successful start, clears any manual hold on `unit` (see
+    /// [`ArbiterState::held`]) so the ensure-running post-step resumes
+    /// managing it. The handler awaits `reply` for the outcome.
+    ManualStart {
+        /// The managed unit to start (already validated by the HTTP handler
+        /// against [`crate::config::Config::resolved_units`]).
+        unit: String,
+        /// Where to send the outcome (`Ok` on a successful start; the typed
+        /// [`ManualActionError`] otherwise, so the HTTP layer can distinguish
+        /// a `409` rejection from a `500` failure).
+        reply: oneshot::Sender<Result<(), ManualActionError>>,
+    },
+    /// `POST /units/{unit}/stop` (or the `/ollama/stop` alias): evict `unit` now
+    /// via its supervisor, and add it to the manually-held set (see
+    /// [`ArbiterState::held`]) so the ensure-running post-step — including the
+    /// very next reconcile pass, even the periodic backstop timer — doesn't
+    /// immediately restart it. The handler awaits `reply` for the outcome.
+    ManualStop {
+        /// The managed unit to stop (already validated).
+        unit: String,
+        /// Where to send the outcome (`Ok` on a successful — or already-clear —
+        /// eviction; [`ManualActionError::Failed`] otherwise — a stop is never
+        /// state-gated, so `GpuHeldByGame` cannot occur here).
+        reply: oneshot::Sender<Result<(), ManualActionError>>,
+    },
+}
+
+impl ReconcileTrigger {
+    /// A short, stable label for logging. Reads only the discriminant — safe to
+    /// call even for `ManualStart`/`ManualStop` after a `match` has already
+    /// taken `reply` out, since it never touches the payload.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            ReconcileTrigger::ProcEvent => "proc_event",
+            ReconcileTrigger::Timer => "timer",
+            ReconcileTrigger::ManualStart { .. } => "manual_start",
+            ReconcileTrigger::ManualStop { .. } => "manual_stop",
+            ReconcileTrigger::Startup => "startup",
+        }
+    }
+
+    /// The coarser [`PassTrigger`] metric bucket for this trigger — feeds
+    /// `gpu_arbiter_reconcile_passes_total{trigger}` (#14). Coarser than
+    /// [`Self::label`]: `ManualStart`/`ManualStop` both bucket to
+    /// [`PassTrigger::Manual`] (the metric doesn't need to distinguish a manual
+    /// start from a manual stop, only "an operator drove this pass").
+    #[must_use]
+    pub fn pass_trigger(&self) -> PassTrigger {
+        match self {
+            ReconcileTrigger::ProcEvent => PassTrigger::ProcEvent,
+            ReconcileTrigger::Timer => PassTrigger::Timer,
+            ReconcileTrigger::ManualStart { .. } | ReconcileTrigger::ManualStop { .. } => {
+                PassTrigger::Manual
+            }
+            ReconcileTrigger::Startup => PassTrigger::Startup,
+        }
+    }
 }
 
 /// One managed unit's observed sub-state, embedded in [`StatusSnapshot`].
@@ -81,15 +179,26 @@ pub enum ReconcileTrigger {
 pub struct UnitStatus {
     /// The systemd unit name (`"ollama.service"`).
     pub unit: String,
-    /// Whether the unit is currently active.
-    pub running: bool,
+    /// Whether the unit is currently active. **Tristate**: `None` means the
+    /// `is-active` check itself failed (a wedged supervisor, a missing
+    /// `*_cmd` binary) — "couldn't tell", which must render distinctly from a
+    /// confirmed `false` ("stopped"). Serializes as JSON `null` when unknown.
+    pub running: Option<bool>,
     /// Loaded model names (best-effort; Ollama-only — empty for other units, or
     /// when not running / unknown).
     pub models: Vec<String>,
-    /// VRAM attributed to this unit in MiB (best-effort; `None` when unknown or
-    /// the unit has no `vram_match`).
+    /// VRAM attributed to this unit in MiB (best-effort; `None` when unknown).
+    /// Attributed primarily via cgroup PID resolution (#7; works for any
+    /// systemd-supervised unit with no config needed), falling back to the
+    /// unit's configured `vram_match` substring for command-driven tenants.
+    /// `None` when neither channel found a match.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_mb: Option<u64>,
+    /// Whether an operator has manually stopped this unit via
+    /// `POST /units/{unit}/stop` — while held, the ensure-running post-step will
+    /// not restart it even when the GPU is free (see [`ArbiterState::held`]).
+    /// Cleared by a manual start on the same unit, or a daemon restart.
+    pub held: bool,
 }
 
 /// The `/status` payload, serialized verbatim for remote machines + dashboards.
@@ -143,6 +252,16 @@ pub struct StatusSnapshot {
     /// Whether the input monitor is healthy. `false` ⇒ presence is **unknown**
     /// (fail-safe: an alert must not suppress on a down monitor).
     pub input_monitor_up: bool,
+
+    /// `true` if the most recent `available → gaming` eviction pass had at
+    /// least one managed unit fail to evict. Gaming still wins the GPU
+    /// unconditionally when this is set (see
+    /// [`crate::reconcile::reconcile`]'s `Evict` handling) — this is visibility
+    /// only, not a different outcome: a wedged tenant may still hold VRAM
+    /// while `state` reports a clean `gaming`. Cleared on the next eviction
+    /// pass that succeeds cleanly, or when the state resolves back to
+    /// `available`.
+    pub degraded: bool,
 }
 
 impl StatusSnapshot {
@@ -161,8 +280,12 @@ impl StatusSnapshot {
 /// The live, in-memory state owned by the single reconcile task.
 ///
 /// Not serialized directly — it produces a [`StatusSnapshot`] for `/status`.
-/// Shared with the HTTP handlers behind a `tokio::sync::RwLock`/`Mutex` (wired
-/// in `main`).
+/// Shared with the HTTP handlers behind a `std::sync::RwLock` (wired in
+/// `main`): every critical section is a brief, synchronous take-mutate-drop
+/// with no `.await` held across the lock, so the std (non-async) `RwLock` is
+/// the right primitive — `/status`/`/metrics` take a read lock, the reconcile
+/// task takes a write lock only for the short mutations (never across the
+/// slow shell-outs; see `reconcile`'s docs).
 #[derive(Debug, Clone)]
 pub struct ArbiterState {
     /// Current externally-visible state.
@@ -181,6 +304,135 @@ pub struct ArbiterState {
     /// monitor each reconcile). Cross-platform; on non-Linux it stays at its
     /// "monitor down" default.
     pub presence: Presence,
+    /// Unit names an operator has manually stopped via `POST
+    /// /units/{unit}/stop`. Consulted by the ensure-running post-step (see
+    /// [`crate::reconcile::ensure_running_targets`]), which skips any unit in
+    /// this set even though the GPU is free — otherwise the very next reconcile
+    /// pass (even the periodic backstop timer) would immediately restart a unit
+    /// the operator just stopped. A hold survives gaming↔available transitions
+    /// (a game ending must not resurrect a held unit) and is cleared only by a
+    /// manual start on the same unit, or a daemon restart — held state is
+    /// **in-memory only**, which is the correct behavior: a fresh process
+    /// re-derives everything from observed truth rather than trusting a stale
+    /// hold from a prior run.
+    pub held: HashSet<String>,
+    /// `true` if the most recent eviction pass had at least one unit fail —
+    /// feeds [`StatusSnapshot::degraded`].
+    pub degraded: bool,
+    /// Monotonic Prometheus counters (#14) — durable history across
+    /// journald's short retention on the deployment host. See [`Metrics`].
+    pub metrics: Metrics,
+}
+
+/// Monotonic Prometheus counters accumulated over the daemon's process
+/// lifetime, rendered by `gpu_arbiter_evictions_total` /
+/// `gpu_arbiter_unit_restarts_total` / `gpu_arbiter_reconcile_passes_total`
+/// (#14; `gpu_arbiter_proc_events_dropped_total` is tracked separately in
+/// [`crate::procmon`], which has no [`ArbiterState`] access).
+///
+/// Held in [`ArbiterState`] behind its `RwLock`, exactly like every other
+/// field — the reconcile task is the sole writer, so incrementing a counter is
+/// just another brief, synchronous mutation under [`write_state`]. **Never
+/// reset except by a daemon restart**: every `# HELP` line on these metrics
+/// says so explicitly, because a Prometheus consumer must use `rate()`/
+/// `increase()` rather than comparing raw values across a restart.
+#[derive(Debug, Clone, Default)]
+pub struct Metrics {
+    /// Per-unit eviction outcome counts, keyed by unit name.
+    pub evictions: std::collections::HashMap<String, EvictionCounts>,
+    /// Per-unit count of successful managed-unit starts driven by the daemon
+    /// (the ensure-running eager restore — which also covers the
+    /// `gaming → available` restart, see [`crate::reconcile::reconcile`]'s
+    /// `UnitAction::Restart` docs — and a manual `POST /units/{unit}/start`).
+    pub unit_restarts: std::collections::HashMap<String, u64>,
+    /// Reconcile passes run, bucketed by [`PassTrigger`].
+    pub reconcile_passes: ReconcilePassCounts,
+}
+
+impl Metrics {
+    /// Record one eviction attempt's outcome for `unit`. Callers get `outcome`
+    /// from [`crate::units::eviction_metric_outcome`], which already excludes
+    /// the "nothing to evict" case — every call here represents a real
+    /// eviction event.
+    pub fn record_eviction(&mut self, unit: &str, outcome: crate::units::EvictionMetricOutcome) {
+        use crate::units::EvictionMetricOutcome;
+        let counts = self.evictions.entry(unit.to_string()).or_default();
+        match outcome {
+            EvictionMetricOutcome::Graceful => counts.graceful += 1,
+            EvictionMetricOutcome::Sigkill => counts.sigkill += 1,
+            EvictionMetricOutcome::Error => counts.error += 1,
+        }
+    }
+
+    /// Record one successful managed-unit start for `unit`.
+    pub fn record_unit_restart(&mut self, unit: &str) {
+        *self.unit_restarts.entry(unit.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record one reconcile pass under `trigger`'s bucket.
+    pub fn record_reconcile_pass(&mut self, trigger: PassTrigger) {
+        match trigger {
+            PassTrigger::ProcEvent => self.reconcile_passes.proc_event += 1,
+            PassTrigger::Timer => self.reconcile_passes.timer += 1,
+            PassTrigger::Manual => self.reconcile_passes.manual += 1,
+            PassTrigger::Startup => self.reconcile_passes.startup += 1,
+        }
+    }
+}
+
+/// One unit's cumulative eviction outcomes — the `{outcome=...}` label values
+/// for `gpu_arbiter_evictions_total{unit}`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvictionCounts {
+    /// Count of gracefully-freed evictions (VRAM drained within the timeout).
+    pub graceful: u64,
+    /// Count of evictions that needed a SIGKILL escalation.
+    pub sigkill: u64,
+    /// Count of eviction attempts that errored.
+    pub error: u64,
+}
+
+/// Cumulative reconcile-pass counts by trigger category — the `{trigger=...}`
+/// label values for `gpu_arbiter_reconcile_passes_total`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReconcilePassCounts {
+    /// Passes driven by a debounced `cn_proc` exec/exit event.
+    pub proc_event: u64,
+    /// Passes driven by the periodic backstop timer.
+    pub timer: u64,
+    /// Passes driven by a `POST /units/{unit}/start|stop` (or `/ollama/*`
+    /// alias) manual trigger.
+    pub manual: u64,
+    /// The one-off startup pass `main` runs before any other task starts.
+    pub startup: u64,
+}
+
+/// The `trigger` label bucket for `gpu_arbiter_reconcile_passes_total` (#14).
+/// Coarser than [`ReconcileTrigger`] itself — see
+/// [`ReconcileTrigger::pass_trigger`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassTrigger {
+    /// A debounced `cn_proc` exec/exit event.
+    ProcEvent,
+    /// The periodic backstop timer.
+    Timer,
+    /// A manual `POST /units/{unit}/start|stop` (either direction).
+    Manual,
+    /// The one-off startup pass.
+    Startup,
+}
+
+impl PassTrigger {
+    /// The Prometheus label value (`"proc_event"`/`"timer"`/`"manual"`/`"startup"`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            PassTrigger::ProcEvent => "proc_event",
+            PassTrigger::Timer => "timer",
+            PassTrigger::Manual => "manual",
+            PassTrigger::Startup => "startup",
+        }
+    }
 }
 
 /// The local-presence view embedded in [`ArbiterState`] / [`StatusSnapshot`],
@@ -209,12 +461,16 @@ impl Default for ArbiterState {
             gpu_vram_total_mb: 0,
             since: SystemTime::now(),
             presence: Presence::default(),
+            held: HashSet::new(),
+            degraded: false,
+            metrics: Metrics::default(),
         }
     }
 }
 
 impl ArbiterState {
     /// Construct the initial state (boot default: `available`).
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -225,6 +481,7 @@ impl ArbiterState {
     ///
     /// The `evicting` transient is set explicitly by the eviction path, not
     /// derived here.
+    #[must_use]
     pub fn resolve_state(claims: &[Claim]) -> State {
         if claims.is_empty() {
             State::Available
@@ -255,8 +512,54 @@ impl ArbiterState {
             local_input_last_unix: self.presence.last_input_unix,
             physical_input_devices: self.presence.devices,
             input_monitor_up: self.presence.monitor_up,
+            degraded: self.degraded,
         }
     }
+}
+
+/// Take a read lock on the shared [`ArbiterState`] (`/status`/`/metrics`
+/// handlers). Panics on a poisoned lock — see [`write_state`] for the policy
+/// this and [`write_state`] share.
+///
+/// # Panics
+///
+/// Panics if the lock is poisoned (a prior writer panicked mid-mutation) —
+/// deliberate, see [`write_state`]'s "Poisoning policy" doc below.
+pub fn read_state(
+    state: &std::sync::RwLock<ArbiterState>,
+) -> std::sync::RwLockReadGuard<'_, ArbiterState> {
+    state.read().unwrap_or_else(|poison| {
+        panic!("ArbiterState lock poisoned (a prior writer panicked): {poison}")
+    })
+}
+
+/// Take a write lock on the shared [`ArbiterState`] (the reconcile task's brief
+/// mutations).
+///
+/// ## Poisoning policy: fatal, not recovered
+///
+/// A poisoned lock means a prior writer panicked mid-mutation, leaving
+/// `ArbiterState` potentially inconsistent (e.g. `units` updated but
+/// `presence`/`gpu_vram_used_mb` not, or `state` left stale relative to
+/// `claims`). For a root daemon whose entire job is deciding whether to evict
+/// or restore GPU tenants, silently continuing on unverified state risks
+/// getting that decision wrong in either direction — leaving a tenant off
+/// forever, or restarting one into a live game. Crashing here and relying on
+/// systemd's `Restart=always` (`packaging/gpu-arbiter.service`) to boot a
+/// fresh process — which re-runs the startup reconcile against freshly
+/// observed ground truth — is the safer failure mode than
+/// `into_inner()`-recovering a guard over data of unknown integrity.
+///
+/// # Panics
+///
+/// Panics if the lock is poisoned (a prior writer panicked mid-mutation) —
+/// deliberate, see the "Poisoning policy" section above.
+pub fn write_state(
+    state: &std::sync::RwLock<ArbiterState>,
+) -> std::sync::RwLockWriteGuard<'_, ArbiterState> {
+    state.write().unwrap_or_else(|poison| {
+        panic!("ArbiterState lock poisoned (a prior writer panicked): {poison}")
+    })
 }
 
 /// Format a [`SystemTime`] as an RFC 3339 / ISO-8601 UTC string for `/status`
@@ -268,11 +571,11 @@ impl ArbiterState {
 /// well beyond any timestamp this daemon emits). Sub-second precision is dropped
 /// (the `/status` contract uses whole-second timestamps); times before the Unix
 /// epoch (which the daemon never produces) clamp to the epoch.
+#[must_use]
 pub fn format_rfc3339(t: SystemTime) -> String {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let (year, month, day, hour, min, sec) = civil_from_unix_secs(secs);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
 }
@@ -284,8 +587,12 @@ pub fn format_rfc3339(t: SystemTime) -> String {
 /// (<http://howardhinnant.github.io/date_algorithms.html>), which is exact for
 /// the whole Gregorian calendar with no leap-second fudging (UTC `/status`
 /// timestamps don't carry leap seconds).
+// `day`/`month` below are provably in [1, 31] / [1, 12] by the date algorithm
+// itself (Howard Hinnant's `days_from_civil` inverse) — the `i64 -> u32`
+// narrowing can't truncate or lose sign for any input this function computes.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn civil_from_unix_secs(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = (secs / 86_400) as i64;
+    let days = (secs / 86_400).cast_signed();
     let rem = (secs % 86_400) as u32;
     let hour = rem / 3600;
     let min = (rem % 3600) / 60;
@@ -378,6 +685,22 @@ mod tests {
     }
 
     #[test]
+    fn unit_status_running_none_serializes_as_json_null() {
+        // #15: unlike `vram_mb` (skip_serializing_if), `running: None` is NOT
+        // omitted — it must appear as an explicit `null` so a consumer can tell
+        // "unknown" apart from a missing/old field.
+        let u = UnitStatus {
+            unit: "ollama.service".into(),
+            running: None,
+            models: vec![],
+            vram_mb: None,
+            held: false,
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains(r#""running":null"#), "{json}");
+    }
+
+    #[test]
     fn evicting_serializes_lowercase_and_vram_present() {
         // The /status contract: `evicting` lowercases, and a known vram_mb is
         // emitted (the inverse of the None-is-skipped case above).
@@ -385,9 +708,10 @@ mod tests {
         s.state = State::Evicting;
         s.units = vec![UnitStatus {
             unit: "ollama.service".into(),
-            running: true,
+            running: Some(true),
             models: vec![],
             vram_mb: Some(21000),
+            held: true,
         }];
         s.gpu_vram_used_mb = 21500;
         s.gpu_vram_total_mb = 32768;
@@ -396,6 +720,8 @@ mod tests {
         assert!(json.contains(r#""vram_mb":21000"#));
         assert!(json.contains(r#""gpu_vram_used_mb":21500"#));
         assert!(json.contains(r#""gpu_vram_total_mb":32768"#));
+        // The manual-hold flag round-trips through `/status` per unit.
+        assert!(json.contains(r#""held":true"#));
     }
 
     #[test]
@@ -406,15 +732,17 @@ mod tests {
         s.units = vec![
             UnitStatus {
                 unit: "vllm.service".into(),
-                running: true,
+                running: Some(true),
                 models: vec![],
                 vram_mb: Some(8000),
+                held: false,
             },
             UnitStatus {
                 unit: "ollama.service".into(),
-                running: true,
+                running: Some(true),
                 models: vec!["qwen3:30b".into()],
                 vram_mb: Some(21000),
+                held: false,
             },
         ];
         let snap = s.snapshot();
@@ -432,9 +760,10 @@ mod tests {
         let mut s = ArbiterState::new();
         s.units = vec![UnitStatus {
             unit: "vllm.service".into(),
-            running: false,
+            running: Some(false),
             models: vec![],
             vram_mb: None,
+            held: false,
         }];
         let snap = s.snapshot();
         assert_eq!(snap.ollama.unit, "vllm.service");
@@ -448,5 +777,94 @@ mod tests {
         assert_eq!(s.since, t0);
         s.set_state(State::Gaming); // change
         assert!(s.since >= t0);
+    }
+
+    // ── Metrics (#14) ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn record_eviction_accumulates_per_unit_per_outcome() {
+        use crate::units::EvictionMetricOutcome;
+        let mut m = Metrics::default();
+        m.record_eviction("ollama.service", EvictionMetricOutcome::Graceful);
+        m.record_eviction("ollama.service", EvictionMetricOutcome::Graceful);
+        m.record_eviction("ollama.service", EvictionMetricOutcome::Sigkill);
+        m.record_eviction("vllm.service", EvictionMetricOutcome::Error);
+
+        let ollama = m.evictions["ollama.service"];
+        assert_eq!(ollama.graceful, 2);
+        assert_eq!(ollama.sigkill, 1);
+        assert_eq!(ollama.error, 0);
+        let vllm = m.evictions["vllm.service"];
+        assert_eq!(vllm.error, 1);
+    }
+
+    #[test]
+    fn record_unit_restart_accumulates_per_unit() {
+        let mut m = Metrics::default();
+        m.record_unit_restart("ollama.service");
+        m.record_unit_restart("ollama.service");
+        m.record_unit_restart("vllm.service");
+        assert_eq!(m.unit_restarts["ollama.service"], 2);
+        assert_eq!(m.unit_restarts["vllm.service"], 1);
+    }
+
+    #[test]
+    fn record_reconcile_pass_buckets_by_trigger() {
+        let mut m = Metrics::default();
+        m.record_reconcile_pass(PassTrigger::ProcEvent);
+        m.record_reconcile_pass(PassTrigger::ProcEvent);
+        m.record_reconcile_pass(PassTrigger::Timer);
+        m.record_reconcile_pass(PassTrigger::Manual);
+        m.record_reconcile_pass(PassTrigger::Startup);
+        assert_eq!(m.reconcile_passes.proc_event, 2);
+        assert_eq!(m.reconcile_passes.timer, 1);
+        assert_eq!(m.reconcile_passes.manual, 1);
+        assert_eq!(m.reconcile_passes.startup, 1);
+    }
+
+    #[test]
+    fn reconcile_trigger_pass_bucket_mapping() {
+        // ManualStart/ManualStop both bucket to Manual; every other variant maps
+        // 1:1 to its own PassTrigger.
+        let (start_reply, _) = oneshot::channel();
+        let (stop_reply, _) = oneshot::channel();
+        assert_eq!(
+            ReconcileTrigger::ProcEvent.pass_trigger(),
+            PassTrigger::ProcEvent
+        );
+        assert_eq!(ReconcileTrigger::Timer.pass_trigger(), PassTrigger::Timer);
+        assert_eq!(
+            ReconcileTrigger::Startup.pass_trigger(),
+            PassTrigger::Startup
+        );
+        assert_eq!(
+            ReconcileTrigger::ManualStart {
+                unit: "x".to_string(),
+                reply: start_reply
+            }
+            .pass_trigger(),
+            PassTrigger::Manual
+        );
+        assert_eq!(
+            ReconcileTrigger::ManualStop {
+                unit: "x".to_string(),
+                reply: stop_reply
+            }
+            .pass_trigger(),
+            PassTrigger::Manual
+        );
+    }
+
+    #[test]
+    fn pass_trigger_labels() {
+        assert_eq!(PassTrigger::ProcEvent.label(), "proc_event");
+        assert_eq!(PassTrigger::Timer.label(), "timer");
+        assert_eq!(PassTrigger::Manual.label(), "manual");
+        assert_eq!(PassTrigger::Startup.label(), "startup");
+    }
+
+    #[test]
+    fn reconcile_trigger_label_covers_startup() {
+        assert_eq!(ReconcileTrigger::Startup.label(), "startup");
     }
 }

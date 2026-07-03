@@ -9,6 +9,14 @@
 //!
 //! Pure & cross-platform: parsing is a pure function, unit-tested on macOS with
 //! literal TOML strings.
+//!
+//! [`Config`], [`ManagedUnit`], and [`GamePattern`] all carry
+//! `#[serde(deny_unknown_fields)]`: a typo'd or unrecognized key is a parse
+//! error naming the offending key, not a silently-ignored no-op. This is what
+//! makes `--check-config` (see [`crate::cli::check_config`]) trustworthy — a
+//! typo like `detect_stema` used to still print `OK`.
+
+use std::net::{IpAddr, Ipv4Addr};
 
 use serde::Deserialize;
 
@@ -21,6 +29,7 @@ use serde::Deserialize;
 /// match = "Heroic"
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GamePattern {
     /// Human-readable claim name (becomes `pattern:<name>`).
     pub name: String,
@@ -89,7 +98,7 @@ pub enum GpuBackendKind {
 /// By default the tenant is driven by **systemd** (`systemctl stop|start|
 /// is-active|kill`), exactly as the daemon has always behaved. The optional
 /// `*_cmd` fields override that with arbitrary process-control commands so the
-/// daemon can drive OpenRC (Gentoo/Artix/Alpine), runit (Void), or plain
+/// daemon can drive `OpenRC` (Gentoo/Artix/Alpine), runit (Void), or plain
 /// processes — see [`crate::units::Supervisor`]. When **all** `*_cmd` overrides
 /// are absent the tenant is byte-for-byte systemd-driven.
 ///
@@ -115,7 +124,7 @@ pub enum GpuBackendKind {
 /// introspect_cmd = "ollama ps"  # explicit model-list command (optional, overrides kind)
 /// ```
 ///
-/// Or, command-driven (OpenRC example):
+/// Or, command-driven (`OpenRC` example):
 /// ```toml
 /// [[managed_units]]
 /// unit = "ollama"                              # label only; not a systemd unit
@@ -126,6 +135,7 @@ pub enum GpuBackendKind {
 /// # kill_cmd optional; if omitted, escalation re-runs stop_cmd
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedUnit {
     /// systemd unit the daemon exclusively owns — or, when `*_cmd` overrides are
     /// set, a free-form label for `/status` and logging.
@@ -133,9 +143,16 @@ pub struct ManagedUnit {
     /// Restart this unit when gaming ends (eager warm-up). Defaults to `true`.
     #[serde(default = "default_true")]
     pub eager_restart: bool,
-    /// Substring matched (case-insensitive) against `nvidia-smi` compute-proc
-    /// names to attribute this unit's VRAM in `/status`. `None` → no VRAM is
-    /// reported for the unit (the field is omitted rather than reported as 0).
+    /// **Fallback** substring (case-insensitive) matched against `nvidia-smi`
+    /// compute-proc names to attribute this unit's VRAM in `/status`. For a
+    /// systemd-supervised unit, cgroup PID resolution (#7) attributes VRAM
+    /// automatically with no config needed — it isn't fooled by a wrapper
+    /// binary (a venv interpreter, a launcher script) the way this
+    /// name-substring match can be. `vram_match` remains the only attribution
+    /// channel for command-driven (`*_cmd`) units and non-systemd hosts, where
+    /// no cgroup path resolves to a configured unit name. `None` → no VRAM is
+    /// reported for the unit via this channel (the field is omitted rather
+    /// than reported as 0).
     #[serde(default)]
     pub vram_match: Option<String>,
     /// Introspection backend selector for the `/status` `models[]` list. The only
@@ -195,6 +212,7 @@ impl ManagedUnit {
     /// A blank/whitespace-only **or** over-length (`> MAX_INTROSPECT_CMD_LEN`)
     /// `introspect_cmd` is treated as unset — resolution falls through to `kind`
     /// and the name heuristic rather than running a bogus command.
+    #[must_use]
     pub fn introspection(&self) -> Introspection {
         if let Some(cmd) = &self.introspect_cmd
             && !cmd.trim().is_empty()
@@ -231,6 +249,7 @@ impl ArgvCmd {
     /// The argv as a slice. `argv()[0]` is the program; the rest are args.
     /// Empty only if a config supplied an empty array / blank string (callers
     /// treat that as a no-op).
+    #[must_use]
     pub fn argv(&self) -> &[String] {
         &self.0
     }
@@ -279,13 +298,28 @@ impl<'de> Deserialize<'de> for ArgvCmd {
 /// | `presence_detection` | `gpu_arbiter_presence_detection` |
 /// | `presence_idle_threshold_s` | `gpu_arbiter_presence_idle_threshold_s` |
 /// | `gpu_backend` | `gpu_arbiter_gpu_backend` |
+/// | `bind` | `gpu_arbiter_bind` |
+/// | `socket_path` | `gpu_arbiter_socket_path` |
+// The bool fields are independent TOML config toggles (1:1 with the table
+// above), not a state machine — splitting them into a builder/bitflags type
+// would break the flat `deny_unknown_fields` TOML schema for no readability
+// win.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Master enable. (The Ansible role also gates the unit on this.)
     pub enabled: bool,
-    /// HTTP listen port (bound `0.0.0.0`; LAN-restricted by firewalld).
+    /// HTTP listen port (bound to `bind`; LAN-restricted by firewalld).
     pub port: u16,
+    /// TCP bind address for the HTTP control surface (`GET /status /metrics
+    /// /healthz` plus the deprecated `POST /units/*` / `/ollama/*` write
+    /// routes — see [`Config::socket_path`] for the sanctioned write path).
+    /// Default `0.0.0.0` (unchanged historical behavior — every interface).
+    /// Scoping this to a LAN-only address is defense-in-depth **on top of**,
+    /// not instead of, the firewalld rich rule.
+    #[serde(default = "default_bind")]
+    pub bind: IpAddr,
     /// **Legacy** single managed unit. Superseded by `managed_units`; still
     /// accepted and, when `managed_units` is unset, synthesized into a
     /// one-element list (see [`Config::resolved_units`]).
@@ -298,13 +332,22 @@ pub struct Config {
     /// `ollama_unit` / `eager_ollama` fields synthesize a single entry — see
     /// [`Config::resolved_units`], the one accessor the daemon drives off.
     pub managed_units: Vec<ManagedUnit>,
+    /// The normalized, ordered list the daemon actually drives — `managed_units`
+    /// verbatim, or the legacy-synthesized single entry when it's empty. Computed
+    /// **once**, when the config is loaded/defaulted (see [`Config::from_toml`] /
+    /// [`Default for Config`](#impl-Default-for-Config)), not re-synthesized on
+    /// every [`Config::resolved_units`] call — a single reconcile pass and HTTP
+    /// request each call it multiple times. Not a TOML key: never read from the
+    /// config file, always derived.
+    #[serde(skip)]
+    pub units: Vec<ManagedUnit>,
     /// Seconds to wait for a graceful Ollama teardown before SIGKILL escalation.
     pub eviction_timeout_s: u64,
     /// VRAM-used threshold (MiB) under which the GPU is considered "freed" after
     /// eviction.
     pub vram_free_threshold_mb: u64,
     /// Slow backstop reconcile interval (seconds). Detection itself is
-    /// event-driven (cn_proc); this only covers dropped events.
+    /// event-driven (`cn_proc`); this only covers dropped events.
     pub reconcile_interval_s: u64,
 
     // ── detection ──────────────────────────────────────────────────────────
@@ -316,7 +359,12 @@ pub struct Config {
     pub vram_heuristic: bool,
     /// VRAM threshold (MiB) for the opt-in heuristic.
     pub vram_game_threshold_mb: u64,
-    /// Sanctioned GPU tenants (for the heuristic + a sanity log line).
+    /// Sanctioned GPU tenants (for the heuristic + a sanity log line). Each
+    /// entry is matched case-insensitively against a `vram_heuristic`
+    /// graphics proc's full name/path, its path basename, and (when cgroup
+    /// attribution resolved one, #7) its owning systemd unit — see
+    /// [`crate::classify::matches_allowlist`] (#13). No substring matching:
+    /// every check is an exact equality.
     pub gpu_allowlist: Vec<String>,
 
     // ── presence ─────────────────────────────────────────────────────────────
@@ -332,16 +380,56 @@ pub struct Config {
     /// Which GPU vendor backend to drive: `"auto"` (default), `"nvidia"`, or
     /// `"amd"`. `auto` keeps existing NVIDIA hosts on the `nvidia-smi` path.
     pub gpu_backend: GpuBackendKind,
+
+    // ── control socket ───────────────────────────────────────────────────────
+    /// Path to the unix control socket that serves the write path (`POST
+    /// /units/{unit}/start|stop`, `/ollama/start|stop`) — the sanctioned
+    /// control surface (local-only, no bearer tokens). Bound mode `0600`,
+    /// root-owned, inside a mode-`0700` root-owned parent directory (see
+    /// [`crate::http::serve_uds`] — the parent directory closes a
+    /// bind-then-chmod permission race and is itself part of the auth
+    /// boundary, not just the socket file's own mode). Default
+    /// `/run/gpu-arbiter/gpu-arbiter.sock` — a dedicated subdirectory of
+    /// `/run`, not bare `/run` itself, specifically so the daemon (or
+    /// systemd's `RuntimeDirectory=`, see `packaging/gpu-arbiter.service`)
+    /// has a directory of its own to lock down to `0700` rather than relying
+    /// solely on the socket file's mode. The TCP `/units/*`/`/ollama/*`
+    /// routes keep working (loopback-gated) for back-compat but are
+    /// deprecated in favor of this socket. An **empty string** disables the
+    /// unix socket entirely.
+    #[serde(default = "default_socket_path")]
+    pub socket_path: String,
+}
+
+/// serde default for [`Config::bind`] — `0.0.0.0` (every interface), the
+/// historical hardcoded behavior.
+fn default_bind() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
+
+/// serde default for [`Config::socket_path`]: `/run/gpu-arbiter/gpu-arbiter.sock`.
+///
+/// A dedicated subdirectory of `/run` (not bare `/run/gpu-arbiter.sock`, the
+/// pre-#61 default) — see [`crate::http::serve_uds`]'s docs for why the
+/// parent directory itself needs to be lockable to mode `0700`.
+fn default_socket_path() -> String {
+    "/run/gpu-arbiter/gpu-arbiter.sock".to_string()
 }
 
 impl Default for Config {
     fn default() -> Self {
+        let ollama_unit = "ollama.service".to_string();
+        let eager_ollama = true;
+        let managed_units = Vec::new();
+        let units = synthesize_units(&ollama_unit, eager_ollama, &managed_units);
         Self {
             enabled: true,
             port: 48750,
-            ollama_unit: "ollama.service".to_string(),
-            eager_ollama: true,
-            managed_units: Vec::new(),
+            bind: default_bind(),
+            ollama_unit,
+            eager_ollama,
+            managed_units,
+            units,
             eviction_timeout_s: 5,
             vram_free_threshold_mb: 2000,
             reconcile_interval_s: 30,
@@ -358,6 +446,7 @@ impl Default for Config {
             presence_detection: true,
             presence_idle_threshold_s: 600,
             gpu_backend: GpuBackendKind::Auto,
+            socket_path: default_socket_path(),
         }
     }
 }
@@ -378,42 +467,76 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
 }
 
+/// Compute the normalized [`Config::units`] list from the raw `managed_units` /
+/// legacy `ollama_unit` / `eager_ollama` fields. Pure — the sole place the
+/// backward-compatibility synthesis happens, called once per [`Config`]
+/// construction (see [`Config::from_toml`] and `impl Default for Config`).
+///
+/// If `managed_units` is non-empty it's returned verbatim (order preserved —
+/// eviction runs in this order). Otherwise a **one-element** list is synthesized
+/// from `ollama_unit` / `eager_ollama` with `vram_match = "ollama"` and
+/// `kind = "ollama"`, so an unconfigured daemon (or one still using only the old
+/// keys) evicts, attributes VRAM for, and introspects (`ollama ps`) Ollama
+/// exactly as it did before `managed_units` existed. This is the
+/// backward-compatibility contract.
+fn synthesize_units(
+    ollama_unit: &str,
+    eager_ollama: bool,
+    managed_units: &[ManagedUnit],
+) -> Vec<ManagedUnit> {
+    if managed_units.is_empty() {
+        vec![ManagedUnit {
+            unit: ollama_unit.to_string(),
+            eager_restart: eager_ollama,
+            vram_match: Some("ollama".to_string()),
+            kind: Some("ollama".to_string()),
+            introspect_cmd: None,
+            // Legacy synthesized unit is always systemd-driven (no overrides).
+            stop_cmd: None,
+            start_cmd: None,
+            is_active_cmd: None,
+            kill_cmd: None,
+        }]
+    } else {
+        managed_units.to_vec()
+    }
+}
+
 impl Config {
     /// The ordered list of managed units the daemon actually drives — the single
     /// source of truth for eviction/restart and `/status`.
     ///
-    /// If `managed_units` is non-empty it's returned verbatim (order preserved —
-    /// eviction runs in this order). Otherwise a **one-element** list is
-    /// synthesized from the legacy `ollama_unit` / `eager_ollama` fields with
-    /// `vram_match = "ollama"`, so an unconfigured daemon (or one still using only
-    /// the old keys) evicts + attributes VRAM for Ollama exactly as it did before
-    /// `managed_units` existed. This is the backward-compatibility contract.
-    pub fn resolved_units(&self) -> Vec<ManagedUnit> {
-        if self.managed_units.is_empty() {
-            vec![ManagedUnit {
-                unit: self.ollama_unit.clone(),
-                eager_restart: self.eager_ollama,
-                vram_match: Some("ollama".to_string()),
-                kind: Some("ollama".to_string()),
-                introspect_cmd: None,
-                // Legacy synthesized unit is always systemd-driven (no overrides).
-                stop_cmd: None,
-                start_cmd: None,
-                is_active_cmd: None,
-                kill_cmd: None,
-            }]
-        } else {
-            self.managed_units.clone()
-        }
+    /// Borrowed, not cloned: [`Config::units`] is computed once at load time (see
+    /// [`Config::from_toml`]), so a reconcile pass or an HTTP request calling this
+    /// several times per pass/request costs nothing beyond the initial synthesis.
+    #[must_use]
+    pub fn resolved_units(&self) -> &[ManagedUnit] {
+        &self.units
     }
 
     /// Parse a [`Config`] from a TOML string. Pure — unit-tested on macOS.
+    ///
+    /// Normalizes [`Config::units`] immediately after deserializing (see
+    /// [`synthesize_units`]) so every other constructor of a live `Config`
+    /// (`load`, `Default`) produces a consistently-resolved unit list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] if `s` isn't valid TOML, or a known field has
+    /// the wrong type, or an unknown key is present (`deny_unknown_fields`).
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
-        Ok(toml::from_str(s)?)
+        let mut cfg: Config = toml::from_str(s)?;
+        cfg.units = synthesize_units(&cfg.ollama_unit, cfg.eager_ollama, &cfg.managed_units);
+        Ok(cfg)
     }
 
     /// Load config from a path. A missing file is **not** an error — it yields
     /// [`Config::default`] (the daemon is fully usable with zero config).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] if the file exists but can't be read (permission
+    /// denied, etc.) or fails to parse — see [`Config::from_toml`].
     pub fn load(path: &str) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(s) => Self::from_toml(&s),
@@ -440,15 +563,46 @@ mod tests {
         // Presence defaults: on, 10-minute idle threshold.
         assert!(c.presence_detection);
         assert_eq!(c.presence_idle_threshold_s, 600);
+        // #22/#17: bind defaults to every interface (unchanged historical
+        // behavior); the unix control socket defaults to a dedicated,
+        // lockable-to-0700 subdirectory of /run (#61).
+        assert_eq!(
+            c.bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(c.socket_path, "/run/gpu-arbiter/gpu-arbiter.sock");
+    }
+
+    #[test]
+    fn bind_key_parses_and_rejects_garbage() {
+        let c = Config::from_toml(r#"bind = "127.0.0.1""#).unwrap();
+        assert_eq!(c.bind, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let c = Config::from_toml(r#"bind = "::1""#).unwrap();
+        assert_eq!(c.bind, std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        // A malformed address is a typed parse error, not a silent fallback.
+        assert!(matches!(
+            Config::from_toml(r#"bind = "not-an-ip""#).unwrap_err(),
+            ConfigError::Parse(_)
+        ));
+    }
+
+    #[test]
+    fn socket_path_key_overrides_and_empty_string_is_accepted() {
+        let c = Config::from_toml(r#"socket_path = "/run/gpu-arbiter/custom.sock""#).unwrap();
+        assert_eq!(c.socket_path, "/run/gpu-arbiter/custom.sock");
+        // Empty string is the documented "disable the unix socket" sentinel —
+        // it must parse (validation of *meaning* happens where it's consumed).
+        let c = Config::from_toml(r#"socket_path = """#).unwrap();
+        assert_eq!(c.socket_path, "");
     }
 
     #[test]
     fn presence_keys_override() {
         let c = Config::from_toml(
-            r#"
+            "
             presence_detection = false
             presence_idle_threshold_s = 120
-            "#,
+            ",
         )
         .unwrap();
         assert!(!c.presence_detection);
@@ -458,10 +612,10 @@ mod tests {
     #[test]
     fn partial_toml_overrides_only_named_keys() {
         let c = Config::from_toml(
-            r#"
+            "
             port = 9000
             eager_ollama = false
-            "#,
+            ",
         )
         .unwrap();
         assert_eq!(c.port, 9000);
@@ -484,6 +638,65 @@ mod tests {
         // A template bug producing the wrong type must fail fast with a typed
         // Parse error, not silently default.
         let err = Config::from_toml("port = \"not_a_number\"").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        // #4: a typo'd top-level key (e.g. `detect_stema` instead of
+        // `detect_steam`) must fail parse instead of silently defaulting —
+        // otherwise `--check-config` prints OK on a config that does nothing the
+        // operator intended.
+        let err = Config::from_toml("detect_stema = true").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("detect_stema"),
+            "error should name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_per_unit_key_is_rejected() {
+        // Same guard on a per-`managed_units` entry.
+        let err = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama.service"
+            eagre_restart = true
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("eagre_restart"),
+            "error should name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_game_pattern_key_is_rejected() {
+        let err = Config::from_toml(
+            r#"
+            [[game_patterns]]
+            name = "heroic"
+            match = "Heroic"
+            extra = "nope"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+        assert!(
+            err.to_string().contains("extra"),
+            "error should name the offending key: {err}"
+        );
+    }
+
+    #[test]
+    fn units_toml_key_is_rejected_not_silently_accepted() {
+        // Config::units is `#[serde(skip)]` (computed, never read from the file) —
+        // a config that tries to set it directly must be a typed error, not
+        // silently ignored (which was the pre-deny_unknown_fields behavior).
+        let err = Config::from_toml("units = []").unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)));
     }
 

@@ -7,13 +7,32 @@
 #
 # Keys map 1:1 to the serde Config struct in src/config.rs. See
 # gpu-arbiter-config(5) for the authoritative reference.
+#
+# An unknown/misspelled key (top-level, per-[[managed_units]], or
+# per-[[game_patterns]]) fails to parse instead of silently doing nothing —
+# run `gpu-arbiter --check-config` after editing this file.
 
 # Master enable. When false, the daemon logs that it is disabled and exits
 # cleanly (a quick disable without touching systemd).
 #enabled = true
 
-# HTTP listen port, bound on 0.0.0.0 and LAN-restricted by firewalld.
+# HTTP listen port for the read-only surface (/status /metrics /healthz) and
+# the deprecated TCP write routes, bound to `bind` and LAN-restricted by
+# firewalld.
 #port = 48750
+
+# TCP bind address for the HTTP control surface. Scoping this to a LAN-only
+# address is defense-in-depth ON TOP OF, not instead of, the firewalld rule.
+#bind = "0.0.0.0"
+
+# Unix control socket serving the write path (POST /units/{unit}/start|stop,
+# /ollama/start|stop) — the sanctioned control surface: local root only, no
+# bearer tokens, mode 0600 root-owned, inside a mode 0700 root-owned parent
+# directory (the parent directory is itself part of the auth boundary — it
+# closes the bind-then-chmod permission window; see gpu-arbiter-config(5)).
+# An empty string disables the socket entirely, leaving only the deprecated,
+# loopback-gated TCP write routes on `port`.
+#socket_path = "/run/gpu-arbiter/gpu-arbiter.sock"
 
 # Seconds to wait for a graceful tenant teardown (VRAM dropping below
 # vram_free_threshold_mb) before escalating to SIGKILL.
@@ -44,7 +63,10 @@
 #vram_game_threshold_mb = 4000
 
 # Sanctioned GPU tenants, used by the heuristic (and a sanity log line) to avoid
-# flagging known-good processes as games.
+# flagging known-good processes as games. Each entry is matched
+# case-insensitively (no substrings) against a proc's full name/path, its
+# path basename (e.g. "1password" matches /opt/1Password/1password), and its
+# owning systemd unit when cgroup attribution resolved one.
 #gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
 
 # Cmdline-substring patterns for non-Steam launchers. Repeat the table per
@@ -74,14 +96,18 @@
 #
 # If `managed_units` is omitted entirely, a single Ollama entry is synthesized
 # from the legacy `ollama_unit` / `eager_ollama` keys (default
-# "ollama.service", eager_restart = true, vram_match = "ollama"), so an
-# unconfigured daemon evicts Ollama exactly as before.
+# "ollama.service", eager_restart = true, vram_match = "ollama",
+# kind = "ollama"), so an unconfigured daemon evicts Ollama — and reports its
+# loaded models via `ollama ps` — exactly as before.
 #
-# Tenant 1 — Ollama, driven by systemd (the default supervisor):
+# Tenant 1 — Ollama, driven by systemd (the default supervisor). VRAM
+# attribution for a systemd unit is automatic via cgroup PID resolution — no
+# vram_match needed; it's set below only to keep working on the (rare) VRAM
+# heuristic / legacy fallback paths where cgroup data isn't available.
 #[[managed_units]]
 #unit = "ollama.service"        # systemd unit the daemon exclusively owns
 #eager_restart = true           # restart this unit when gaming ends
-#vram_match = "ollama"          # substring for /status VRAM attribution (optional)
+#vram_match = "ollama"          # FALLBACK substring for /status VRAM attribution (optional; cgroup wins when it applies)
 #kind = "ollama"                # introspection backend for /status models[] (optional; only "ollama" recognized)
 #introspect_cmd = "ollama ps"   # explicit model-list command, overrides kind (optional)
 

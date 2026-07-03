@@ -50,7 +50,7 @@
 //! on the host.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 /// Shared presence signal, written by the (Linux) watcher task and read by the
 /// snapshot/metrics path. Cheap to clone (`Arc`-backed) and lock-free.
@@ -67,19 +67,22 @@ pub struct PresenceMonitor {
     /// Whether enumeration + watching is currently working. `false` ⇒ presence is
     /// unknown (fail-safe: callers must not suppress alerts on unknown presence).
     healthy: Arc<AtomicBool>,
-    /// Count of physical human-input devices currently watched.
-    device_count: Arc<AtomicI64>,
+    /// Count of physical human-input devices currently watched. `AtomicU32`
+    /// directly (#37) — a device count is never negative, so there's no
+    /// `i64`-then-`max(0) as u32` clamp/cast dance to carry around.
+    device_count: Arc<AtomicU32>,
 }
 
 impl PresenceMonitor {
     /// Construct a monitor seeded with `start_unix` as the last-input time (the
     /// startup bias). Starts **unhealthy** with zero devices until the watcher
     /// task enumerates successfully (on non-Linux it stays this way forever).
+    #[must_use]
     pub fn new(start_unix: i64) -> Self {
         Self {
             last_input: Arc::new(AtomicI64::new(start_unix)),
             healthy: Arc::new(AtomicBool::new(false)),
-            device_count: Arc::new(AtomicI64::new(0)),
+            device_count: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -91,17 +94,20 @@ impl PresenceMonitor {
     }
 
     /// Unix seconds of the most recent observed physical input event.
+    #[must_use]
     pub fn last_input_unix(&self) -> i64 {
         self.last_input.load(Ordering::Relaxed)
     }
 
     /// Number of physical human-input devices currently watched.
+    #[must_use]
     pub fn device_count(&self) -> u32 {
-        self.device_count.load(Ordering::Relaxed).max(0) as u32
+        self.device_count.load(Ordering::Relaxed)
     }
 
     /// Whether the monitor is healthy (enumeration + watching working). `false`
     /// ⇒ presence unknown.
+    #[must_use]
     pub fn healthy(&self) -> bool {
         self.healthy.load(Ordering::Relaxed)
     }
@@ -114,10 +120,14 @@ impl PresenceMonitor {
     }
 
     /// Set the watched-device count (watcher task internal). Linux-only writer;
-    /// dead on the non-Linux stub build.
+    /// dead on the non-Linux stub build. `n` (a `Vec`/`HashMap` length) is
+    /// saturated into `u32` rather than truncated — a device count in the
+    /// billions is impossible in practice, but `try_from` keeps that an
+    /// explicit, panic-free decision instead of a silent wraparound.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_device_count(&self, n: usize) {
-        self.device_count.store(n as i64, Ordering::Relaxed);
+        self.device_count
+            .store(u32::try_from(n).unwrap_or(u32::MAX), Ordering::Relaxed);
     }
 }
 
@@ -128,6 +138,7 @@ impl PresenceMonitor {
 /// `/sys/devices/virtual/`. Virtual `uinput`/`uhid` devices are *always* parented
 /// there even when they spoof `BUS_USB`, so this is a deterministic exclusion,
 /// independent of bustype/name. Pure & cross-platform — unit-tested on macOS.
+#[must_use]
 pub fn is_physical_syspath(canonical_syspath: &str) -> bool {
     !canonical_syspath.starts_with("/sys/devices/virtual/")
 }
@@ -158,6 +169,7 @@ pub struct InputCaps {
 /// unknown, and unknown is rendered as **not present** here — but callers/alerts
 /// must gate on `input_monitor_up` and refuse to *suppress* on a down monitor
 /// (don't stop warning just because the monitor broke). Pure & cross-platform.
+#[must_use]
 pub fn is_local_present(
     last_input_unix: i64,
     now_unix: i64,
@@ -179,6 +191,7 @@ pub fn is_local_present(
 /// the machine: a lone power button or lid switch (`EV_SW`/`EV_KEY` with no usable
 /// keys → `has_keys` false here), `Video Bus` brightness, PC Speaker, and
 /// `HD-Audio` jack-detection nodes. Pure & cross-platform — unit-tested.
+#[must_use]
 pub fn is_human_input(caps: InputCaps) -> bool {
     caps.has_keys || caps.has_rel || caps.has_abs
 }
@@ -221,8 +234,7 @@ mod linux {
     fn now_unix() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs().cast_signed())
     }
 
     /// Resolve the canonical sysfs path for a `/dev/input/eventX` node by
@@ -249,8 +261,7 @@ mod linux {
         let has_keys = has_key_type
             && dev
                 .supported_keys()
-                .map(|keys| keys.iter().next().is_some())
-                .unwrap_or(false);
+                .is_some_and(|keys| keys.iter().next().is_some());
         InputCaps {
             has_keys,
             has_rel: events.contains(EventType::RELATIVE),
@@ -423,7 +434,7 @@ mod linux {
 
             tokio::select! {
                 _ = timer.tick() => {}
-                _ = trigger => {}
+                () = trigger => {}
             }
 
             match reenumerate(&monitor, &mut watched) {

@@ -10,7 +10,22 @@ gpu\-arbiter \- gaming\-first GPU arbiter daemon
 .B gpu\-arbiter status
 .RB [ \-\-config | \-c
 .IR PATH ]
+.RB [ \-\-url
+.IR URL ]
+.RB [ \-\-json | \-q | \-\-quiet ]
+.br
+.B gpu\-arbiter wait
+.RB [ \-\-for
+.IR available | claimed ]
+.RB [ \-\-timeout
+.IR SECS ]
+.RB [ \-\-url
+.IR URL ]
+.br
+.B gpu\-arbiter watch
 .RB [ \-\-json ]
+.RB [ \-\-url
+.IR URL ]
 .br
 .B gpu\-arbiter
 .RB [ \-\-version | \-V ]
@@ -52,25 +67,84 @@ environment variable, then the default
 .IR /etc/gpu-arbiter/config.toml .
 A missing file is not an error \(em the daemon falls back to built\-in defaults.
 Applies both to the daemon and to the
-.B status
-subcommand (which reads it only for the port). See
+.BR status / wait / watch
+clients (which read it only for the port, and only when
+.B \-\-url
+and
+.B GPU_ARBITER_URL
+are both unset \(em see DAEMON LOCATION). See
 .BR gpu-arbiter-config (5).
+.TP
+.BI "\-\-url " URL
+.RI ( status / wait / watch
+only) explicit daemon base URL, e.g.\&
+.IR http://host:48750 .
+See DAEMON LOCATION.
 .TP
 .B \-\-check\-config
 Load and validate the resolved config, print
 .BI "OK: " <path>
 (or the typed validation error) and exit 0 on success / 1 on error, without
 starting the daemon. Cross\-platform \(em works on the non\-Linux stub build.
+An unknown or typo'd key at any level
+.RI ( top\-level ", " [[managed_units]] ", or " [[game_patterns]] )
+fails validation naming the offending key, rather than silently defaulting.
 .TP
-.BR status " [" \-\-json ]
-Query a running daemon: read the config for the port, issue
-.B "GET http://127.0.0.1:<port>/status"
+.BR status " [" \-\-json " | " \-q | \-\-quiet ]
+Query a running daemon: GET
+.B /status
 and print a human\-readable summary.
 .B \-\-json
 prints the raw
 .I /status
-JSON instead. A plain localhost HTTP client (no TLS), so it runs on any host that
-can reach the port \(em including the non\-Linux stub build.
+JSON instead.
+.B \-q
+/
+.B \-\-quiet
+prints nothing; the exit code alone reports state \(em see EXIT STATUS.
+.B \-\-json
+and
+.B \-\-quiet
+are mutually exclusive. A plain HTTP client (no TLS, via
+.BR ureq ),
+so it runs on any host that can reach the daemon \(em including the non\-Linux
+stub build. See DAEMON LOCATION below for how the target is resolved.
+.TP
+.BR wait " [" \-\-for " " available | claimed "] [" \-\-timeout
+.IR SECS ]
+Poll
+.B /status
+every 2 seconds until the daemon reaches the requested state, then exit 0.
+.B \-\-for
+defaults to
+.BR available ;
+.B claimed
+maps to the daemon's
+.B gaming
+wire state (the wire vocabulary is gaming/available today; a later release may
+rename it, but the
+.B wait
+interface itself will not change).
+.B \-\-timeout
+defaults to 60 seconds; on timeout, or if the daemon is unreachable, exits 1
+with a message on stderr. Intended to replace a hand\-rolled poll loop in a
+launch script, e.g.\&
+.BR "gpu-arbiter wait --for available --timeout 30 && ./start-inference.sh" .
+.TP
+.BR watch " [" \-\-json ]
+Poll
+.B /status
+every 2 seconds and print one line per state transition (plus the initial
+observation) to standard output, until killed. The default line is
+human\-readable
+.RI ( timestamp "  " old " -> " new "  claims=" ... );
+.B \-\-json
+emits one compact JSON object per line (NDJSON) instead:
+.BR "{\(dqts\(dq:...,\(dqfrom\(dq:...,\(dqto\(dq:...,\(dqclaims\(dq:[...]}" .
+This is a client\-side polling loop, not a server\-side streaming endpoint
+\(em the daemon's HTTP surface stays GET\-only for reads. A transient fetch
+error is logged to stderr and polling continues; standard output stays a pure
+transition log, safe to pipe.
 .TP
 .BR \-\-version ", " \-V
 Print the program name and version (the
@@ -81,6 +155,31 @@ Handled before any runtime setup, so it works even on the non\-Linux stub build.
 .BR \-\-help ", " \-h
 Print a short usage summary \(em including the config path and the available
 subcommands \(em to standard output and exit 0.
+.SH DAEMON LOCATION
+The
+.BR status ", " wait ", and " watch
+clients resolve the daemon to query with the following precedence, highest
+first:
+.IP 1. 4
+.BI "\-\-url " URL
+.IP 2. 4
+the
+.B GPU_ARBITER_URL
+environment variable (matching
+.BR gpu-arbiter-tray (1)'s
+convention)
+.IP 3. 4
+.I http://127.0.0.1:<port>
+using the
+.B port
+from the local config (resolved as in
+.BR \-\-config " above)"
+.PP
+Only the third form reads a local config file \(em a caller using
+.B \-\-url
+or
+.B GPU_ARBITER_URL
+to reach a remote daemon never needs one to exist.
 .SH DETECTION AND EVICTION MODEL
 Control is
 .B level\-triggered reconciliation
@@ -127,23 +226,67 @@ is already released and the release is treated as graceful; otherwise the unit
 is force\-killed via its supervisor
 .RB ( "systemctl kill -s SIGKILL" ", or the per-unit " kill_cmd )
 and the daemon proceeds regardless \(em gaming wins the GPU unconditionally and a
-game launch must never hang waiting on a tenant.
+game launch must never hang waiting on a tenant. If any managed unit fails to
+evict, the daemon still hands the GPU to gaming, but marks the state
+.B degraded
+until the next clean eviction pass or a clean return to
+.IR available ,
+so an operator can tell a wedged tenant apart from a fully\-reclaimed GPU.
 .SH HTTP CONTROL SURFACE
-A single HTTP port (default 48750) is bound on 0.0.0.0 and restricted to the LAN
-by a firewalld rich rule. The override endpoints under
+The read\-only surface is a single TCP port (default 48750, bind address
+.BR bind ,
+default 0.0.0.0) restricted to the LAN by a firewalld rich rule (a
+non\-default
+.B bind
+is defense\-in\-depth
+.B on top of,
+not instead of, that rule). The
+.B write
+path \(em
 .I /units/*
-(and the
+and the
 .I /ollama/*
-back\-compat alias) are additionally localhost\-only.
+back\-compat alias \(em is served on
+.B two
+transports: a
+.B unix control socket
+.RB ( socket_path ,
+default
+.IR /run/gpu-arbiter/gpu-arbiter.sock ,
+mode 0600 root\-owned, inside a mode 0700 root\-owned parent directory) \(em
+the sanctioned surface, local\-root\-only, no bearer tokens \(em and,
+.BR deprecated ,
+the same TCP port (additionally localhost\-only there), kept for back\-compat
+with
+.BR gpu-arbiter-tray (1)
+and any existing scripts. Both transports validate
+.I {unit}
+against
+.B managed_units
+before touching
+.BR systemctl .
+See
+.BR gpu-arbiter-config (5)
+for
+.B bind
+/
+.BR socket_path .
 .TP
 .B GET /status
 Full state snapshot: overall state
 .RI ( gaming " | " available " | " evicting ),
-active claims, a per\-managed\-unit array (running flag, reported
+active claims, a per\-managed\-unit array (a tristate
+.B running
+flag \(em true/false/null, the last meaning the daemon couldn't confirm either
+way \(em reported
 .B models[]
-list, attributed VRAM), an
+list, attributed VRAM, and whether the unit is manually
+.BR held ),
+an
 .I ollama
-back\-compat alias block, and total GPU memory.
+back\-compat alias block, total GPU memory, and a top\-level
+.B degraded
+flag (see DETECTION AND EVICTION MODEL).
 .TP
 .B GET /metrics
 Prometheus text\-format exposition.
@@ -152,13 +295,43 @@ Prometheus text\-format exposition.
 Liveness probe.
 .TP
 .B "POST /units/{unit}/start, /units/{unit}/stop"
-Manual override for debugging.
+Manual override for debugging, on the unix socket (sanctioned) or,
+.BR deprecated ,
+the localhost\-only TCP port.
 .I {unit}
 must be one of the configured managed units; an unknown unit is rejected with
-404. Localhost\-only.
+404. Both transports route through the same reconcile task that drives
+automatic eviction/restart (never a directly\-racing HTTP handler).
+.B stop
+additionally
+.B holds
+the unit down: without the hold, the ensure\-running self\-heal step would
+restart it on the very next reconcile pass (even the periodic backstop
+timer), making a manual stop a self\-reverting no\-op. A held unit stays down
+across game launches/exits until
+.B start
+(which clears the hold) or a daemon restart \(em holds are in\-memory only.
+.B start
+is
+.B rejected with 409 Conflict
+while a game holds the GPU (state
+.IR gaming " or " evicting )
+\(em eviction is edge\-triggered (it fires on the available \(-> gaming
+transition), so a unit started mid\-game would NOT be re\-evicted by the next
+pass; it would sit on the GPU alongside the game. On rejection nothing
+changes: the unit is not started and any hold stays in place \(em retry once
+the state is
+.IR available .
+Example, on the unix socket:
+.RS
+.nf
+curl \-\-unix\-socket /run/gpu\-arbiter/gpu\-arbiter.sock \e
+  \-X POST http://localhost/units/ollama.service/stop
+.fi
+.RE
 .TP
 .B "POST /ollama/start, /ollama/stop"
-Back\-compat alias for the first managed unit. Localhost\-only.
+Back\-compat alias for the first managed unit. Same two transports as above.
 .SH FILES
 .TP
 .I /etc/gpu-arbiter/config.toml
@@ -172,12 +345,35 @@ Tracing/log filter (e.g.\&
 Defaults to
 .I info
 when unset.
+.TP
+.B GPU_ARBITER_URL
+Daemon base URL for
+.BR status / wait / watch
+(and
+.BR gpu-arbiter-tray (1)),
+overriding the local\-config\-derived default. See DAEMON LOCATION. Lower
+precedence than
+.BR \-\-url .
 .SH EXIT STATUS
+Any command line rejected by the parser (unknown flag, missing/malformed
+value, an invalid flag/subcommand combination) exits
+.B 2
+immediately, before doing any work \(em true for every subcommand.
 .TP
 .B 0
-Normal: informational flag handled, or
+Normal: informational flag handled,
 .B enabled = false
-in config (the daemon logs and exits cleanly).
+in config (the daemon logs and exits cleanly),
+.B \-\-check\-config
+on a valid config,
+.B status
+printed successfully (or, with
+.BR \-q / \-\-quiet ,
+state is
+.IR available ),
+or
+.B wait
+reached its target state.
 .TP
 .B 1
 Run as the daemon on a non\-Linux host (it requires the cn_proc netlink
@@ -193,11 +389,36 @@ or the per\-unit
 .B *_cmd
 overrides). Also returned by
 .B \-\-check\-config
-on an invalid config, and by
+on an invalid config; by
 .B status
-when the running daemon cannot be reached.
+(without
+.BR \-q )
+on a fetch/render error or an unreachable daemon; by
+.B status " " \-q
+when the state is
+.I gaming
+or
+.IR evicting ;
+and by
+.B wait
+on timeout or an unreachable daemon.
+.TP
+.B 2
+.RB ( status " " \-q " only)"
+the daemon is unreachable \(em a distinct code from the general
+.B status
+fetch\-error code (1) so a script can tell "GPU claimed" from "can't even ask".
 .PP
-SIGTERM (systemd stop) and SIGINT (Ctrl\-C) trigger a graceful shutdown.
+SIGTERM (systemd stop) and SIGINT (Ctrl\-C) trigger a real graceful shutdown:
+the reconcile task is asked to stop picking up new triggers, but any pass
+already in flight \(em including an eviction's stop \(-> poll\-VRAM \(->
+SIGKILL window \(em always runs to completion first, bounded by a 15\-second
+join timeout. Only the stateless I/O tasks are terminated immediately.
+.PP
+SIGHUP logs a notice that config is not hot\-reloaded and a restart is
+required \(em it does not reload, reset, or terminate the daemon. This is
+safe: startup always reconciles against observed truth before anything can
+touch a managed unit, so a restart never "loses" state.
 .SH NOTES
 The daemon runs only on Linux. The crate still builds and unit\-tests on any host
 (including macOS) via a library/stub split; the pure decision logic is

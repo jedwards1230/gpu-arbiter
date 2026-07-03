@@ -16,6 +16,18 @@ names and leaves the rest at their defaults.
 TOML keys mirror the deployment variable names minus the
 .I gpu_arbiter_
 prefix.
+.PP
+An
+.B unknown or misspelled key
+at any level (top\-level, a
+.B [[managed_units]]
+entry, or a
+.B [[game_patterns]]
+entry) is a
+.B parse error
+naming the offending key, not a silently\-ignored no\-op \(em run
+.B gpu\-arbiter \-\-check\-config
+after editing this file.
 .SH TOP-LEVEL KEYS
 .TP
 .B enabled
@@ -29,7 +41,44 @@ touching systemd).
 .B port
 Integer (u16). Default
 .BR 48750 .
-HTTP listen port, bound on 0.0.0.0 and LAN\-restricted by firewalld.
+HTTP listen port for the read\-only surface (and the deprecated TCP write
+routes), bound to
+.B bind
+and LAN\-restricted by firewalld.
+.TP
+.B bind
+String (IP address). Default
+.BR """0.0.0.0""" .
+TCP bind address for the HTTP control surface. Accepts any IPv4 or IPv6
+address literal; a malformed value is a parse error naming the bad string.
+Scoping this to a LAN\-only address is defense\-in\-depth
+.B on top of,
+not instead of, the firewalld rich rule.
+.TP
+.B socket_path
+String (filesystem path). Default
+.BR """/run/gpu-arbiter/gpu-arbiter.sock""" .
+Path to the unix control socket serving the write path
+.RB ( "POST /units/{unit}/start|stop" ", " /ollama/start|stop ),
+created mode 0600, root\-owned \(em the sanctioned control surface (local root
+only, no bearer tokens). The parent directory is created if missing at mode
+0700, root\-owned, and is itself part of the auth boundary, not just the
+socket file's own mode: it closes the brief window between the socket file
+being created (bind) and its mode being pinned to 0600 (chmod), during which
+another local user could otherwise attempt a connection. Before binding, an
+existing socket file is probed with a short connect: if a live process
+answers (another gpu\-arbiter instance), startup fails rather than stealing
+its socket; only a genuinely stale file from an unclean prior shutdown
+(nothing listening) is removed. A failure to bind either listener (this
+socket or the TCP
+.BR port )
+is fatal at startup \(em the daemon exits nonzero so the service manager
+surfaces and retries it, instead of half\-running without a control surface.
+An
+.B empty string
+disables the unix socket entirely (the write path is then reachable only via
+the deprecated, loopback\-gated TCP routes on
+.BR port ).
 .TP
 .B managed_units
 Array of tables. Default: synthesized from
@@ -67,8 +116,18 @@ before escalating to SIGKILL.
 .B vram_free_threshold_mb
 Integer (MiB). Default
 .BR 2000 .
-VRAM\-used strictly below this value means the GPU is considered "freed" after
-eviction.
+VRAM\-used strictly below this value means the GPU (or, when attribution is
+available, the evicting unit itself) is considered "freed" after eviction.
+The graceful\-eviction poll gates on the evicting unit's
+.B own
+attributed VRAM (cgroup, then
+.BR vram_match ,
+same precedence as
+.I /status
+attribution) when available, falling back to total GPU VRAM otherwise \(em
+see
+.B vram_match
+below.
 .TP
 .B reconcile_interval_s
 Integer (seconds). Default
@@ -114,8 +173,30 @@ VRAM threshold for the opt\-in
 .B gpu_allowlist
 Array of strings. Default
 .BR "[""ollama"", ""kwin_wayland"", ""plasmashell"", ""Xwayland""]" .
-Sanctioned GPU tenants, used by the heuristic (and a sanity log line) to avoid
-flagging known\-good processes as games.
+Sanctioned GPU tenants, used by the
+.B vram_heuristic
+(and a sanity log line) to avoid flagging known\-good processes as games. Each
+entry is matched
+.B case\-insensitively
+against three identities of an observed graphics process, in order: its full
+name/path as
+.B nvidia-smi
+reports it (e.g.\&
+.IR /opt/1Password/1password ),
+the path's
+.B basename
+(so
+.B "gpu_allowlist = [\(dq1password\(dq]"
+matches that same path), and, when cgroup attribution (#7) resolved one, its
+.B owning systemd unit
+(compared both verbatim and with a trailing
+.B .service
+/
+.B .scope
+stripped). There is
+.B no substring matching
+anywhere \(em every check is an exact equality, so a broadly\-named entry
+cannot accidentally exempt an unrelated process that merely contains it.
 .TP
 .B gpu_backend
 String. Default
@@ -225,12 +306,29 @@ be represented. When
 are unset for a unit it is systemd\-driven exactly as before.
 .TP
 .B vram_match
-String. Default: none. Substring matched case\-insensitively against
+String. Default: none.
+.B Fallback
+substring matched case\-insensitively against
 .B nvidia-smi
 compute\-process names to attribute this unit's VRAM in
 .IR /status .
-When unset, no VRAM figure is reported for the unit (the field is omitted, not
-reported as 0).
+For a
+.B systemd\-supervised
+unit, cgroup PID resolution attributes VRAM automatically with
+.B no config needed
+\(em it reads
+.I /proc/<pid>/cgroup
+to find the owning unit directly, so it cannot be fooled by a wrapper binary
+(a venv interpreter, a launcher script) the way this name\-substring match
+can be.
+.B vram_match
+remains the
+.B only
+attribution channel for command\-driven
+.RB ( *_cmd )
+units and non\-systemd hosts, where no cgroup path resolves to a configured
+unit name. When unset (and no cgroup match applies), no VRAM figure is
+reported for the unit (the field is omitted, not reported as 0).
 .TP
 .B kind
 String. Default: none. Introspection backend selector for the
@@ -314,11 +412,15 @@ then the name heuristic). The 1024\-byte cap is a footgun guard against an
 operator typo overrunning the OS argv limit; a real command is far shorter.
 Best\-effort: a missing binary, a non\-zero exit, an empty argv, or a query timeout
 yields no models (never an error). The command is
-.B bounded to 10 seconds
-(the shared
-.I SYSTEMCTL_TIMEOUT );
-a custom introspection command that runs longer is killed and silently yields an
-empty list, so keep it fast.
+.B bounded to 2 seconds
+(the
+.I INTROSPECTION_TIMEOUT ,
+tighter than the 10\-second bound on
+.BR stop_cmd / start_cmd / is_active_cmd / kill_cmd ,
+since this query runs on every reconcile pass's
+.I /status
+refresh and must stay fast); a custom introspection command that runs longer
+is killed and silently yields an empty list, so keep it fast.
 .SH INTROSPECTION RESOLUTION
 For each managed unit, the
 .B models[]
