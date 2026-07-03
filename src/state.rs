@@ -5,6 +5,7 @@
 //! agents) code against. They are pure and cross-platform — no Linux-only
 //! imports — so they unit-test on macOS.
 
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -82,8 +83,10 @@ pub enum ReconcileTrigger {
     /// `POST /units/{unit}/start` (or the `/ollama/start` alias): start `unit`
     /// now via its supervisor. Routed through the reconcile task — the sole
     /// caller of [`crate::units::start`]/[`crate::units::evict`] — so an HTTP
-    /// handler never races the reconcile task driving the same unit. The
-    /// handler awaits `reply` for the outcome.
+    /// handler never races the reconcile task driving the same unit. Clears any
+    /// manual hold on `unit` (see [`ArbiterState::held`]) so the ensure-running
+    /// post-step resumes managing it. The handler awaits `reply` for the
+    /// outcome.
     ManualStart {
         /// The managed unit to start (already validated by the HTTP handler
         /// against [`crate::config::Config::resolved_units`]).
@@ -92,7 +95,10 @@ pub enum ReconcileTrigger {
         reply: oneshot::Sender<Result<(), ()>>,
     },
     /// `POST /units/{unit}/stop` (or the `/ollama/stop` alias): evict `unit` now
-    /// via its supervisor. The handler awaits `reply` for the outcome.
+    /// via its supervisor, and add it to the manually-held set (see
+    /// [`ArbiterState::held`]) so the ensure-running post-step — including the
+    /// very next reconcile pass, even the periodic backstop timer — doesn't
+    /// immediately restart it. The handler awaits `reply` for the outcome.
     ManualStop {
         /// The managed unit to stop (already validated).
         unit: String,
@@ -130,6 +136,11 @@ pub struct UnitStatus {
     /// the unit has no `vram_match`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_mb: Option<u64>,
+    /// Whether an operator has manually stopped this unit via
+    /// `POST /units/{unit}/stop` — while held, the ensure-running post-step will
+    /// not restart it even when the GPU is free (see [`ArbiterState::held`]).
+    /// Cleared by a manual start on the same unit, or a daemon restart.
+    pub held: bool,
 }
 
 /// The `/status` payload, serialized verbatim for remote machines + dashboards.
@@ -225,6 +236,18 @@ pub struct ArbiterState {
     /// monitor each reconcile). Cross-platform; on non-Linux it stays at its
     /// "monitor down" default.
     pub presence: Presence,
+    /// Unit names an operator has manually stopped via `POST
+    /// /units/{unit}/stop`. Consulted by the ensure-running post-step (see
+    /// [`crate::reconcile::ensure_running_targets`]), which skips any unit in
+    /// this set even though the GPU is free — otherwise the very next reconcile
+    /// pass (even the periodic backstop timer) would immediately restart a unit
+    /// the operator just stopped. A hold survives gaming↔available transitions
+    /// (a game ending must not resurrect a held unit) and is cleared only by a
+    /// manual start on the same unit, or a daemon restart — held state is
+    /// **in-memory only**, which is the correct behavior: a fresh process
+    /// re-derives everything from observed truth rather than trusting a stale
+    /// hold from a prior run.
+    pub held: HashSet<String>,
 }
 
 /// The local-presence view embedded in [`ArbiterState`] / [`StatusSnapshot`],
@@ -253,6 +276,7 @@ impl Default for ArbiterState {
             gpu_vram_total_mb: 0,
             since: SystemTime::now(),
             presence: Presence::default(),
+            held: HashSet::new(),
         }
     }
 }
@@ -467,6 +491,7 @@ mod tests {
             running: true,
             models: vec![],
             vram_mb: Some(21000),
+            held: true,
         }];
         s.gpu_vram_used_mb = 21500;
         s.gpu_vram_total_mb = 32768;
@@ -475,6 +500,8 @@ mod tests {
         assert!(json.contains(r#""vram_mb":21000"#));
         assert!(json.contains(r#""gpu_vram_used_mb":21500"#));
         assert!(json.contains(r#""gpu_vram_total_mb":32768"#));
+        // The manual-hold flag round-trips through `/status` per unit.
+        assert!(json.contains(r#""held":true"#));
     }
 
     #[test]
@@ -488,12 +515,14 @@ mod tests {
                 running: true,
                 models: vec![],
                 vram_mb: Some(8000),
+                held: false,
             },
             UnitStatus {
                 unit: "ollama.service".into(),
                 running: true,
                 models: vec!["qwen3:30b".into()],
                 vram_mb: Some(21000),
+                held: false,
             },
         ];
         let snap = s.snapshot();
@@ -514,6 +543,7 @@ mod tests {
             running: false,
             models: vec![],
             vram_mb: None,
+            held: false,
         }];
         let snap = s.snapshot();
         assert_eq!(snap.ollama.unit, "vllm.service");

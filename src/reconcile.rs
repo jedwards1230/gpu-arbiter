@@ -13,7 +13,9 @@ use std::sync::{Arc, RwLock};
 use crate::classify::{self, GpuGraphicsProc};
 use crate::config::Config;
 use crate::gpu::{self, GpuBackend};
-use crate::state::{ArbiterState, Claim, ReconcileTrigger, State, UnitStatus, write_state};
+use crate::state::{
+    ArbiterState, Claim, ReconcileTrigger, State, UnitStatus, read_state, write_state,
+};
 use crate::units;
 
 /// Reconcile-pass errors. Composes the module errors a pass can surface: the
@@ -239,6 +241,11 @@ pub async fn reconcile(
             match units::start_by_name(cfg, &unit).await {
                 Ok(()) => {
                     tracing::info!(unit = %unit, "manual unit start");
+                    // Clear the hold (if any) on a successful start: the operator
+                    // is bringing the unit back, so the ensure-running post-step
+                    // should resume managing it. A failed start leaves any
+                    // existing hold in place — nothing changed.
+                    write_state(state).held.remove(&unit);
                     let _ = reply.send(Ok(()));
                 }
                 Err(e) => {
@@ -248,13 +255,21 @@ pub async fn reconcile(
             }
         }
         ReconcileTrigger::ManualStop { unit, reply } => {
+            // Hold BEFORE evicting, unconditionally: the fix for the
+            // self-reverting manual stop (#1) is that *nothing* — not this same
+            // pass's ensure-running post-step, not the next backstop timer tick —
+            // may restart a unit the operator just asked to stop, regardless of
+            // whether the eviction itself succeeds (a failed eviction is still an
+            // explicit "keep this off" signal; the daemon must not paper over it
+            // by restarting the unit on the next pass).
+            write_state(state).held.insert(unit.clone());
             match units::evict_by_name(cfg, backend, &unit).await {
                 Ok(outcome) => {
-                    tracing::info!(unit = %unit, ?outcome, "manual unit stop");
+                    tracing::info!(unit = %unit, ?outcome, "manual unit stop (held)");
                     let _ = reply.send(Ok(()));
                 }
                 Err(e) => {
-                    tracing::warn!(unit = %unit, error = %e, "manual unit stop failed");
+                    tracing::warn!(unit = %unit, error = %e, "manual unit stop failed (still held)");
                     let _ = reply.send(Err(()));
                 }
             }
@@ -336,7 +351,13 @@ pub async fn reconcile(
     // here whenever the GPU is free makes them come up at boot and self-heal if one
     // dies while no game is running. Idempotent: `is_running` skips units already
     // up, so steady-state passes are no-ops (and don't spam logs).
-    for u in ensure_running_targets(desired, cfg) {
+    //
+    // MANUAL HOLD (#1): a unit an operator just stopped via `ManualStop` is also
+    // excluded (see [`ArbiterState::held`]) — without this, the very next pass
+    // (even this same one, since ensure-running always runs after the state
+    // transition above) would immediately undo the operator's stop.
+    let held = { read_state(state).held.clone() };
+    for u in ensure_running_targets(desired, cfg, &held) {
         if !units::is_running(u).await.unwrap_or(false) {
             if let Err(e) = units::start(u).await {
                 tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
@@ -356,16 +377,23 @@ pub async fn reconcile(
 /// Returns the configured `eager_restart` units **only** when `desired` is exactly
 /// [`State::Available`] (the GPU is verified free — zero game claims). For
 /// [`State::Gaming`] and the transient [`State::Evicting`] it returns an empty Vec,
-/// guaranteeing a managed GPU unit is never started into a live game. The caller
-/// still skips any unit already running (idempotence); this function only decides
+/// guaranteeing a managed GPU unit is never started into a live game. `held`
+/// (a snapshot of [`ArbiterState::held`]) excludes any unit an operator has
+/// manually stopped — see [`ReconcileTrigger::ManualStop`](crate::state::ReconcileTrigger::ManualStop)
+/// — even though the GPU is otherwise free. The caller still skips any
+/// non-held unit already running (idempotence); this function only decides
 /// *which units are eligible*, not whether each is currently up.
-fn ensure_running_targets(desired: State, cfg: &Config) -> Vec<&crate::config::ManagedUnit> {
+fn ensure_running_targets<'c>(
+    desired: State,
+    cfg: &'c Config,
+    held: &std::collections::HashSet<String>,
+) -> Vec<&'c crate::config::ManagedUnit> {
     if desired != State::Available {
         return Vec::new();
     }
     cfg.resolved_units()
         .iter()
-        .filter(|u| u.eager_restart)
+        .filter(|u| u.eager_restart && !held.contains(&u.unit))
         .collect()
 }
 
@@ -386,6 +414,9 @@ async fn refresh_substate(
     // rather than lying with a 0. (AMD returns an empty list, so attribution is
     // simply omitted there — it must not error.)
     let compute = backend.query_compute_procs().await.ok();
+    // Snapshot the held set so /status can tell an operator *why* a stopped unit
+    // isn't restarting (see ArbiterState::held / ensure_running_targets).
+    let held = { read_state(state).held.clone() };
 
     let mut unit_statuses = Vec::new();
     for u in cfg.resolved_units() {
@@ -408,6 +439,7 @@ async fn refresh_substate(
             running,
             models,
             vram_mb,
+            held: held.contains(&u.unit),
         });
     }
     let mem = backend.query_memory().await.ok();
@@ -774,6 +806,123 @@ mod tests {
         assert_eq!(read_state(&state).units.len(), 1);
     }
 
+    // ── manual hold (#1) ───────────────────────────────────────────────────────
+    //
+    // The verified live bug: since the v0.9.0 ensure-running step, a manual stop
+    // was self-reverting — the very next reconcile pass (even the periodic
+    // backstop) restarted the unit because `desired == Available` and
+    // `eager_restart` is on. These exercise the fix end-to-end through the real
+    // `reconcile()` entry point (not just the pure `ensure_running_targets`
+    // gate above), using the same `Command` supervisor `*_cmd` test seam as the
+    // ensure-running tests below.
+
+    #[tokio::test]
+    async fn held_unit_survives_manual_stop_then_timer_reconcile() {
+        // is_active_cmd = false: the unit always *looks* stopped, so absent the
+        // hold, ensure-running would eagerly restart it on every pass.
+        let marker = marker_path("held-survives-timer");
+        let cfg = ensure_cfg(false, &marker, true);
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+
+        // 1. Manual stop → holds the unit (AlreadyClear since it already reports
+        //    stopped; the hold is set unconditionally regardless of outcome).
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStop {
+                unit: "fake.service".to_string(),
+                reply: tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.await.unwrap(), Ok(()));
+        assert!(
+            read_state(&state).held.contains("fake.service"),
+            "manual stop must record the hold"
+        );
+        assert!(
+            !marker.exists(),
+            "ensure-running must not restart a unit it just held"
+        );
+
+        // 2. A Timer-triggered reconcile pass — including the periodic backstop —
+        //    must NOT restart the held unit even though it still looks stopped
+        //    and is otherwise eager_restart = true.
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !marker.exists(),
+            "a Timer-triggered reconcile must not restart a held unit"
+        );
+        assert!(read_state(&state).units[0].held, "/status reports held");
+
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn manual_start_clears_hold_and_restarts_unit() {
+        let marker = marker_path("held-manual-start-clears");
+        let cfg = ensure_cfg(false, &marker, true);
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+
+        // Hold it first (as above).
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStop {
+                unit: "fake.service".to_string(),
+                reply: tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        rx.await.unwrap().unwrap();
+        assert!(read_state(&state).held.contains("fake.service"));
+
+        // A manual start clears the hold AND starts the unit (via the same call).
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "fake.service".to_string(),
+                reply: tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.await.unwrap(), Ok(()));
+        assert!(marker.exists(), "manual start must actually start the unit");
+        assert!(
+            !read_state(&state).held.contains("fake.service"),
+            "manual start must clear the hold"
+        );
+        assert!(
+            !read_state(&state).units[0].held,
+            "/status reflects the cleared hold"
+        );
+
+        let _ = std::fs::remove_file(&marker);
+    }
+
     // ── ensure-running post-step (boot / self-heal) ───────────────────────────
     //
     // These drive the real `units::start` / `units::is_running` seam via the
@@ -1010,7 +1159,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        let targets = ensure_running_targets(State::Available, &cfg);
+        let no_holds = std::collections::HashSet::new();
+        let targets = ensure_running_targets(State::Available, &cfg, &no_holds);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].unit, "ollama.service");
     }
@@ -1033,8 +1183,9 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert!(ensure_running_targets(State::Gaming, &cfg).is_empty());
-        assert!(ensure_running_targets(State::Evicting, &cfg).is_empty());
+        let no_holds = std::collections::HashSet::new();
+        assert!(ensure_running_targets(State::Gaming, &cfg, &no_holds).is_empty());
+        assert!(ensure_running_targets(State::Evicting, &cfg, &no_holds).is_empty());
     }
 
     #[test]
@@ -1053,9 +1204,33 @@ mod tests {
             "#,
         )
         .unwrap();
-        let targets = ensure_running_targets(State::Available, &cfg);
+        let no_holds = std::collections::HashSet::new();
+        let targets = ensure_running_targets(State::Available, &cfg, &no_holds);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].unit, "eager.service");
+    }
+
+    #[test]
+    fn ensure_running_targets_excludes_held_units() {
+        // #1: a manually-held unit is excluded from the eager target set even
+        // though the GPU is free and the unit is otherwise eager_restart = true.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "held.service"
+            eager_restart = true
+
+            [[managed_units]]
+            unit = "free.service"
+            eager_restart = true
+            "#,
+        )
+        .unwrap();
+        let mut held = std::collections::HashSet::new();
+        held.insert("held.service".to_string());
+        let targets = ensure_running_targets(State::Available, &cfg, &held);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].unit, "free.service");
     }
 
     #[test]
