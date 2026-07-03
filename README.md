@@ -147,11 +147,20 @@ remote stream. `input_monitor_up = false` means presence is **unknown** (fail-sa
 
 ### Metrics
 
-`/metrics` exposes the current state as Prometheus **gauges**, including the
-presence set:
+`/metrics` exposes the current state as Prometheus **gauges**:
 
 | Metric | Meaning |
 |---|---|
+| `gpu_arbiter_up` | Always `1` (the daemon answered the scrape) |
+| `gpu_arbiter_build_info{version}` | Constant `1`; build version in the label |
+| `gpu_arbiter_state{state}` | `1` for the active state (`gaming`/`available`/`evicting`), `0` for the others |
+| `gpu_arbiter_gaming` | `1` while a game holds the GPU |
+| `gpu_arbiter_state_since_seconds` | Unix time the current state was entered |
+| `gpu_arbiter_claims` | Count of active gaming claims |
+| `gpu_arbiter_claim{token,kind,id}` | `1` per active claim; the series appearing/disappearing over time is the launch/close record |
+| `gpu_arbiter_vram_used_mib` / `gpu_arbiter_vram_total_mib` | Total GPU VRAM used / capacity (MiB) |
+| `gpu_arbiter_unit_running{unit}` | `1` if a managed unit is active (an unconfirmed tristate `null` renders `0` here — `/status` is where "unknown" surfaces distinctly) |
+| `gpu_arbiter_unit_vram_mib{unit}` | VRAM attributed to a managed unit (omitted when unknown) |
 | `gpu_arbiter_local_present` | `1` if a human is at the desk (recent physical input AND monitor up) |
 | `gpu_arbiter_local_input_last_seconds` | Unix time of the most recent physical human input |
 | `gpu_arbiter_physical_input_devices` | Count of watched physical input devices (virtual excluded) |
@@ -302,8 +311,9 @@ SIGKILL` loop, in order) and restores when gaming ends. Each entry:
 | `kill_cmd` | _(none)_ | Override: SIGKILL-escalation command (`None` → re-run `stop_cmd`) |
 
 If `managed_units` is omitted, a single entry is synthesized from the legacy
-`ollama_unit` / `eager_ollama` fields (with `vram_match = "ollama"`), so an
-unconfigured daemon behaves exactly as before.
+`ollama_unit` / `eager_ollama` fields (with `vram_match = "ollama"` and
+`kind = "ollama"`), so an unconfigured daemon behaves exactly as before —
+including `ollama ps` model introspection.
 
 ### VRAM attribution
 
@@ -408,8 +418,9 @@ artifact; your deployment tooling (e.g. Ansible) can fetch it by version (on-hos
 Reference manuals live under [`man/`](man):
 
 - [`gpu-arbiter.8`](man/gpu-arbiter.8) — daemon usage, the cn_proc/eviction model,
-  the `status` / `--check-config` / `--config` CLI, and the `--version`/`--help`
-  behavior.
+  the HTTP control surface (TCP + unix socket), the `status` / `wait` / `watch` /
+  `--check-config` CLI with exit codes, and signal handling
+  (SIGTERM/SIGINT/SIGHUP).
 - [`gpu-arbiter-config.5`](man/gpu-arbiter-config.5) — every config key, including
   the per-unit `kind` / `introspect_cmd` introspection backends.
 

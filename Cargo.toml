@@ -74,12 +74,14 @@ futures-util = { version = "0.3", default-features = false, features = [
     "alloc",
 ] }
 
-# --- gpu-arbiter-tray companion (second bin: src/bin/gpu-arbiter-tray.rs) ------
-# ureq is the tray's HTTP *client* for polling the daemon over localhost. NO TLS:
-# `default-features = false` drops the whole rustls/ring/aws-lc stack, keeping the
-# tray pure-Rust and musl-clean (it only ever talks plain http://127.0.0.1).
-# `json` wires serde de/serialization of the bodies. Cross-platform — builds on
-# the macOS dev host even though only the Linux tray module references it.
+# ureq is the plain-HTTP *client* shared by the gpu-arbiter-tray companion (its
+# 2s /status poll — second bin: src/bin/gpu-arbiter-tray.rs) AND the daemon
+# binary's `status`/`wait`/`watch` subcommands (main.rs's `fetch_status_json`).
+# NO TLS: `default-features = false` drops the whole rustls/ring/aws-lc stack,
+# keeping both binaries pure-Rust and musl-clean (they only ever talk plain
+# http:// — localhost or a LAN daemon URL). `json` wires serde de/serialization
+# of the bodies. Cross-platform — the CLI subcommands run on the macOS dev host
+# too.
 ureq = { version = "3", default-features = false, features = ["json"] }
 
 # cn_proc process-event connector lives behind a Linux-only netlink socket, so

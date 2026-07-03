@@ -94,8 +94,9 @@
 #
 # If `managed_units` is omitted entirely, a single Ollama entry is synthesized
 # from the legacy `ollama_unit` / `eager_ollama` keys (default
-# "ollama.service", eager_restart = true, vram_match = "ollama"), so an
-# unconfigured daemon evicts Ollama exactly as before.
+# "ollama.service", eager_restart = true, vram_match = "ollama",
+# kind = "ollama"), so an unconfigured daemon evicts Ollama — and reports its
+# loaded models via `ollama ps` — exactly as before.
 #
 # Tenant 1 — Ollama, driven by systemd (the default supervisor). VRAM
 # attribution for a systemd unit is automatic via cgroup PID resolution — no

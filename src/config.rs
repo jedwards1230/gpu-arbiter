@@ -464,9 +464,10 @@ pub enum ConfigError {
 ///
 /// If `managed_units` is non-empty it's returned verbatim (order preserved —
 /// eviction runs in this order). Otherwise a **one-element** list is synthesized
-/// from `ollama_unit` / `eager_ollama` with `vram_match = "ollama"`, so an
-/// unconfigured daemon (or one still using only the old keys) evicts + attributes
-/// VRAM for Ollama exactly as it did before `managed_units` existed. This is the
+/// from `ollama_unit` / `eager_ollama` with `vram_match = "ollama"` and
+/// `kind = "ollama"`, so an unconfigured daemon (or one still using only the old
+/// keys) evicts, attributes VRAM for, and introspects (`ollama ps`) Ollama
+/// exactly as it did before `managed_units` existed. This is the
 /// backward-compatibility contract.
 fn synthesize_units(
     ollama_unit: &str,
