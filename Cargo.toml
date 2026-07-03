@@ -1,6 +1,14 @@
 [package]
 name = "gpu-arbiter"
-version = "0.1.0"
+# Kept approximately honest with the latest GitHub release (currently 0.9.0) so
+# a `cargo build` on `main` between releases reports a believable version via
+# `--version` / `/status.version` instead of the fossilized "0.1.0" every dev
+# build used to show. This is NOT the release source of truth — `release.yml`'s
+# "Bake release version into Cargo.toml" step overwrites this line (only in the
+# ephemeral tagged checkout it builds from, never pushed back to `main`) with
+# the actual computed `vX.Y.Z` before building the shipped binaries. Bump this
+# by hand alongside a release PR if it drifts noticeably behind the latest tag.
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
