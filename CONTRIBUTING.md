@@ -4,7 +4,7 @@ gpu-arbiter is a Linux root daemon that evicts GPU compute tenants (such as Olla
 
 ## Prerequisites
 
-Rust stable (≥ 1.88, edition 2024), pinned via `rust-toolchain.toml`. Required components: `rustfmt`, `clippy`. Install via [rustup](https://rustup.rs/):
+Rust (≥ 1.88, edition 2024), pinned to an exact version via `rust-toolchain.toml`. Required components: `rustfmt`, `clippy`. Install via [rustup](https://rustup.rs/):
 
 ```bash
 rustup component add rustfmt clippy
