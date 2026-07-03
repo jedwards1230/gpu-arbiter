@@ -357,12 +357,48 @@ pub async fn reconcile(
     // (even this same one, since ensure-running always runs after the state
     // transition above) would immediately undo the operator's stop.
     let held = { read_state(state).held.clone() };
-    for u in ensure_running_targets(desired, cfg, &held) {
-        if !units::is_running(u).await.unwrap_or(false) {
-            if let Err(e) = units::start(u).await {
-                tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
+    let eager_targets = ensure_running_targets(desired, cfg, &held);
+    if !eager_targets.is_empty() {
+        // Only units NOT already running are actual start candidates
+        // (idempotence — an already-running unit is left alone).
+        let mut to_start = Vec::new();
+        for u in eager_targets {
+            if !units::is_running(u).await.unwrap_or(false) {
+                to_start.push(u);
+            }
+        }
+
+        if !to_start.is_empty() {
+            // ── TOCTOU close (#5) ──────────────────────────────────────────────
+            //
+            // `desired` was resolved from the snapshot taken at the TOP of this
+            // pass (see `observe`/`claim_set` above). Everything since then —
+            // the unit-action branch, the `is_running` checks just above — is
+            // real elapsed wall-clock time in which a game can exec. Without
+            // this re-check, that race would start a unit directly into a live
+            // game, violating the "never start a unit into a live game"
+            // invariant documented on `ensure_running_targets`.
+            //
+            // Re-scanning immediately before the first start closes it: a claim
+            // that appeared mid-pass aborts every eager start this pass. Safety
+            // over promptness — the next pass (event-driven or the backstop
+            // timer) retries and self-heals either way. `scan_proc` is a cheap
+            // `/proc` walk, so this is only paid when there's actually
+            // something to start.
+            let fresh = observe(cfg, backend).await?;
+            if !ensure_running_toctou_clear(&claim_set(&fresh, cfg)) {
+                tracing::warn!(
+                    units = to_start.len(),
+                    "ensure-running: a claim appeared mid-pass; skipping eager start(s) this pass"
+                );
             } else {
-                tracing::info!(unit = %u.unit, "ensure-running: started eager unit (GPU free)");
+                for u in to_start {
+                    if let Err(e) = units::start(u).await {
+                        tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
+                    } else {
+                        tracing::info!(unit = %u.unit, "ensure-running: started eager unit (GPU free)");
+                    }
+                }
             }
         }
     }
@@ -395,6 +431,15 @@ fn ensure_running_targets<'c>(
         .iter()
         .filter(|u| u.eager_restart && !held.contains(&u.unit))
         .collect()
+}
+
+/// The #5 TOCTOU-close decision: given a **freshly** re-scanned claim set (taken
+/// immediately before the ensure-running post-step's first `units::start`),
+/// should the pending eager start(s) proceed? Pure — unit-tested; the impure
+/// re-scan (`observe` + `claim_set`) itself lives at the call site in
+/// [`reconcile`], right before the first start.
+fn ensure_running_toctou_clear(fresh_claims: &[Claim]) -> bool {
+    fresh_claims.is_empty()
 }
 
 /// Refresh the per-unit + GPU sub-state embedded in `/status` (best-effort —
@@ -1231,6 +1276,17 @@ mod tests {
         let targets = ensure_running_targets(State::Available, &cfg, &held);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].unit, "free.service");
+    }
+
+    #[test]
+    fn ensure_running_toctou_clear_gate() {
+        // #5: an empty fresh re-scan clears eager starts to proceed; any claim at
+        // all (a game exec'd mid-pass) blocks every eager start this pass.
+        assert!(ensure_running_toctou_clear(&[]));
+        assert!(!ensure_running_toctou_clear(&[Claim::Steam("440".into())]));
+        assert!(!ensure_running_toctou_clear(&[Claim::Pattern(
+            "heroic".into()
+        )]));
     }
 
     #[test]
