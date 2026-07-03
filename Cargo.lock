@@ -670,6 +670,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "evdev",
+ "futures-util",
  "inotify",
  "ksni",
  "libc",

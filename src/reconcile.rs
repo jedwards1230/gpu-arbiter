@@ -509,41 +509,56 @@ async fn refresh_substate(
     // isn't restarting (see ArbiterState::held / ensure_running_targets).
     let held = { read_state(state).held.clone() };
 
-    let mut unit_statuses = Vec::new();
-    for u in cfg.resolved_units() {
-        // Tristate (#15): a failed is-active check is "couldn't tell", not a
-        // confirmed `false` — logged here (the one place this query happens on
-        // the /status refresh path) rather than silently coerced to a definite
-        // answer.
-        let running = units::is_running(u)
-            .await
-            .inspect_err(|e| {
-                tracing::warn!(unit = %u.unit, error = %e, "/status refresh: is_running check failed; reporting unknown")
-            })
-            .ok();
-        // Model listing is generic per-tenant: the introspection backend
-        // (`introspect_cmd` / `kind == "ollama"` / `ollama`-named fallback) is
-        // resolved from the unit's config. Only queried when confirmed running
-        // (an unknown state gets no models, same as a confirmed-stopped one).
-        let models = if running == Some(true) {
-            units::loaded_models(u).await
-        } else {
-            Vec::new()
-        };
-        // Attribute VRAM via the unit's configured `vram_match` substring —
-        // likewise only when confirmed running.
-        let vram_mb = match (running, &u.vram_match, &compute) {
-            (Some(true), Some(needle), Some(procs)) => gpu::vram_mb_matching(procs, needle),
-            _ => None,
-        };
-        unit_statuses.push(UnitStatus {
-            unit: u.unit.clone(),
-            running,
-            models,
-            vram_mb,
-            held: held.contains(&u.unit),
-        });
-    }
+    // Each unit's substate is queried CONCURRENTLY (#34), not serially: a
+    // wedged is_running/loaded_models on one unit used to block every unit
+    // behind it, each bound by its own timeout — three wedged units could
+    // stall this whole /status refresh (and thus the reconcile task, which
+    // can't react to a game-launch trigger until refresh_substate returns) for
+    // up to ~30s. `join_all` polls every unit's future concurrently within
+    // this one `.await`, so the wall-clock cost is the SLOWEST unit, not the
+    // sum. `compute`/`held` are borrowed read-only by every future — safe,
+    // this is concurrent polling in one task, not spawned tasks (no `'static`
+    // requirement, no cross-task Send concerns).
+    let unit_futures = cfg.resolved_units().iter().map(|u| {
+        let compute = &compute;
+        let held = &held;
+        async move {
+            // Tristate (#15): a failed is-active check is "couldn't tell", not
+            // a confirmed `false` — logged here (the one place this query
+            // happens on the /status refresh path) rather than silently
+            // coerced to a definite answer.
+            let running = units::is_running(u)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(unit = %u.unit, error = %e, "/status refresh: is_running check failed; reporting unknown")
+                })
+                .ok();
+            // Model listing is generic per-tenant: the introspection backend
+            // (`introspect_cmd` / `kind == "ollama"` / `ollama`-named
+            // fallback) is resolved from the unit's config. Only queried when
+            // confirmed running (an unknown state gets no models, same as a
+            // confirmed-stopped one).
+            let models = if running == Some(true) {
+                units::loaded_models(u).await
+            } else {
+                Vec::new()
+            };
+            // Attribute VRAM via the unit's configured `vram_match` substring
+            // — likewise only when confirmed running.
+            let vram_mb = match (running, &u.vram_match, compute) {
+                (Some(true), Some(needle), Some(procs)) => gpu::vram_mb_matching(procs, needle),
+                _ => None,
+            };
+            UnitStatus {
+                unit: u.unit.clone(),
+                running,
+                models,
+                vram_mb,
+                held: held.contains(&u.unit),
+            }
+        }
+    });
+    let unit_statuses = futures_util::future::join_all(unit_futures).await;
     let mem = backend.query_memory().await.ok();
 
     // Snapshot the lock-free presence monitor into the embedded view so `/status`
@@ -765,6 +780,59 @@ mod tests {
         // Order matches the configured (eviction) order.
         assert_eq!(g.units[0].unit, "ollama.service");
         assert_eq!(g.units[1].unit, "vllm.service");
+    }
+
+    #[tokio::test]
+    async fn refresh_substate_queries_units_concurrently() {
+        // #34: three units each with a 1s-but-successful is_active_cmd. Run
+        // serially that's >=3s; run concurrently (join_all) it's bounded by the
+        // SLOWEST single unit (~1s). A generous 2.5s ceiling proves the queries
+        // actually overlap rather than merely not regressing.
+        // eager_restart = false on every unit: keeps the (serial) ensure-running
+        // post-step's own is_running confirmation loop from also querying these
+        // slow units and confounding the timing assertion below — this test is
+        // isolated to refresh_substate's concurrency, not ensure-running's.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "slow0.service"
+            eager_restart = false
+            is_active_cmd = ["sleep", "1"]
+
+            [[managed_units]]
+            unit = "slow1.service"
+            eager_restart = false
+            is_active_cmd = ["sleep", "1"]
+
+            [[managed_units]]
+            unit = "slow2.service"
+            eager_restart = false
+            is_active_cmd = ["sleep", "1"]
+            "#,
+        )
+        .unwrap();
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+        let start = std::time::Instant::now();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(2500),
+            "refresh_substate should query units concurrently, not serially (took {elapsed:?})"
+        );
+        let g = read_state(&state);
+        assert_eq!(g.units.len(), 3);
+        assert_eq!(g.units[0].running, Some(true));
+        assert_eq!(g.units[1].running, Some(true));
+        assert_eq!(g.units[2].running, Some(true));
     }
 
     #[tokio::test]

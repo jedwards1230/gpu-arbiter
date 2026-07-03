@@ -151,14 +151,30 @@ pub enum EvictionOutcome {
 /// release is caught promptly, yet coarse enough not to hammer `nvidia-smi`.
 const EVICTION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Hard ceiling on any `systemctl` / `ollama` shell-out. A wedged systemd (stuck
-/// D-Bus, hung PID 1 transaction) or a hung `ollama ps` would otherwise block the
-/// single reconcile task indefinitely while it holds `state.lock()` — wedging
-/// `/status`, the backstop timer, and every future reconcile. Bounding each call
-/// keeps the worst-case eviction window finite (a game launch must never hang on
-/// Ollama). Healthy `systemctl` calls return in milliseconds, so this never trips
-/// in normal operation.
+/// Hard ceiling on any `systemctl` control verb (start/stop/kill/is-active).
+/// A wedged systemd (stuck D-Bus, hung PID 1 transaction) would otherwise
+/// block the single reconcile task indefinitely — wedging `/status`, the
+/// backstop timer, and every future reconcile. Bounding each call keeps the
+/// worst-case eviction window finite (a game launch must never hang on
+/// Ollama). Healthy `systemctl` calls return in milliseconds, so this never
+/// trips in normal operation.
+///
+/// Deliberately left at 10s (not tightened alongside [`INTROSPECTION_TIMEOUT`]
+/// — #34): `start`/`stop`/`kill`/`is-active` are all in the eviction/ensure-
+/// running decision path, where correctness matters more than the `/status`
+/// refresh path's "must be fast" requirement, and 10s already bounds them well
+/// below any reasonable systemd transaction timeout.
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard ceiling on the `/status` refresh path's model-introspection shell-outs
+/// (`ollama ps` / a configured `introspect_cmd`) — tighter than
+/// [`SYSTEMCTL_TIMEOUT`] (#34). These run on every reconcile pass's
+/// `refresh_substate`, which the reconcile task must return from promptly to
+/// react to the next trigger (a game launch); the doc on
+/// [`loaded_models`] already commits to "fast on the /status refresh path", and
+/// 10s wasn't honoring that. 2s is generous for a healthy `ollama ps`/custom
+/// script (typically tens of ms) while still bounding the worst case tightly.
+const INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Pure predicate: is the GPU considered "freed" given a memory snapshot and the
 /// configured free threshold? Pure — unit-tested. Strict `<`.
@@ -325,16 +341,16 @@ pub async fn loaded_models(unit: &ManagedUnit) -> Vec<String> {
 /// run **shell-free** (no shell, no quoting, no expansion) — the first token is
 /// the program, the rest are arguments. Best-effort + bounded: a blank command, a
 /// spawn failure, or a non-zero exit all yield an empty vec. The call is bounded
-/// to `SYSTEMCTL_TIMEOUT` (10s) — a custom introspection command that runs longer
-/// is killed and silently yields an empty vec, so it must be fast (it runs on the
-/// `/status` refresh path under the reconcile task).
+/// to [`INTROSPECTION_TIMEOUT`] (2s, #34) — a custom introspection command that
+/// runs longer is killed and silently yields an empty vec, so it must be fast
+/// (it runs on the `/status` refresh path under the reconcile task).
 async fn run_introspect_cmd(cmd: &str) -> Vec<String> {
     let mut argv = cmd.split_whitespace();
     let Some(program) = argv.next() else {
         return Vec::new();
     };
     let fut = tokio::process::Command::new(program).args(argv).output();
-    match tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut).await {
+    match tokio::time::timeout(INTROSPECTION_TIMEOUT, fut).await {
         Ok(Ok(out)) if out.status.success() => {
             parse_model_lines(&String::from_utf8_lossy(&out.stdout))
         }
@@ -359,8 +375,9 @@ pub fn parse_model_lines(out: &str) -> Vec<String> {
 /// introspection backend.
 async fn ollama_loaded_models() -> Vec<String> {
     let fut = tokio::process::Command::new("ollama").arg("ps").output();
-    // Best-effort + bounded: a hung `ollama ps` must not stall the reconcile.
-    match tokio::time::timeout(SYSTEMCTL_TIMEOUT, fut).await {
+    // Best-effort + bounded (#34): a hung `ollama ps` must not stall the
+    // reconcile — 2s, tighter than the control-verb SYSTEMCTL_TIMEOUT.
+    match tokio::time::timeout(INTROSPECTION_TIMEOUT, fut).await {
         Ok(Ok(out)) if out.status.success() => {
             parse_ollama_ps(&String::from_utf8_lossy(&out.stdout))
         }

@@ -35,6 +35,13 @@ libc = "0.2"
 # the musl build clear of the ring/aws-lc cross-compile minefield). Note 0.8
 # path-param syntax: `/{p}`.
 axum = "0.8"
+# future::join_all — concurrently polls the per-unit is_running/loaded_models
+# queries on the /status refresh path instead of awaiting them serially.
+# Already pulled transitively (axum -> tower), declared directly since we use
+# it in our own code. Pure-Rust; no io/executor features needed, just alloc.
+futures-util = { version = "0.3", default-features = false, features = [
+    "alloc",
+] }
 
 # --- gpu-arbiter-tray companion (second bin: src/bin/gpu-arbiter-tray.rs) ------
 # ureq is the tray's HTTP *client* for polling the daemon over localhost. NO TLS:
