@@ -833,9 +833,13 @@ pub async fn healthz() -> &'static str {
 /// write path (see [`unit_start_uds`] for the sanctioned unix-socket route).
 /// Rejects non-loopback peers and unknown units.
 ///
-/// A direct override: starts the unit now. (Note the reconcile authority will
-/// re-evict on the next pass if a game is running — this is a debug escape
-/// hatch, not a way to override gaming.)
+/// A direct override: starts the unit now — **unless a game holds the GPU**.
+/// While the state is `gaming`/`evicting` the reconcile task rejects the
+/// start with `409 Conflict` (any manual hold stays in place) rather than
+/// starting a tenant into a live game: eviction is edge-triggered (it fires
+/// on the available → gaming *transition*), so a unit started mid-game would
+/// NOT be re-evicted by the next pass — it would sit on the GPU alongside
+/// the game. This endpoint cannot override gaming.
 pub async fn unit_start(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(unit): Path<String>,
@@ -976,17 +980,26 @@ async fn stop_validated(app: &AppState, unit: String) -> (StatusCode, String) {
 /// for the reconcile task's reply. `verb` ("start"/"stop") only labels the
 /// response text/log lines.
 ///
-/// Both failure modes the reconcile task can report — the unit action itself
-/// failing, or the reply channel being dropped (the reconcile task panicked or
-/// isn't running) — collapse to the same `500` the handler always returned for
-/// a failed start/stop; the detail is logged, not echoed to the (untrusted
-/// enough to warrant no detail) HTTP response body.
+/// The reply's error is typed ([`crate::state::ManualActionError`]) so the
+/// two refusal shapes map to distinct status codes:
+/// - `GpuHeldByGame` → `409 Conflict` — a manual start while a game holds
+///   the GPU (state `gaming`/`evicting`) is rejected outright, never
+///   attempted (any hold stays in place); the body says why.
+/// - `Failed` → `500` — the unit action itself was attempted and failed;
+///   the detail is logged, not echoed to the (untrusted enough to warrant no
+///   detail) HTTP response body. A dropped reply channel (the reconcile task
+///   panicked or isn't running) collapses to the same `500`.
 async fn enqueue_and_await(
     app: &AppState,
     unit: String,
-    variant: impl FnOnce(String, oneshot::Sender<Result<(), ()>>) -> ReconcileTrigger,
+    variant: impl FnOnce(
+        String,
+        oneshot::Sender<Result<(), crate::state::ManualActionError>>,
+    ) -> ReconcileTrigger,
     verb: &str,
 ) -> (StatusCode, String) {
+    use crate::state::ManualActionError;
+
     let (reply_tx, reply_rx) = oneshot::channel();
     if app
         .triggers
@@ -1002,7 +1015,13 @@ async fn enqueue_and_await(
     }
     match reply_rx.await {
         Ok(Ok(())) => (StatusCode::OK, format!("{unit} {verb} requested")),
-        Ok(Err(())) => (
+        Ok(Err(ManualActionError::GpuHeldByGame)) => (
+            StatusCode::CONFLICT,
+            format!(
+                "{unit} {verb} rejected: a game currently holds the GPU (state gaming/evicting); retry once the GPU is available"
+            ),
+        ),
+        Ok(Err(ManualActionError::Failed)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{unit} {verb} failed (see daemon logs)"),
         ),

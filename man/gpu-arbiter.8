@@ -311,10 +311,21 @@ timer), making a manual stop a self\-reverting no\-op. A held unit stays down
 across game launches/exits until
 .B start
 (which clears the hold) or a daemon restart \(em holds are in\-memory only.
+.B start
+is
+.B rejected with 409 Conflict
+while a game holds the GPU (state
+.IR gaming " or " evicting )
+\(em eviction is edge\-triggered (it fires on the available \(-> gaming
+transition), so a unit started mid\-game would NOT be re\-evicted by the next
+pass; it would sit on the GPU alongside the game. On rejection nothing
+changes: the unit is not started and any hold stays in place \(em retry once
+the state is
+.IR available .
 Example, on the unix socket:
 .RS
 .nf
-curl \-\-unix\-socket /run/gpu\-arbiter.sock \e
+curl \-\-unix\-socket /run/gpu\-arbiter/gpu\-arbiter.sock \e
   \-X POST http://localhost/units/ollama.service/stop
 .fi
 .RE

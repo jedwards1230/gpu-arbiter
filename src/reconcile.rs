@@ -14,7 +14,8 @@ use crate::classify::{self, GpuGraphicsProc};
 use crate::config::Config;
 use crate::gpu::{self, GpuBackend};
 use crate::state::{
-    ArbiterState, Claim, ReconcileTrigger, State, UnitStatus, read_state, write_state,
+    ArbiterState, Claim, ManualActionError, ReconcileTrigger, State, UnitStatus, read_state,
+    write_state,
 };
 use crate::units;
 
@@ -278,25 +279,45 @@ pub async fn reconcile(
     // the next trigger.
     match trigger {
         ReconcileTrigger::ManualStart { unit, reply } => {
-            match units::start_by_name(cfg, &unit).await {
-                Ok(()) => {
-                    tracing::info!(unit = %unit, "manual unit start");
-                    // Clear the hold (if any) on a successful start: the operator
-                    // is bringing the unit back, so the ensure-running post-step
-                    // should resume managing it. A failed start leaves any
-                    // existing hold in place — nothing changed. One lock
-                    // acquisition for both mutations (#14's restart counter
-                    // rides along with the existing hold-clear).
-                    {
-                        let mut guard = write_state(state);
-                        guard.held.remove(&unit);
-                        guard.metrics.record_unit_restart(&unit);
+            // Never start a managed unit into a live game — the same invariant
+            // startup reconciliation enforces applies to a manual start (#61).
+            // Eviction is edge-triggered (it fires on the available → gaming
+            // TRANSITION, not on the gaming level), so a unit started here
+            // mid-game would NOT be re-evicted by the next pass — it would sit
+            // on the GPU alongside the game until the game exited. Rejecting is
+            // the only behavior consistent with "gaming wins the GPU". The
+            // rejection is typed (`GpuHeldByGame` → HTTP 409, distinct from a
+            // 500 start failure) and leaves any manual hold in place — nothing
+            // about the unit changed.
+            let current = read_state(state).state;
+            if matches!(current, State::Gaming | State::Evicting) {
+                tracing::info!(
+                    unit = %unit,
+                    state = ?current,
+                    "manual unit start rejected: a game holds the GPU"
+                );
+                let _ = reply.send(Err(ManualActionError::GpuHeldByGame));
+            } else {
+                match units::start_by_name(cfg, &unit).await {
+                    Ok(()) => {
+                        tracing::info!(unit = %unit, "manual unit start");
+                        // Clear the hold (if any) on a successful start: the operator
+                        // is bringing the unit back, so the ensure-running post-step
+                        // should resume managing it. A failed start leaves any
+                        // existing hold in place — nothing changed. One lock
+                        // acquisition for both mutations (#14's restart counter
+                        // rides along with the existing hold-clear).
+                        {
+                            let mut guard = write_state(state);
+                            guard.held.remove(&unit);
+                            guard.metrics.record_unit_restart(&unit);
+                        }
+                        let _ = reply.send(Ok(()));
                     }
-                    let _ = reply.send(Ok(()));
-                }
-                Err(e) => {
-                    tracing::warn!(unit = %unit, error = %e, "manual unit start failed");
-                    let _ = reply.send(Err(()));
+                    Err(e) => {
+                        tracing::warn!(unit = %unit, error = %e, "manual unit start failed");
+                        let _ = reply.send(Err(ManualActionError::Failed));
+                    }
                 }
             }
         }
@@ -324,7 +345,7 @@ pub async fn reconcile(
                 }
                 Err(e) => {
                     tracing::warn!(unit = %unit, error = %e, "manual unit stop failed (still held)");
-                    let _ = reply.send(Err(()));
+                    let _ = reply.send(Err(ManualActionError::Failed));
                 }
             }
         }
@@ -1175,7 +1196,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(reply_rx.await.unwrap(), Err(()));
+        assert_eq!(reply_rx.await.unwrap(), Err(ManualActionError::Failed));
     }
 
     #[tokio::test]
@@ -1318,6 +1339,99 @@ mod tests {
 
         let _ = std::fs::remove_file(&marker);
     }
+
+    // ── manual start vs. a live game (#61) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn manual_start_during_gaming_is_rejected_unit_not_started_hold_preserved() {
+        // The never-start-into-a-live-game invariant applies to manual starts:
+        // while state is Gaming the reconcile task must reject the trigger with
+        // the typed GpuHeldByGame error (HTTP layer maps it to 409), must NOT
+        // run start_cmd, and must leave any manual hold exactly as it was.
+        let marker = marker_path("manual-start-rejected-gaming");
+        let _ = std::fs::remove_file(&marker);
+        let cfg = ensure_cfg(false, &marker, true);
+        let mut initial = ArbiterState::new();
+        initial.set_state(State::Gaming);
+        initial.held.insert("fake.service".to_string());
+        let state = shared(initial);
+        let presence = crate::presence::PresenceMonitor::new(0);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "fake.service".to_string(),
+                reply: tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rx.await.unwrap(), Err(ManualActionError::GpuHeldByGame));
+        assert!(
+            !marker.exists(),
+            "a rejected manual start must never run start_cmd"
+        );
+        assert!(
+            read_state(&state).held.contains("fake.service"),
+            "a rejected manual start must leave the hold in place"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn manual_start_during_evicting_is_rejected() {
+        // Same rejection during the transient Evicting state — the kill window
+        // is exactly when racing a fresh start against the teardown would be
+        // worst. The unit is held here too (as in the Gaming test): without a
+        // hold, the SAME pass's observe step — which on this host sees no game
+        // (the non-Linux stub observes nothing) — would legitimately settle
+        // Available and eager-restart the unit via the ensure-running
+        // post-step, which is correct daemon behavior but not what this test
+        // is pinning (the rejection of the *manual* start).
+        let marker = marker_path("manual-start-rejected-evicting");
+        let _ = std::fs::remove_file(&marker);
+        let cfg = ensure_cfg(false, &marker, true);
+        let mut initial = ArbiterState::new();
+        initial.set_state(State::Evicting);
+        initial.held.insert("fake.service".to_string());
+        let state = shared(initial);
+        let presence = crate::presence::PresenceMonitor::new(0);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "fake.service".to_string(),
+                reply: tx,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rx.await.unwrap(), Err(ManualActionError::GpuHeldByGame));
+        assert!(
+            !marker.exists(),
+            "a rejected manual start must never run start_cmd"
+        );
+        assert!(
+            read_state(&state).held.contains("fake.service"),
+            "a rejected manual start must leave the hold in place"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    // (Manual start while Available — the accepted path — is covered by
+    // `manual_start_trigger_starts_unit_and_replies_ok` /
+    // `manual_start_clears_hold_and_restarts_unit` above: reply Ok, start_cmd
+    // actually runs, hold cleared.)
 
     // ── ensure-running post-step (boot / self-heal) ───────────────────────────
     //

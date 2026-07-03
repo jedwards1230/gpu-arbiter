@@ -144,6 +144,16 @@ daemon restart (holds are in-memory only — a fresh process re-derives
 everything from observed truth, it does not remember a hold from a prior
 run). `/status` surfaces the hold per-unit via `units[].held`.
 
+`POST /units/{unit}/start` is **rejected with `409 Conflict` while a game
+holds the GPU** (state `gaming` or `evicting`): the
+never-start-a-managed-unit-into-a-live-game invariant that startup
+reconciliation enforces applies to operators too. Eviction is edge-triggered
+(it fires on the available → gaming *transition*), so a unit started mid-game
+would **not** be re-evicted by the next pass — it would sit on the GPU
+alongside the game until the game exited. On rejection nothing changes: the
+unit is not started and any hold stays in place; retry once `/status` reports
+`available`.
+
 `local_input_last_unix` / `physical_input_devices` / `input_monitor_up` report
 **local human presence**: the daemon watches *physical* input devices (keyboard /
 mouse / gamepad) and tracks input recency. Virtual devices injected by

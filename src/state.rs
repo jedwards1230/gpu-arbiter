@@ -66,6 +66,25 @@ pub enum State {
     Evicting,
 }
 
+/// Why a manual unit action ([`ReconcileTrigger::ManualStart`]/
+/// [`ReconcileTrigger::ManualStop`]) was refused or failed — the error half of
+/// the reply the reconcile task sends back over the trigger's oneshot channel,
+/// typed so the HTTP layer can map each cause to the right status code
+/// instead of collapsing everything to a 500.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualActionError {
+    /// The unit action itself was attempted and failed (the start/stop
+    /// control command errored — detail is in the daemon log). HTTP: `500`.
+    Failed,
+    /// A manual start was **rejected without being attempted** because a game
+    /// currently holds the GPU (state is [`State::Gaming`] or
+    /// [`State::Evicting`]) — the never-start-a-managed-unit-into-a-live-game
+    /// invariant (the same one startup reconciliation enforces) applies to
+    /// operators too. Any manual hold on the unit is left in place. HTTP:
+    /// `409 Conflict`.
+    GpuHeldByGame,
+}
+
 /// Why a reconcile pass was triggered. Fed over the `mpsc` of triggers into the
 /// single reconcile task that owns state.
 ///
@@ -90,16 +109,22 @@ pub enum ReconcileTrigger {
     /// `POST /units/{unit}/start` (or the `/ollama/start` alias): start `unit`
     /// now via its supervisor. Routed through the reconcile task — the sole
     /// caller of [`crate::units::start`]/[`crate::units::evict`] — so an HTTP
-    /// handler never races the reconcile task driving the same unit. Clears any
-    /// manual hold on `unit` (see [`ArbiterState::held`]) so the ensure-running
-    /// post-step resumes managing it. The handler awaits `reply` for the
-    /// outcome.
+    /// handler never races the reconcile task driving the same unit.
+    /// **Rejected** (with [`ManualActionError::GpuHeldByGame`], any hold left
+    /// in place) while the current state is [`State::Gaming`] or
+    /// [`State::Evicting`] — a manual start must never start a managed unit
+    /// into a live game, the same invariant startup reconciliation enforces.
+    /// On a successful start, clears any manual hold on `unit` (see
+    /// [`ArbiterState::held`]) so the ensure-running post-step resumes
+    /// managing it. The handler awaits `reply` for the outcome.
     ManualStart {
         /// The managed unit to start (already validated by the HTTP handler
         /// against [`crate::config::Config::resolved_units`]).
         unit: String,
-        /// Where to send the outcome (`Ok` on a successful start).
-        reply: oneshot::Sender<Result<(), ()>>,
+        /// Where to send the outcome (`Ok` on a successful start; the typed
+        /// [`ManualActionError`] otherwise, so the HTTP layer can distinguish
+        /// a `409` rejection from a `500` failure).
+        reply: oneshot::Sender<Result<(), ManualActionError>>,
     },
     /// `POST /units/{unit}/stop` (or the `/ollama/stop` alias): evict `unit` now
     /// via its supervisor, and add it to the manually-held set (see
@@ -110,8 +135,9 @@ pub enum ReconcileTrigger {
         /// The managed unit to stop (already validated).
         unit: String,
         /// Where to send the outcome (`Ok` on a successful — or already-clear —
-        /// eviction).
-        reply: oneshot::Sender<Result<(), ()>>,
+        /// eviction; [`ManualActionError::Failed`] otherwise — a stop is never
+        /// state-gated, so `GpuHeldByGame` cannot occur here).
+        reply: oneshot::Sender<Result<(), ManualActionError>>,
     },
 }
 
