@@ -234,8 +234,7 @@ mod linux {
     fn now_unix() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs().cast_signed())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs().cast_signed())
     }
 
     /// Resolve the canonical sysfs path for a `/dev/input/eventX` node by
@@ -435,7 +434,7 @@ mod linux {
 
             tokio::select! {
                 _ = timer.tick() => {}
-                _ = trigger => {}
+                () = trigger => {}
             }
 
             match reenumerate(&monitor, &mut watched) {

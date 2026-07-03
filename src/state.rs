@@ -575,8 +575,7 @@ pub fn write_state(
 pub fn format_rfc3339(t: SystemTime) -> String {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let (year, month, day, hour, min, sec) = civil_from_unix_secs(secs);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
 }

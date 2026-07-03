@@ -158,9 +158,8 @@ pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, 
 fn scan_proc() -> Result<Vec<ProcInfo>, ReconcileError> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(entry) = entry else {
+            continue;
         };
         // Only numeric dir names are pids.
         let Some(pid) = entry
@@ -171,9 +170,8 @@ fn scan_proc() -> Result<Vec<ProcInfo>, ReconcileError> {
             continue;
         };
         // A pid that exits between read_dir and read is the common race — skip it.
-        let raw = match std::fs::read(format!("/proc/{pid}/cmdline")) {
-            Ok(b) => b,
-            Err(_) => continue,
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
         };
         let cmdline = flatten_cmdline(&raw);
         if cmdline.is_empty() {

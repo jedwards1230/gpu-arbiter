@@ -129,15 +129,13 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
     let since_unix = guard
         .since
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().cast_signed())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs().cast_signed());
     drop(guard);
     // `now`/threshold are read HERE (impure edge) and passed into the pure
     // renderer, exactly like `since_unix`, so `render_metrics` reads no clocks.
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().cast_signed())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs().cast_signed());
     let threshold_s = app.cfg.presence_idle_threshold_s.cast_signed();
     // procmon's dropped-event counter lives outside ArbiterState (#14's
     // module docs explain why) — read it here, at the same impure edge as
