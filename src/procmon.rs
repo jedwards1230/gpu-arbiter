@@ -283,6 +283,11 @@ fn is_enobufs(err: &neli::err::SocketError) -> bool {
 
 /// Map a parsed neli [`ProcEvent`][neli::connector::ProcEvent] to our
 /// [`ProcEventKind`]. Linux-only (the neli type only exists there).
+///
+/// `neli::connector::ProcEvent` (as of neli 0.7.4) is **not** `#[non_exhaustive]`,
+/// so this is spelled out exhaustively rather than with a `_` catch-all: a neli
+/// upgrade adding a new `cn_proc` event variant becomes a compile error here
+/// (forcing a deliberate classification), not a silent fold into `Other`.
 #[cfg(target_os = "linux")]
 fn kind_of(event: &neli::connector::ProcEvent) -> ProcEventKind {
     use neli::connector::ProcEvent;
@@ -290,7 +295,13 @@ fn kind_of(event: &neli::connector::ProcEvent) -> ProcEventKind {
         ProcEvent::Fork { .. } => ProcEventKind::Fork,
         ProcEvent::Exec { .. } => ProcEventKind::Exec,
         ProcEvent::Exit { .. } => ProcEventKind::Exit,
-        _ => ProcEventKind::Other,
+        ProcEvent::Ack { .. }
+        | ProcEvent::Uid { .. }
+        | ProcEvent::Gid { .. }
+        | ProcEvent::Sid { .. }
+        | ProcEvent::Ptrace { .. }
+        | ProcEvent::Comm { .. }
+        | ProcEvent::Coredump { .. } => ProcEventKind::Other,
     }
 }
 

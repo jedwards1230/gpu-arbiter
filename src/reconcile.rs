@@ -388,15 +388,27 @@ async fn refresh_substate(
 /// action (if any) should this pass take on the managed units? Pure —
 /// unit-tested. The decision is the same regardless of *how many* units are
 /// managed; the caller applies it to each.
+///
+/// **This function IS the state-transition table.** Every `(current, desired)`
+/// pair is spelled out explicitly — no wildcard arm — so adding a 4th
+/// [`State`] variant makes this a non-exhaustive-match compile error instead
+/// of silently falling through to [`UnitAction::None`].
 pub fn unit_action(current: State, desired: State) -> UnitAction {
+    use State::{Available, Evicting, Gaming};
     match (current, desired) {
         // available → gaming: evict (caller sets the transient `evicting`).
-        (State::Available, State::Gaming) => UnitAction::Evict,
+        (Available, Gaming) => UnitAction::Evict,
         // gaming → available: verified restart (caller gates on a clean scan +
         // each unit's eager_restart).
-        (State::Gaming, State::Available) => UnitAction::Restart,
-        // Already-evicting → gaming settles with no new action.
-        _ => UnitAction::None,
+        (Gaming, Available) => UnitAction::Restart,
+        // Steady states and the evicting settle: no new unit action.
+        (Available, Available)
+        | (Available, Evicting)
+        | (Gaming, Gaming)
+        | (Gaming, Evicting)
+        | (Evicting, Available)
+        | (Evicting, Gaming)
+        | (Evicting, Evicting) => UnitAction::None,
     }
 }
 
