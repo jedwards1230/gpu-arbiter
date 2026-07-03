@@ -83,11 +83,12 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
     let snap = guard.snapshot();
     // Read the state-entered instant straight off live state as whole unix
     // seconds — avoids round-tripping the `/status` RFC-3339 string back to a
-    // timestamp. Pre-epoch (never produced) clamps to 0.
+    // timestamp. Pre-epoch (never produced) clamps to 0. `i64` (#37), the same
+    // sign convention `now_unix`/every other timestamp in the crate already uses.
     let since_unix = guard
         .since
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     drop(guard);
     // `now`/threshold are read HERE (impure edge) and passed into the pure
@@ -138,121 +139,126 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
 /// so the renderer stays pure — same discipline as `since_unix`.
 pub fn render_metrics(
     snap: &StatusSnapshot,
-    since_unix: u64,
+    since_unix: i64,
     now_unix: i64,
     presence_threshold_s: i64,
 ) -> String {
-    use std::fmt::Write as _;
     let mut o = String::with_capacity(1024);
 
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_up 1 if the gpu-arbiter daemon is serving."
+    gauge(
+        &mut o,
+        "gpu_arbiter_up",
+        "1 if the gpu-arbiter daemon is serving.",
+        &[],
+        1,
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_up gauge");
-    let _ = writeln!(o, "gpu_arbiter_up 1");
 
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_build_info Build metadata; constant 1, version in the label."
-    );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_build_info gauge");
-    let _ = writeln!(
-        o,
-        "gpu_arbiter_build_info{{version=\"{}\"}} 1",
-        esc(&snap.version)
+    gauge(
+        &mut o,
+        "gpu_arbiter_build_info",
+        "Build metadata; constant 1, version in the label.",
+        &[("version", &snap.version)],
+        1,
     );
 
     let cur = state_label(snap.state);
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_state Current arbiter state (1 for the active state)."
+    metric_header(
+        &mut o,
+        "gauge",
+        "gpu_arbiter_state",
+        "Current arbiter state (1 for the active state).",
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_state gauge");
     for s in ["gaming", "available", "evicting"] {
-        let _ = writeln!(
-            o,
-            "gpu_arbiter_state{{state=\"{s}\"}} {}",
-            u8::from(s == cur)
+        sample(
+            &mut o,
+            "gpu_arbiter_state",
+            &[("state", s)],
+            u8::from(s == cur),
         );
     }
 
-    let _ = writeln!(o, "# HELP gpu_arbiter_gaming 1 while a game holds the GPU.");
-    let _ = writeln!(o, "# TYPE gpu_arbiter_gaming gauge");
-    let _ = writeln!(o, "gpu_arbiter_gaming {}", u8::from(cur == "gaming"));
-
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_state_since_seconds Unix time the current state was entered."
+    gauge(
+        &mut o,
+        "gpu_arbiter_gaming",
+        "1 while a game holds the GPU.",
+        &[],
+        u8::from(cur == "gaming"),
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_state_since_seconds gauge");
-    let _ = writeln!(o, "gpu_arbiter_state_since_seconds {since_unix}");
 
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_claims Number of active gaming claims."
+    gauge(
+        &mut o,
+        "gpu_arbiter_state_since_seconds",
+        "Unix time the current state was entered.",
+        &[],
+        since_unix,
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_claims gauge");
-    let _ = writeln!(o, "gpu_arbiter_claims {}", snap.claims.len());
 
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_claim Active gaming claim; presence over time = launch/close."
+    gauge(
+        &mut o,
+        "gpu_arbiter_claims",
+        "Number of active gaming claims.",
+        &[],
+        snap.claims.len(),
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_claim gauge");
+
+    metric_header(
+        &mut o,
+        "gauge",
+        "gpu_arbiter_claim",
+        "Active gaming claim; presence over time = launch/close.",
+    );
     for token in &snap.claims {
         let (kind, id) = token.split_once(':').unwrap_or((token.as_str(), ""));
-        let _ = writeln!(
-            o,
-            "gpu_arbiter_claim{{token=\"{}\",kind=\"{}\",id=\"{}\"}} 1",
-            esc(token),
-            esc(kind),
-            esc(id)
+        sample(
+            &mut o,
+            "gpu_arbiter_claim",
+            &[("token", token), ("kind", kind), ("id", id)],
+            1,
         );
     }
 
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_vram_used_mib Total GPU VRAM in use (MiB), all tenants."
+    gauge(
+        &mut o,
+        "gpu_arbiter_vram_used_mib",
+        "Total GPU VRAM in use (MiB), all tenants.",
+        &[],
+        snap.gpu_vram_used_mb,
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_vram_used_mib gauge");
-    let _ = writeln!(o, "gpu_arbiter_vram_used_mib {}", snap.gpu_vram_used_mb);
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_vram_total_mib Total GPU VRAM capacity (MiB)."
+    gauge(
+        &mut o,
+        "gpu_arbiter_vram_total_mib",
+        "Total GPU VRAM capacity (MiB).",
+        &[],
+        snap.gpu_vram_total_mb,
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_vram_total_mib gauge");
-    let _ = writeln!(o, "gpu_arbiter_vram_total_mib {}", snap.gpu_vram_total_mb);
 
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_unit_running 1 if a managed unit is active."
+    metric_header(
+        &mut o,
+        "gauge",
+        "gpu_arbiter_unit_running",
+        "1 if a managed unit is active.",
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_unit_running gauge");
     for u in &snap.units {
         // `running` is a tristate (#15); a gauge has no "unknown" value, so an
         // unconfirmed unit renders 0 here — same numeric behavior scrapers saw
         // before the tristate. `/status` (StatusSnapshot JSON) and the CLI/tray
         // renderers are where "unknown" actually surfaces distinctly.
-        let _ = writeln!(
-            o,
-            "gpu_arbiter_unit_running{{unit=\"{}\"}} {}",
-            esc(&u.unit),
-            u8::from(u.running.unwrap_or(false))
+        sample(
+            &mut o,
+            "gpu_arbiter_unit_running",
+            &[("unit", &u.unit)],
+            u8::from(u.running.unwrap_or(false)),
         );
     }
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_unit_vram_mib VRAM attributed to a managed unit (MiB)."
+    metric_header(
+        &mut o,
+        "gauge",
+        "gpu_arbiter_unit_vram_mib",
+        "VRAM attributed to a managed unit (MiB).",
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_unit_vram_mib gauge");
     for u in &snap.units {
         if let Some(v) = u.vram_mb {
-            let _ = writeln!(
-                o,
-                "gpu_arbiter_unit_vram_mib{{unit=\"{}\"}} {v}",
-                esc(&u.unit)
-            );
+            sample(&mut o, "gpu_arbiter_unit_vram_mib", &[("unit", &u.unit)], v);
         }
     }
 
@@ -264,47 +270,84 @@ pub fn render_metrics(
         snap.input_monitor_up,
     );
 
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_local_input_last_seconds Unix time of the most recent physical human input."
-    );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_local_input_last_seconds gauge");
-    let _ = writeln!(
-        o,
-        "gpu_arbiter_local_input_last_seconds {}",
-        snap.local_input_last_unix
+    gauge(
+        &mut o,
+        "gpu_arbiter_local_input_last_seconds",
+        "Unix time of the most recent physical human input.",
+        &[],
+        snap.local_input_last_unix,
     );
 
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_local_present 1 if a human is locally present (recent physical input, monitor up)."
-    );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_local_present gauge");
-    let _ = writeln!(o, "gpu_arbiter_local_present {}", u8::from(present));
-
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_physical_input_devices Count of watched physical human-input devices."
-    );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_physical_input_devices gauge");
-    let _ = writeln!(
-        o,
-        "gpu_arbiter_physical_input_devices {}",
-        snap.physical_input_devices
+    gauge(
+        &mut o,
+        "gpu_arbiter_local_present",
+        "1 if a human is locally present (recent physical input, monitor up).",
+        &[],
+        u8::from(present),
     );
 
-    let _ = writeln!(
-        o,
-        "# HELP gpu_arbiter_input_monitor_up 1 if presence detection is healthy (else presence is unknown)."
+    gauge(
+        &mut o,
+        "gpu_arbiter_physical_input_devices",
+        "Count of watched physical human-input devices.",
+        &[],
+        snap.physical_input_devices,
     );
-    let _ = writeln!(o, "# TYPE gpu_arbiter_input_monitor_up gauge");
-    let _ = writeln!(
-        o,
-        "gpu_arbiter_input_monitor_up {}",
-        u8::from(snap.input_monitor_up)
+
+    gauge(
+        &mut o,
+        "gpu_arbiter_input_monitor_up",
+        "1 if presence detection is healthy (else presence is unknown).",
+        &[],
+        u8::from(snap.input_monitor_up),
     );
 
     o
+}
+
+/// Emit a single-sample gauge: the `# HELP`/`# TYPE gauge` preamble plus one
+/// `name{labels} value` line. For a metric with multiple samples under the same
+/// name (one per state/unit/claim/…), emit the preamble once via
+/// [`metric_header`] and call [`sample`] per line instead — see the `gpu_arbiter_state`/
+/// `gpu_arbiter_claim`/`gpu_arbiter_unit_running` blocks in [`render_metrics`].
+fn gauge(
+    o: &mut String,
+    name: &str,
+    help: &str,
+    labels: &[(&str, &str)],
+    value: impl std::fmt::Display,
+) {
+    metric_header(o, "gauge", name, help);
+    sample(o, name, labels, value);
+}
+
+/// The two-line `# HELP <name> <help>` / `# TYPE <name> <kind>` preamble every
+/// Prometheus metric needs, emitted **exactly once** per metric name — the
+/// duplication [`gauge`]/[`sample`] replace (previously each of HELP/TYPE/sample
+/// was a separate hand-rolled `writeln!`, so a metric's name string appeared
+/// three times over).
+fn metric_header(o: &mut String, kind: &str, name: &str, help: &str) {
+    use std::fmt::Write as _;
+    let _ = writeln!(o, "# HELP {name} {help}");
+    let _ = writeln!(o, "# TYPE {name} {kind}");
+}
+
+/// One `name{label1="v1",label2="v2"} value` sample line (`name value` with no
+/// labels). Every label value is escaped via [`esc`].
+fn sample(o: &mut String, name: &str, labels: &[(&str, &str)], value: impl std::fmt::Display) {
+    use std::fmt::Write as _;
+    if labels.is_empty() {
+        let _ = writeln!(o, "{name} {value}");
+        return;
+    }
+    let _ = write!(o, "{name}{{");
+    for (i, (k, v)) in labels.iter().enumerate() {
+        if i > 0 {
+            let _ = write!(o, ",");
+        }
+        let _ = write!(o, "{k}=\"{}\"", esc(v));
+    }
+    let _ = writeln!(o, "}} {value}");
 }
 
 /// The lowercase `/status` token for a [`State`] — also the `gpu_arbiter_state`
