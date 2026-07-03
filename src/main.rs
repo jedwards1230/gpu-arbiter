@@ -211,7 +211,9 @@ mod linux {
             .collect::<Vec<_>>()
             .join(", ");
         tracing::info!(
+            bind = %cfg.bind,
             port = cfg.port,
+            socket_path = %cfg.socket_path,
             managed_units = %managed_units,
             detect_steam = cfg.detect_steam,
             reconcile_interval_s = cfg.reconcile_interval_s,
@@ -284,18 +286,49 @@ mod linux {
             }
         });
 
-        // 6. HTTP control surface.
-        let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
+        // 6. HTTP control surface: the read-only surface (`/status /metrics
+        //    /healthz`) plus the deprecated TCP write routes, bound to
+        //    `cfg.bind` (default 0.0.0.0, unchanged historical behavior —
+        //    #22). The sanctioned write path is the unix socket below (#17).
+        let addr = SocketAddr::new(cfg.bind, cfg.port);
         let app = AppState {
             state: state.clone(),
             triggers: triggers_tx.clone(),
             cfg: cfg.clone(),
         };
+        let uds_app = app.clone();
         let http_handle = tokio::spawn(async move {
             if let Err(e) = http::serve(addr, app).await {
                 tracing::error!(error = %e, "HTTP server exited");
             }
         });
+
+        // 6b. Unix control socket (#17): the sanctioned write path — local
+        // root only, file-permission-gated (mode 0600), no bearer tokens.
+        // Serves ONLY `/units/*` + `/ollama/*`; the read-only surface above
+        // stays TCP/LAN. `socket_path = ""` opts out entirely.
+        let socket_handle = if cfg.socket_path.is_empty() {
+            tracing::info!("unix control socket disabled (socket_path is empty)");
+            None
+        } else {
+            let socket_path = cfg.socket_path.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = http::serve_uds(&socket_path, uds_app).await {
+                    tracing::error!(error = %e, socket = %socket_path, "unix control socket exited");
+                }
+            }))
+        };
+
+        // 6c. SIGHUP: config is an immutable `Arc` threaded into every task
+        // (procmon, presence, reconcile, http) — a real hot-reload would need
+        // ArcSwap/RwLock plumbing across all of them (#23 scope guard: not
+        // worth that blast radius for this wave). Log instead of silently
+        // swallowing the signal, so `systemctl kill -s HUP gpu-arbiter`
+        // doesn't leave an operator wondering why nothing changed — restart
+        // is the supported reload path, and it's safe by construction: step
+        // 3 above always reconciles against observed truth before anything
+        // can touch a managed unit, so a restart never "loses" state.
+        let sighup_handle = tokio::spawn(sighup_task());
 
         // 7. Block until a shutdown signal, then tear down.
         wait_for_shutdown().await;
@@ -328,11 +361,38 @@ mod linux {
         // I/O-only tasks here is safe.
         procmon_handle.abort();
         http_handle.abort();
+        if let Some(h) = socket_handle {
+            h.abort();
+        }
+        sighup_handle.abort();
         if let Some(h) = presence_handle {
             h.abort();
         }
 
         Ok(())
+    }
+
+    /// Log-only SIGHUP handling (#23 — see the scope-guard note at the call
+    /// site). Runs for the daemon's lifetime; a failure to even register the
+    /// handler is non-fatal (the daemon still runs, it just won't react to
+    /// SIGHUP at all — same fallback as [`wait_for_shutdown`]).
+    async fn sighup_task() {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to register SIGHUP handler");
+                return;
+            }
+        };
+        loop {
+            sighup.recv().await;
+            tracing::info!(
+                "SIGHUP received; gpu-arbiter does not hot-reload config — restart the daemon \
+                 (e.g. `systemctl restart gpu-arbiter`) to apply changes. This is safe: startup \
+                 always reconciles against observed truth before anything can touch a managed unit."
+            );
+        }
     }
 
     /// The sole state-mutating task. Owns `state`; every other task only *reads*

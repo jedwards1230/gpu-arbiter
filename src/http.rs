@@ -1,22 +1,39 @@
-//! HTTP control surface (axum 0.8). Cross-platform (tokio/axum only).
+//! HTTP control surface. Cross-platform (tokio/axum only) — the unix socket
+//! server compiles on any unix host (macOS included), so no `cfg` split was
+//! needed to keep the crate building on the macOS dev host.
 //!
-//! | Method | Path | Bind | Purpose |
+//! | Method | Path | Transport | Purpose |
 //! |---|---|---|---|
-//! | GET | `/status` | LAN | Full [`StatusSnapshot`] for remote machines + dashboards |
-//! | GET | `/metrics` | LAN | Prometheus text-format exposition of the current state |
-//! | GET | `/healthz` | LAN | Liveness |
-//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | localhost-only | Manual override (debugging) |
-//! | POST | `/ollama/start`,`/ollama/stop` | localhost-only | Back-compat alias for the first managed unit |
+//! | GET | `/status` | TCP (LAN) | Full [`StatusSnapshot`] for remote machines + dashboards |
+//! | GET | `/metrics` | TCP (LAN) | Prometheus text-format exposition of the current state |
+//! | GET | `/healthz` | TCP (LAN) | Liveness |
+//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | unix socket | Manual override (the sanctioned write path — #17) |
+//! | POST | `/ollama/start`,`/ollama/stop` | unix socket | Back-compat alias for the first managed unit |
+//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | TCP (localhost-only) | **Deprecated** — same alias, kept working for the tray/existing scripts |
+//! | POST | `/ollama/start`,`/ollama/stop` | TCP (localhost-only) | **Deprecated** alias |
 //!
 //! State is fully **auto** — derived from observed reality (no manual override).
 //!
-//! Security: single port bound `0.0.0.0`, LAN-restricted by a firewalld rich
-//! rule (firewalld-gated HTTP bridge pattern). The `/units/*` (and alias
-//! `/ollama/*`) handlers additionally reject any client whose peer address is
-//! not loopback — enforced in-process via [`ConnectInfo`] so it holds even if
-//! the firewall rule is missing/misconfigured. The `{unit}` path param is
-//! validated against the configured managed-unit list before any `systemctl`
-//! runs, so an attacker can't drive arbitrary units even from loopback.
+//! Security: the read-only surface (`/status`/`/metrics`/`/healthz`) is a
+//! single TCP port (default `48750`, bind address configurable — see
+//! [`crate::config::Config::bind`]), LAN-restricted by a firewalld rich rule
+//! (firewalld-gated HTTP bridge pattern; the configurable bind is
+//! defense-in-depth on top of, not instead of, that rule). The **write** path
+//! (`/units/*`, `/ollama/*`) is served twice:
+//!
+//! - a **unix domain socket** ([`crate::config::Config::socket_path`],
+//!   default `/run/gpu-arbiter.sock`, mode `0600` root-owned) — the
+//!   sanctioned control surface. The socket file's permissions ARE the auth
+//!   boundary (local root only, no bearer tokens, no `SocketAddr` to gate
+//!   on for a unix peer); see [`write_router`] / [`serve_uds`].
+//! - the **TCP** port, kept working for back-compat (the tray and existing
+//!   scripts) but **deprecated** — it additionally rejects any client whose
+//!   peer address is not loopback, enforced in-process via [`ConnectInfo`] so
+//!   it holds even if the firewall rule is missing/misconfigured.
+//!
+//! Both paths validate `{unit}` against the configured managed-unit list
+//! before any `systemctl` runs, so a caller can't drive arbitrary units
+//! through either surface.
 //!
 //! Note axum 0.8 path-param syntax is `/{p}` (not `/:p`).
 
@@ -58,18 +75,36 @@ pub struct AppState {
     pub cfg: Arc<Config>,
 }
 
-/// Build the axum [`Router`] for the control surface. Pulled out of [`serve`] so
-/// it can be exercised without binding a socket.
+/// Build the axum [`Router`] for the **TCP** control surface: the full
+/// read-only surface plus the deprecated TCP write routes (loopback-gated).
+/// Pulled out of [`serve`] so it can be exercised without binding a socket.
 pub fn router(app: AppState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
+        // Deprecated (#17): the unix socket (see `write_router`) is the
+        // sanctioned write path. Kept working — loopback-gated — for the
+        // tray and any existing scripts.
         .route("/units/{unit}/start", post(unit_start))
         .route("/units/{unit}/stop", post(unit_stop))
         // Back-compat aliases — address the first managed unit (historically Ollama).
         .route("/ollama/start", post(ollama_start))
         .route("/ollama/stop", post(ollama_stop))
+        .with_state(app)
+}
+
+/// Build the axum [`Router`] for the **unix control socket**: the write path
+/// only (`/status`/`/metrics`/`/healthz` stay TCP-only — this router carries
+/// no read routes). No loopback/`ConnectInfo` gate — a unix-socket peer has no
+/// `SocketAddr`, and the socket file's permissions (mode `0600`, root-owned;
+/// see [`serve_uds`]) are the entire auth boundary for this transport.
+pub fn write_router(app: AppState) -> Router {
+    Router::new()
+        .route("/units/{unit}/start", post(unit_start_uds))
+        .route("/units/{unit}/stop", post(unit_stop_uds))
+        .route("/ollama/start", post(ollama_start_uds))
+        .route("/ollama/stop", post(ollama_stop_uds))
         .with_state(app)
 }
 
@@ -363,6 +398,46 @@ pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
     Ok(())
 }
 
+/// Serve [`write_router`] (the manual start/stop write path — #17) on a unix
+/// domain socket at `socket_path` until the process exits.
+///
+/// - Creates the parent directory if missing (`/run` always exists under
+///   systemd, but a custom `socket_path` may name a subdirectory).
+/// - Removes a stale socket file left by an unclean prior shutdown before
+///   binding (a leftover file makes `bind` fail with `AddrInUse`).
+/// - Sets the socket file mode to `0600` **after** binding (the mode a
+///   freshly-created unix socket gets is umask-dependent, so this pins it
+///   explicitly) — root-owned (the daemon runs as root), so this is the
+///   entire auth boundary for the write path: any other local root process
+///   can reach it, no other user/process can.
+///
+/// `#[cfg(unix)]`: `tokio::net::UnixListener` and the `0600`-mode step both
+/// need a unix target. The daemon only ever runs on Linux, but this compiles
+/// equally on the macOS dev host (macOS is unix too), so no non-unix stub is
+/// needed — the crate has never targeted a non-unix host.
+#[cfg(unix)]
+pub async fn serve_uds(socket_path: &str, app: AppState) -> Result<(), HttpError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::path::Path::new(socket_path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => tracing::debug!(socket = socket_path, "removed stale control socket"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    let listener = tokio::net::UnixListener::bind(path)?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    tracing::info!(socket = socket_path, "unix control socket listening");
+    axum::serve(listener, write_router(app)).await?;
+    Ok(())
+}
+
 /// `GET /status` — serialize the current [`StatusSnapshot`] as JSON.
 pub async fn status(State(app): State<AppState>) -> Json<StatusSnapshot> {
     let snap = read_state(&app.state).snapshot();
@@ -374,8 +449,9 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
-/// `POST /units/{unit}/start` — manual start (debugging). Rejects non-loopback
-/// peers and unknown units.
+/// `POST /units/{unit}/start` — **deprecated** TCP alias for the manual-start
+/// write path (see [`unit_start_uds`] for the sanctioned unix-socket route).
+/// Rejects non-loopback peers and unknown units.
 ///
 /// A direct override: starts the unit now. (Note the reconcile authority will
 /// re-evict on the next pass if a game is running — this is a debug escape
@@ -388,8 +464,8 @@ pub async fn unit_start(
     do_start(&app, peer.ip(), &unit).await
 }
 
-/// `POST /units/{unit}/stop` — manual stop (debugging). Rejects non-loopback
-/// peers and unknown units.
+/// `POST /units/{unit}/stop` — **deprecated** TCP alias; see [`unit_stop_uds`].
+/// Rejects non-loopback peers and unknown units.
 pub async fn unit_stop(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(unit): Path<String>,
@@ -398,7 +474,8 @@ pub async fn unit_stop(
     do_stop(&app, peer.ip(), &unit).await
 }
 
-/// `POST /ollama/start` — back-compat alias addressing the first managed unit.
+/// `POST /ollama/start` — **deprecated** TCP back-compat alias addressing the
+/// first managed unit; see [`ollama_start_uds`].
 pub async fn ollama_start(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(app): State<AppState>,
@@ -407,7 +484,8 @@ pub async fn ollama_start(
     do_start(&app, peer.ip(), &unit).await
 }
 
-/// `POST /ollama/stop` — back-compat alias addressing the first managed unit.
+/// `POST /ollama/stop` — **deprecated** TCP back-compat alias addressing the
+/// first managed unit; see [`ollama_stop_uds`].
 pub async fn ollama_stop(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(app): State<AppState>,
@@ -416,19 +494,82 @@ pub async fn ollama_stop(
     do_stop(&app, peer.ip(), &unit).await
 }
 
-/// Shared start logic: loopback gate → managed-unit gate → enqueue a
-/// [`ReconcileTrigger::ManualStart`] and await its outcome.
-///
-/// The actual `units::start` call happens on the reconcile task (see
-/// [`crate::reconcile::reconcile`]) — this handler never drives the unit
-/// itself, removing the handler-vs-reconcile-task race that existed when it
-/// called `units::start` directly.
+/// `POST /units/{unit}/start` on the **unix control socket** (#17) — the
+/// sanctioned write path. No loopback gate: a unix-socket peer carries no
+/// `SocketAddr`, and the socket file's permissions (mode `0600`, root-owned;
+/// see [`serve_uds`]) are the entire auth boundary for this transport.
+pub async fn unit_start_uds(
+    Path(unit): Path<String>,
+    State(app): State<AppState>,
+) -> impl IntoResponse {
+    do_start_uds(&app, &unit).await
+}
+
+/// `POST /units/{unit}/stop` on the unix control socket. See [`unit_start_uds`].
+pub async fn unit_stop_uds(
+    Path(unit): Path<String>,
+    State(app): State<AppState>,
+) -> impl IntoResponse {
+    do_stop_uds(&app, &unit).await
+}
+
+/// `POST /ollama/start` on the unix control socket — back-compat alias
+/// addressing the first managed unit.
+pub async fn ollama_start_uds(State(app): State<AppState>) -> impl IntoResponse {
+    let unit = first_managed_unit(&app.cfg);
+    do_start_uds(&app, &unit).await
+}
+
+/// `POST /ollama/stop` on the unix control socket — back-compat alias
+/// addressing the first managed unit.
+pub async fn ollama_stop_uds(State(app): State<AppState>) -> impl IntoResponse {
+    let unit = first_managed_unit(&app.cfg);
+    do_stop_uds(&app, &unit).await
+}
+
+/// TCP start logic: loopback gate → managed-unit gate → [`start_validated`].
 async fn do_start(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
-    let managed = match guard(&app.cfg, peer, unit) {
+    if let Err(deny) = guard_loopback(peer) {
+        return deny;
+    }
+    do_start_uds(app, unit).await
+}
+
+/// TCP stop logic: loopback gate → managed-unit gate → [`stop_validated`].
+async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
+    if let Err(deny) = guard_loopback(peer) {
+        return deny;
+    }
+    do_stop_uds(app, unit).await
+}
+
+/// Unix-socket start logic: managed-unit gate only (no peer/loopback check —
+/// see the module doc) → [`start_validated`].
+async fn do_start_uds(app: &AppState, unit: &str) -> (StatusCode, String) {
+    let managed = match guard_unit(&app.cfg, unit) {
         Ok(managed) => managed,
         Err(deny) => return deny,
     };
-    let unit = managed.unit.clone();
+    start_validated(app, managed.unit.clone()).await
+}
+
+/// Unix-socket stop logic: managed-unit gate only → [`stop_validated`].
+async fn do_stop_uds(app: &AppState, unit: &str) -> (StatusCode, String) {
+    let managed = match guard_unit(&app.cfg, unit) {
+        Ok(managed) => managed,
+        Err(deny) => return deny,
+    };
+    stop_validated(app, managed.unit.clone()).await
+}
+
+/// Enqueue a [`ReconcileTrigger::ManualStart`] for an already-validated `unit`
+/// and await its outcome.
+///
+/// The actual `units::start` call happens on the reconcile task (see
+/// [`crate::reconcile::reconcile`]) — this never drives the unit itself,
+/// removing the handler-vs-reconcile-task race that existed when it called
+/// `units::start` directly.
+async fn start_validated(app: &AppState, unit: String) -> (StatusCode, String) {
     enqueue_and_await(
         app,
         unit,
@@ -438,14 +579,9 @@ async fn do_start(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, Stri
     .await
 }
 
-/// Shared stop logic: loopback gate → managed-unit gate → enqueue a
-/// [`ReconcileTrigger::ManualStop`] and await its outcome. See [`do_start`].
-async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
-    let managed = match guard(&app.cfg, peer, unit) {
-        Ok(managed) => managed,
-        Err(deny) => return deny,
-    };
-    let unit = managed.unit.clone();
+/// Enqueue a [`ReconcileTrigger::ManualStop`] for an already-validated `unit`
+/// and await its outcome. See [`start_validated`].
+async fn stop_validated(app: &AppState, unit: String) -> (StatusCode, String) {
     enqueue_and_await(
         app,
         unit,
@@ -500,24 +636,32 @@ async fn enqueue_and_await(
     }
 }
 
-/// The access gate shared by every `/units/*` (and alias) handler: loopback-only
-/// and the unit must be one the daemon actually manages. Returns the resolved
-/// [`crate::config::ManagedUnit`] (carrying any command-override fields) on
-/// success — a single lookup into `cfg.resolved_units()`, so callers never
-/// re-resolve the unit after the gate passes. Returns the rejection response to
-/// send verbatim on failure. Pure over `(cfg, peer, unit)` — unit-tested via
-/// [`is_localhost`] / [`is_managed`].
-fn guard<'c>(
-    cfg: &'c Config,
-    peer: IpAddr,
-    unit: &str,
-) -> Result<&'c crate::config::ManagedUnit, (StatusCode, String)> {
-    if !is_localhost(peer) {
-        return Err((
+/// The loopback gate for the **deprecated TCP** write routes only — a unix
+/// socket peer has no `SocketAddr` to check, so [`do_start_uds`]/[`do_stop_uds`]
+/// never call this (see the module doc: the socket file's permissions are
+/// that transport's auth boundary). Pure — unit-tested via [`is_localhost`].
+fn guard_loopback(peer: IpAddr) -> Result<(), (StatusCode, String)> {
+    if is_localhost(peer) {
+        Ok(())
+    } else {
+        Err((
             StatusCode::FORBIDDEN,
             "unit controls are localhost-only".to_string(),
-        ));
+        ))
     }
+}
+
+/// The gate shared by **every** write-path handler (TCP and unix socket
+/// alike): the unit must be one the daemon actually manages. Returns the
+/// resolved [`crate::config::ManagedUnit`] (carrying any command-override
+/// fields) on success — a single lookup into `cfg.resolved_units()`, so
+/// callers never re-resolve the unit after the gate passes. Returns the
+/// rejection response to send verbatim on failure. Pure over `(cfg, unit)` —
+/// unit-tested via [`is_managed`].
+fn guard_unit<'c>(
+    cfg: &'c Config,
+    unit: &str,
+) -> Result<&'c crate::config::ManagedUnit, (StatusCode, String)> {
     cfg.resolved_units()
         .iter()
         .find(|u| u.unit == unit)
@@ -609,22 +753,27 @@ mod tests {
     }
 
     #[test]
-    fn guard_rejects_lan_then_unknown_unit() {
-        let cfg = Config::default();
-        // Non-loopback is forbidden regardless of unit.
+    fn guard_loopback_rejects_lan_allows_loopback() {
         let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
         assert_eq!(
-            guard(&cfg, lan, "ollama.service").map_err(|(s, _)| s),
+            guard_loopback(lan).map_err(|(s, _)| s),
             Err(StatusCode::FORBIDDEN)
         );
-        // Loopback but an unmanaged unit → 404 (can't drive arbitrary units).
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(guard_loopback(lo), Ok(()));
+    }
+
+    #[test]
+    fn guard_unit_rejects_unmanaged_unit() {
+        let cfg = Config::default();
+        // An unmanaged unit → 404 (can't drive arbitrary units).
         assert_eq!(
-            guard(&cfg, lo, "sshd.service").map_err(|(s, _)| s),
+            guard_unit(&cfg, "sshd.service").map_err(|(s, _)| s),
             Err(StatusCode::NOT_FOUND)
         );
-        // Loopback + a managed unit → allowed through, resolving that unit.
-        let managed = guard(&cfg, lo, "ollama.service").expect("ollama.service is managed");
+        // A managed unit → allowed through, resolving that unit. This gate
+        // applies identically on the TCP and unix-socket write paths.
+        let managed = guard_unit(&cfg, "ollama.service").expect("ollama.service is managed");
         assert_eq!(managed.unit, "ollama.service");
     }
 

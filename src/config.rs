@@ -16,6 +16,8 @@
 //! makes `--check-config` (see [`crate::cli::check_config`]) trustworthy — a
 //! typo like `detect_stema` used to still print `OK`.
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use serde::Deserialize;
 
 /// A non-Steam launcher pattern: a human `name` and a cmdline `match` substring.
@@ -287,13 +289,23 @@ impl<'de> Deserialize<'de> for ArgvCmd {
 /// | `presence_detection` | `gpu_arbiter_presence_detection` |
 /// | `presence_idle_threshold_s` | `gpu_arbiter_presence_idle_threshold_s` |
 /// | `gpu_backend` | `gpu_arbiter_gpu_backend` |
+/// | `bind` | `gpu_arbiter_bind` |
+/// | `socket_path` | `gpu_arbiter_socket_path` |
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Master enable. (The Ansible role also gates the unit on this.)
     pub enabled: bool,
-    /// HTTP listen port (bound `0.0.0.0`; LAN-restricted by firewalld).
+    /// HTTP listen port (bound to `bind`; LAN-restricted by firewalld).
     pub port: u16,
+    /// TCP bind address for the HTTP control surface (`GET /status /metrics
+    /// /healthz` plus the deprecated `POST /units/*` / `/ollama/*` write
+    /// routes — see [`Config::socket_path`] for the sanctioned write path).
+    /// Default `0.0.0.0` (unchanged historical behavior — every interface).
+    /// Scoping this to a LAN-only address is defense-in-depth **on top of**,
+    /// not instead of, the firewalld rich rule.
+    #[serde(default = "default_bind")]
+    pub bind: IpAddr,
     /// **Legacy** single managed unit. Superseded by `managed_units`; still
     /// accepted and, when `managed_units` is unset, synthesized into a
     /// one-element list (see [`Config::resolved_units`]).
@@ -349,6 +361,30 @@ pub struct Config {
     /// Which GPU vendor backend to drive: `"auto"` (default), `"nvidia"`, or
     /// `"amd"`. `auto` keeps existing NVIDIA hosts on the `nvidia-smi` path.
     pub gpu_backend: GpuBackendKind,
+
+    // ── control socket ───────────────────────────────────────────────────────
+    /// Path to the unix control socket that serves the write path (`POST
+    /// /units/{unit}/start|stop`, `/ollama/start|stop`) — the sanctioned
+    /// control surface (local-only, no bearer tokens). Bound mode `0600`,
+    /// root-owned: the socket file's permissions ARE the auth boundary, not
+    /// an in-process check (unix-socket peers carry no `SocketAddr` to gate
+    /// on). Default `/run/gpu-arbiter.sock`. The TCP `/units/*`/`/ollama/*`
+    /// routes keep working (loopback-gated) for back-compat but are
+    /// deprecated in favor of this socket. An **empty string** disables the
+    /// unix socket entirely.
+    #[serde(default = "default_socket_path")]
+    pub socket_path: String,
+}
+
+/// serde default for [`Config::bind`] — `0.0.0.0` (every interface), the
+/// historical hardcoded behavior.
+fn default_bind() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
+
+/// serde default for [`Config::socket_path`].
+fn default_socket_path() -> String {
+    "/run/gpu-arbiter.sock".to_string()
 }
 
 impl Default for Config {
@@ -360,6 +396,7 @@ impl Default for Config {
         Self {
             enabled: true,
             port: 48750,
+            bind: default_bind(),
             ollama_unit,
             eager_ollama,
             managed_units,
@@ -380,6 +417,7 @@ impl Default for Config {
             presence_detection: true,
             presence_idle_threshold_s: 600,
             gpu_backend: GpuBackendKind::Auto,
+            socket_path: default_socket_path(),
         }
     }
 }
@@ -484,6 +522,36 @@ mod tests {
         // Presence defaults: on, 10-minute idle threshold.
         assert!(c.presence_detection);
         assert_eq!(c.presence_idle_threshold_s, 600);
+        // #22/#17: bind defaults to every interface (unchanged historical
+        // behavior); the unix control socket defaults to /run/gpu-arbiter.sock.
+        assert_eq!(
+            c.bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(c.socket_path, "/run/gpu-arbiter.sock");
+    }
+
+    #[test]
+    fn bind_key_parses_and_rejects_garbage() {
+        let c = Config::from_toml(r#"bind = "127.0.0.1""#).unwrap();
+        assert_eq!(c.bind, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let c = Config::from_toml(r#"bind = "::1""#).unwrap();
+        assert_eq!(c.bind, std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        // A malformed address is a typed parse error, not a silent fallback.
+        assert!(matches!(
+            Config::from_toml(r#"bind = "not-an-ip""#).unwrap_err(),
+            ConfigError::Parse(_)
+        ));
+    }
+
+    #[test]
+    fn socket_path_key_overrides_and_empty_string_is_accepted() {
+        let c = Config::from_toml(r#"socket_path = "/run/gpu-arbiter/custom.sock""#).unwrap();
+        assert_eq!(c.socket_path, "/run/gpu-arbiter/custom.sock");
+        // Empty string is the documented "disable the unix socket" sentinel —
+        // it must parse (validation of *meaning* happens where it's consumed).
+        let c = Config::from_toml(r#"socket_path = """#).unwrap();
+        assert_eq!(c.socket_path, "");
     }
 
     #[test]
