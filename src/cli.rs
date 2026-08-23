@@ -38,7 +38,18 @@ use crate::config::{Config, ConfigError};
 /// The default config path the daemon reads when neither `--config` nor
 /// `GPU_ARBITER_CONFIG` is set. This is where deployment tooling (Ansible)
 /// renders the file; a missing file falls back to built-in defaults.
+///
+/// Windows has no `/etc`, so it uses the `%ProgramData%` convention instead —
+/// hardcoded rather than read from the environment because this is a *default*
+/// that must be a `const` and identical for the daemon and every CLI client on
+/// the host. A relocated `ProgramData` is handled by passing `--config` or
+/// setting [`CONFIG_ENV_VAR`], the same escape hatches Unix has.
+#[cfg(not(windows))]
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/gpu-arbiter/config.toml";
+
+/// Windows counterpart of [`DEFAULT_CONFIG_PATH`] — see its docs.
+#[cfg(windows)]
+pub const DEFAULT_CONFIG_PATH: &str = r"C:\ProgramData\gpu-arbiter\config.toml";
 
 /// The environment variable that overrides the default config path (lower
 /// precedence than an explicit `--config`/`-c` flag).

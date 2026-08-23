@@ -1333,7 +1333,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
     fn resolve_with_overrides_is_command() {
         // Any override flips the tenant to Command-driven, carrying the argv
         // through. Mirrors a parsed OpenRC config.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "ollama"
@@ -1342,7 +1342,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             is_active_cmd = "rc-service ollama status"
             kill_cmd = ["pkill", "-9", "ollama"]
             "#,
-        )
+        ))
         .unwrap();
         assert_eq!(
             Supervisor::resolve(&cfg.managed_units[0]),
@@ -1358,7 +1358,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
     #[test]
     fn resolve_command_without_kill_leaves_kill_none() {
         // No kill_cmd → kill is None; the runner falls back to re-running stop.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "asr"
@@ -1366,7 +1366,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             start_cmd = "sv up asr"
             is_active_cmd = "sv status asr"
             "#,
-        )
+        ))
         .unwrap();
         let sup = Supervisor::resolve(&cfg.managed_units[0]);
         match sup {
@@ -1428,7 +1428,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
                 .as_nanos()
         ));
         let _ = std::fs::remove_file(&marker);
-        let cfg = Config::from_toml(&format!(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             [[managed_units]]
             unit = "fake.service"
@@ -1436,8 +1436,8 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             stop_cmd = ["true"]
             is_active_cmd = "true"
             "#,
-            marker = marker.display(),
-        ))
+            marker = crate::testutil::toml_path(&marker),
+        )))
         .unwrap();
         start_by_name(&cfg, "fake.service").await.unwrap();
         assert!(marker.exists());
@@ -1462,7 +1462,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
 
     #[tokio::test]
     async fn evict_by_name_already_clear_when_not_running() {
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "fake.service"
@@ -1470,7 +1470,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             stop_cmd = ["true"]
             is_active_cmd = "false"
             "#,
-        )
+        ))
         .unwrap();
         let outcome = evict_by_name(&cfg, GpuBackend::default(), "fake.service")
             .await
@@ -1480,6 +1480,13 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
 
     // ── tristate is_running: the recheck-can't-confirm decision (#15) ───────
 
+    // Unix-only in premise, not just in the chmod: the fixture is a `#!/bin/sh`
+    // script whose self-disarming depends on shebang execution and on the
+    // executable permission bit gating spawn with EACCES. Windows has neither —
+    // it dispatches by file extension and has no `chmod -x` equivalent — so the
+    // second invocation would succeed and the "couldn't tell" state the test
+    // exists to exercise would never arise.
+    #[cfg(unix)]
     #[tokio::test]
     async fn evict_escalates_when_recheck_cannot_confirm_still_running() {
         // A self-disarming is_active_cmd script: the FIRST invocation (evict()'s
@@ -1510,7 +1517,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             std::fs::set_permissions(&script, perms).unwrap();
         }
 
-        let cfg = Config::from_toml(&format!(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             eviction_timeout_s = 0
             [[managed_units]]
@@ -1518,8 +1525,8 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             stop_cmd = ["true"]
             is_active_cmd = ["{script}"]
             "#,
-            script = script.display(),
-        ))
+            script = crate::testutil::toml_path(&script),
+        )))
         .unwrap();
 
         let outcome = evict(&cfg.managed_units[0], &cfg, GpuBackend::default())

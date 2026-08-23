@@ -223,9 +223,84 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Windows client build. The daemon half does not run on Windows yet (main.rs
+  # still exits 1 there), but the CLI half — `status`, `wait`, `watch`,
+  # `--check-config` — resolves and exits before that stub, which is exactly
+  # what earmark's optional CLI-delegation contract needs on a Windows GPU host.
+  # Shipping the .exe now means the Ansible role has a pinned, checksummed
+  # artifact to fetch when the daemon port lands, instead of the role and the
+  # binary needing to arrive in the same change.
+  build_windows:
+    name: Build Windows binary
+    needs: [detect, prepare]
+    if: needs.detect.outputs.release == 'true' && needs.detect.outputs.dry_run != 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      # Same bake as the musl job, same rationale (see its comment): the git tag
+      # is the source of truth for CARGO_PKG_VERSION, and it must match across
+      # both artifacts or `--version` disagrees depending on which one you ran.
+      - name: Bake release version into Cargo.toml
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          awk -v version="$VERSION" '
+            BEGIN { count = 0; in_package = 0 }
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version[[:space:]]*=/ {
+              print "version = \"" version "\""
+              count++
+              next
+            }
+            { print }
+            END {
+              if (count != 1) {
+                print "ERROR: expected exactly 1 [package] version line to replace, found " count > "/dev/stderr"
+                exit 1
+              }
+            }
+          ' Cargo.toml > "$tmp"
+          mv "$tmp" Cargo.toml
+          echo "Baked version:"; grep -m1 '^version = ' Cargo.toml
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: windows-msvc
+
+      # Only the daemon bin: gpu-arbiter-tray is a Linux desktop (ksni/D-Bus)
+      # companion whose non-Linux build is a no-op stub, so shipping it as a
+      # Windows artifact would hand users a binary that does nothing.
+      - name: Build (x86_64-pc-windows-msvc)
+        run: cargo build --release --bin gpu-arbiter
+
+      - name: Stage binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/gpu-arbiter.exe dist/gpu-arbiter-x86_64-pc-windows-msvc.exe
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gpu-arbiter-windows
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release
-    needs: [detect, prepare, build]
+    needs: [detect, prepare, build, build_windows]
     if: needs.detect.outputs.release == 'true' && needs.detect.outputs.dry_run != 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -235,6 +310,12 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: gpu-arbiter-musl
+          path: dist
+
+      - name: Download Windows binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: gpu-arbiter-windows
           path: dist
 
       - name: Compose release body (install snippet + AI notes)
@@ -249,8 +330,10 @@ jobs:
 
           d=dist/gpu-arbiter-x86_64-unknown-linux-musl
           t=dist/gpu-arbiter-tray-x86_64-unknown-linux-musl
+          w=dist/gpu-arbiter-x86_64-pc-windows-msvc.exe
           sha_d=$(sha256sum "$d" | awk '{print $1}')
           sha_t=$(sha256sum "$t" | awk '{print $1}')
+          sha_w=$(sha256sum "$w" | awk '{print $1}')
 
           # Prepend an install snippet: how to fetch the binaries and point your
           # deployment tooling (e.g. Ansible) at this exact release (version +
@@ -276,10 +359,20 @@ jobs:
             echo "gpu_arbiter_tray_binary_sha256: ${sha_t}"
             echo '```'
             echo ""
+            echo ""
+            echo "### Windows (client only)"
+            echo ""
+            echo "\`gpu-arbiter-x86_64-pc-windows-msvc.exe\` provides the **CLI client** — \`status\`, \`wait\`, \`watch\`, \`--check-config\` — against a daemon running elsewhere. The daemon itself does not run on Windows yet."
+            echo ""
+            echo '```yaml'
+            echo "gpu_arbiter_windows_binary_sha256: ${sha_w}"
+            echo '```'
+            echo ""
             echo "| Artifact | sha256 |"
             echo "|----------|--------|"
             echo "| \`gpu-arbiter-x86_64-unknown-linux-musl\` | \`${sha_d}\` |"
             echo "| \`gpu-arbiter-tray-x86_64-unknown-linux-musl\` | \`${sha_t}\` |"
+            echo "| \`gpu-arbiter-x86_64-pc-windows-msvc.exe\` | \`${sha_w}\` |"
             echo ""
             echo "---"
             echo ""
@@ -296,6 +389,7 @@ jobs:
           files: |
             dist/gpu-arbiter-x86_64-unknown-linux-musl
             dist/gpu-arbiter-tray-x86_64-unknown-linux-musl
+            dist/gpu-arbiter-x86_64-pc-windows-msvc.exe
 
       - name: Write workflow summary
         env:

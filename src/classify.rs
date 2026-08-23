@@ -81,12 +81,20 @@ pub struct GpuGraphicsProc {
     pub owning_unit: Option<String>,
 }
 
-/// The last `/`-delimited segment of `path` — its basename. Pure. `nvidia-smi`
-/// reports the full binary path as `process_name`, so a `gpu_allowlist` entry
-/// written as a bare binary name (`"1password"`) needs the basename, not the
-/// whole path, to match.
+/// The last path-separator-delimited segment of `path` — its basename. Pure.
+/// `nvidia-smi` reports the full binary path as `process_name`, so a
+/// `gpu_allowlist` entry written as a bare binary name (`"1password"`) needs the
+/// basename, not the whole path, to match.
+///
+/// Splits on **both** `/` and `\` unconditionally, on every platform. Windows
+/// `nvidia-smi` reports backslash paths (verified on desktop-2:
+/// `C:\Program Files\Ollama\lib\ollama\llama-server.exe`), and a `/`-only split
+/// would return the whole string, so no allowlist entry could ever match. The
+/// split is not `cfg`-gated because `\` is not a legal byte in a POSIX filename
+/// component either way, so accepting it on Unix costs nothing and keeps the
+/// function's behavior identical across the CI matrix.
 fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// `unit` with a trailing `.service`/`.scope` stripped, if present. Pure —
@@ -265,6 +273,41 @@ mod tests {
         assert!(matches_allowlist(
             &graphics_proc(1, "/usr/bin/sunshine", 100),
             &sunshine
+        ));
+    }
+
+    #[test]
+    fn allowlist_matches_basename_of_windows_path() {
+        // Windows nvidia-smi reports backslash-delimited paths. Verified live on
+        // desktop-2 (driver 610.88), which listed the Ollama GPU process as
+        // `C:\Program Files\Ollama\lib\ollama\llama-server.exe`. Before the
+        // `rsplit(['/', '\\'])` fix, `basename` returned the entire string and no
+        // allowlist entry could ever match on Windows.
+        let allow = vec!["llama-server.exe".to_string()];
+        assert!(matches_allowlist(
+            &graphics_proc(
+                1,
+                r"C:\Program Files\Ollama\lib\ollama\llama-server.exe",
+                100
+            ),
+            &allow
+        ));
+        // Case-insensitive, matching the Unix behavior above — Windows paths are
+        // case-insensitive in practice.
+        let steam = vec!["Stardew Valley.exe".to_string()];
+        assert!(matches_allowlist(
+            &graphics_proc(
+                1,
+                r"D:\SteamLibrary\steamapps\common\Stardew Valley\Stardew Valley.exe",
+                100
+            ),
+            &steam
+        ));
+        // A Unix path still works on the same code path — the split is not
+        // platform-gated, so both separators resolve everywhere.
+        assert!(matches_allowlist(
+            &graphics_proc(1, "/usr/local/bin/ollama", 100),
+            &["ollama".to_string()]
         ));
     }
 

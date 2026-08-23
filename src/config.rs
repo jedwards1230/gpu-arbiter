@@ -412,8 +412,18 @@ fn default_bind() -> IpAddr {
 /// A dedicated subdirectory of `/run` (not bare `/run/gpu-arbiter.sock`, the
 /// pre-#61 default) — see [`crate::http::serve_uds`]'s docs for why the
 /// parent directory itself needs to be lockable to mode `0700`.
+///
+/// Empty on Windows, which disables the unix-socket listener. `http::bind_uds`
+/// and `serve_uds_on` are `#[cfg(unix)]` with no Windows counterpart, so a
+/// non-empty default here would name a socket that can never be bound. The
+/// control surface is TCP-only on Windows until the named-pipe listener lands;
+/// see the port plan's §5.5 for the security tradeoff that implies.
 fn default_socket_path() -> String {
-    "/run/gpu-arbiter/gpu-arbiter.sock".to_string()
+    if cfg!(windows) {
+        String::new()
+    } else {
+        "/run/gpu-arbiter/gpu-arbiter.sock".to_string()
+    }
 }
 
 impl Default for Config {
@@ -570,7 +580,16 @@ mod tests {
             c.bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         );
-        assert_eq!(c.socket_path, "/run/gpu-arbiter/gpu-arbiter.sock");
+        // Platform-split: Windows has no unix-socket listener at all
+        // (`http::bind_uds`/`serve_uds_on` are `#[cfg(unix)]` with no Windows
+        // counterpart), so its default is the empty string, which disables the
+        // listener. A `/run/...` default there would name a socket that can
+        // never be bound.
+        if cfg!(windows) {
+            assert_eq!(c.socket_path, "");
+        } else {
+            assert_eq!(c.socket_path, "/run/gpu-arbiter/gpu-arbiter.sock");
+        }
     }
 
     #[test]
