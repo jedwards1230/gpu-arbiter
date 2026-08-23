@@ -66,6 +66,30 @@ fn default_true() -> bool {
     true
 }
 
+/// Default [`ManagedUnit::priority`]: mid-range, so every unit in a config that
+/// never mentions priorities lands on one equal tier.
+///
+/// That equality is the back-compat guarantee: with all units equal, no unit's
+/// demand preempts another (the comparison is strict), and a game — claiming at
+/// [`DEFAULT_GAME_PRIORITY`], well above this — still evicts them all. So a
+/// pre-priorities config behaves exactly as it did before.
+pub const DEFAULT_UNIT_PRIORITY: u8 = 50;
+
+/// Default [`Config::game_priority`]. Above [`DEFAULT_UNIT_PRIORITY`] with room
+/// on either side, so an operator can slot tenants above the default tier
+/// without colliding with gaming.
+pub const DEFAULT_GAME_PRIORITY: u8 = 100;
+
+/// serde default for [`ManagedUnit::priority`].
+fn default_unit_priority() -> u8 {
+    DEFAULT_UNIT_PRIORITY
+}
+
+/// serde default for [`Config::game_priority`].
+fn default_game_priority() -> u8 {
+    DEFAULT_GAME_PRIORITY
+}
+
 /// Maximum accepted length (in bytes) of an [`ManagedUnit::introspect_cmd`]. A
 /// value longer than this is treated as **unset** (resolution falls through to the
 /// next precedence level, just like a blank string), never run.
@@ -166,6 +190,36 @@ pub struct ManagedUnit {
     /// Restart this unit when gaming ends (eager warm-up). Defaults to `true`.
     #[serde(default = "default_true")]
     pub eager_restart: bool,
+    /// Where this tenant sits in the preemption ladder. **Higher wins.**
+    ///
+    /// A demand at priority `P` preempts every unit with `priority < P` and
+    /// leaves everything at `>= P` alone. Since the comparison is strict, a unit
+    /// can never preempt itself, and two units at the same priority coexist
+    /// rather than fighting.
+    ///
+    /// Games claim at [`Config::game_priority`] (default 100), above every
+    /// sensible tenant value, which is what makes gaming unconditionally win.
+    ///
+    /// The default is [`DEFAULT_UNIT_PRIORITY`] — deliberately mid-range so an
+    /// existing config, where nothing sets this, keeps every unit at one equal
+    /// tier and behaves exactly as it did before priorities existed: no tenant
+    /// preempts another, and a game still evicts them all.
+    #[serde(default = "default_unit_priority")]
+    pub priority: u8,
+    /// Optional probe for "this tenant currently has work". **Exit 0 = busy.**
+    ///
+    /// This is what lets a tenant *preempt* lower tiers rather than merely
+    /// surviving them. Without it a unit is only ever a preemption target, never
+    /// a source — which is the right default, since a merely-running server
+    /// holding an idle model should not evict anything.
+    ///
+    /// Parsed as a shell-free argv exactly like the other `*_cmd` fields, and
+    /// run on every reconcile pass, so it must be cheap and must not block. A
+    /// probe that fails to spawn, times out, or exits non-zero reads as **not
+    /// busy** — the conservative direction, since a broken probe should not be
+    /// able to evict a lower tier on a false pretext.
+    #[serde(default)]
+    pub busy_cmd: Option<ArgvCmd>,
     /// **Fallback** substring (case-insensitive) matched against `nvidia-smi`
     /// compute-proc names to attribute this unit's VRAM in `/status`. For a
     /// systemd-supervised unit, cgroup PID resolution (#7) attributes VRAM
@@ -373,6 +427,16 @@ pub struct Config {
     /// event-driven (`cn_proc`); this only covers dropped events.
     pub reconcile_interval_s: u64,
 
+    /// The priority a detected **game** claims at. Higher wins; see
+    /// [`ManagedUnit::priority`] for the ladder's semantics.
+    ///
+    /// Defaults to [`DEFAULT_GAME_PRIORITY`] (100), above every tenant's default
+    /// (50), which is what makes gaming preempt everything. Lowering it below a
+    /// tenant's priority would let that tenant survive a game launch — a real
+    /// option (a tenant you never want interrupted), but a deliberate one.
+    #[serde(default = "default_game_priority")]
+    pub game_priority: u8,
+
     // ── detection ──────────────────────────────────────────────────────────
     /// Match `SteamLaunch AppId=` in exec'd cmdlines (covers all Steam games).
     pub detect_steam: bool,
@@ -459,6 +523,7 @@ impl Default for Config {
             enabled: true,
             port: 48750,
             bind: default_bind(),
+            game_priority: DEFAULT_GAME_PRIORITY,
             ollama_unit,
             eager_ollama,
             managed_units,
@@ -521,6 +586,11 @@ fn synthesize_units(
         vec![ManagedUnit {
             unit: ollama_unit.to_string(),
             eager_restart: eager_ollama,
+            // Legacy synthesized unit: the default tier, and no busy probe. It
+            // is a preemption target (a game evicts it) but never a source,
+            // which is exactly the pre-priorities behavior.
+            priority: DEFAULT_UNIT_PRIORITY,
+            busy_cmd: None,
             vram_match: Some("ollama".to_string()),
             kind: Some("ollama".to_string()),
             introspect_cmd: None,

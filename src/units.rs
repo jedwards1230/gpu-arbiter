@@ -450,6 +450,35 @@ pub async fn is_running(u: &ManagedUnit) -> Result<bool, UnitError> {
     Ok(out.status.success())
 }
 
+/// Whether `u` currently has work, via its configured `busy_cmd`. **Exit 0 =
+/// busy.**
+///
+/// This is what promotes a tenant from a preemption *target* to a preemption
+/// *source*: a busy unit demands the GPU at its own priority and evicts every
+/// strictly-lower tier. A unit with no `busy_cmd` is never busy — the right
+/// default, since a merely-running server holding an idle model should not be
+/// able to evict anything.
+///
+/// **Never errors, and every failure reads as "not busy."** A probe that cannot
+/// spawn, times out, or exits non-zero returns `false`. That direction is
+/// deliberate and is the opposite of [`is_running`]'s unsure-means-still-running
+/// default: a broken `is_running` that under-reports would skip a needed
+/// eviction, whereas a broken `busy_cmd` that over-reports would evict a lower
+/// tier on a false pretext. Each defaults toward the outcome that does less
+/// damage when the probe is wrong.
+pub async fn is_busy(u: &ManagedUnit) -> bool {
+    let Some(cmd) = u.busy_cmd.as_ref() else {
+        return false;
+    };
+    match run_argv("busy", &u.unit, &cmd.0, "").await {
+        Ok(out) => out.status.success(),
+        Err(e) => {
+            tracing::warn!(unit = %u.unit, error = %e, "busy probe failed; treating as not busy");
+            false
+        }
+    }
+}
+
 /// Best-effort list of loaded model/process names for a managed unit (for the
 /// `/status` `models[]` field).
 ///
@@ -1289,6 +1318,8 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         ManagedUnit {
             unit: name.to_string(),
             eager_restart: true,
+            priority: crate::config::DEFAULT_UNIT_PRIORITY,
+            busy_cmd: None,
             vram_match: None,
             kind: None,
             introspect_cmd: None,
@@ -1312,6 +1343,8 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         ManagedUnit {
             unit: name.to_string(),
             eager_restart: true,
+            priority: crate::config::DEFAULT_UNIT_PRIORITY,
+            busy_cmd: None,
             vram_match: None,
             kind: kind.map(str::to_string),
             introspect_cmd: introspect_cmd.map(str::to_string),
