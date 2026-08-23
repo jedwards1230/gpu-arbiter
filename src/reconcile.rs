@@ -11,7 +11,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::classify::{self, GpuGraphicsProc};
-use crate::config::Config;
+use crate::config::{Config, ManagedUnit};
 use crate::gpu::{self, GpuBackend};
 use crate::state::{
     ArbiterState, Claim, ManualActionError, ReconcileTrigger, State, UnitStatus, read_state,
@@ -451,6 +451,28 @@ pub async fn reconcile(
     let snap = observe(cfg, backend).await?;
     let claims = claim_set(&snap, cfg);
 
+    // Which tenants currently have work. A busy tenant demands the GPU at its
+    // own priority and preempts every strictly-lower tier; see
+    // [`effective_demand`] and [`preempted_units`]. Probed off-lock, like every
+    // other shell-out here. Units without a `busy_cmd` are never busy, so a
+    // config that uses no priorities does zero extra work per pass.
+    let mut busy: Vec<&ManagedUnit> = Vec::new();
+    for u in cfg.resolved_units() {
+        if units::is_busy(u).await {
+            busy.push(u);
+        }
+    }
+    let demand = effective_demand(&claims, cfg, &busy);
+    let preempted = preempted_units(cfg, demand);
+    if !preempted.is_empty() {
+        tracing::debug!(
+            demand = ?demand,
+            busy = busy.len(),
+            preempted = preempted.len(),
+            "priority ladder: units below the current demand will not run"
+        );
+    }
+
     // Brief lock: decide, record the fresh claim set, snapshot the current state
     // so we can pick an Ollama action without holding the lock.
     let (current, desired) = {
@@ -471,11 +493,23 @@ pub async fn reconcile(
     match unit_action(current, desired) {
         UnitAction::Evict => {
             // available → gaming: announce `evicting` first (brief lock) so remote
-            // machines back off, then tear every managed unit down (in order) with
+            // machines back off, then tear the preempted units down (in order) with
             // the lock DROPPED so `/status` stays responsive across the whole kill
             // window. Gaming wins unconditionally even if one unit errors.
+            //
+            // `preempted` is NOT the tenant-ladder-only set here, which is easy to
+            // misread. We are on the `available → gaming` edge, so `claims` is
+            // non-empty, so `effective_demand` returned at least
+            // `cfg.game_priority` — and `preempted_units` therefore selected every
+            // unit below that. With stock config (all units 50, game 100) that is
+            // literally every unit, identical to the pre-priorities behavior.
+            //
+            // A unit that survives here is one an operator deliberately placed at
+            // or above `game_priority`, which is a supported configuration, not a
+            // leak: see `a_tenant_above_game_priority_survives_a_game`. Passing
+            // `cfg.resolved_units()` instead would silently delete that ability.
             write_state(state).set_state(State::Evicting);
-            let any_eviction_failed = evict_all_units(state, cfg, backend).await;
+            let any_eviction_failed = evict_units(state, cfg, backend, &preempted).await;
             if any_eviction_failed {
                 // #6: visibility only — gaming still wins the GPU unconditionally
                 // below. A wedged tenant may still hold VRAM even though `state`
@@ -542,8 +576,46 @@ pub async fn reconcile(
     // excluded (see [`ArbiterState::held`]) — without this, the very next pass
     // (even this same one, since ensure-running always runs after the state
     // transition above) would immediately undo the operator's stop.
+    // ── Tenant preemption (the priority ladder, no game involved) ────────────
+    //
+    // The `Evict` arm above already handled the gaming edge. This covers the
+    // other source of demand: a busy higher-tier tenant preempting a lower one
+    // while `state` stays `available`.
+    //
+    // `state` deliberately does NOT become `gaming` or `evicting` here. Those
+    // words are earmark's wire contract for "a game owns the GPU, back off
+    // entirely" — reporting them because the LLM is busy would tell earmark the
+    // box is unavailable for AI work at exactly the moment it is doing AI work.
+    // Inter-tenant preemption is visible through `units[].running`, which is the
+    // honest place for it.
+    //
+    // Skipped while gaming/evicting: the transition arm above owns the units in
+    // that window, and re-entering eviction here would race it.
+    if desired == State::Available && !preempted.is_empty() {
+        let still_up: Vec<&ManagedUnit> = {
+            let mut v = Vec::new();
+            for u in &preempted {
+                // Only evict what is actually up — `evict` already reports
+                // AlreadyClear for a stopped unit, but skipping avoids a
+                // shell-out per already-stopped tenant on every 2 s pass.
+                if units::is_running(u).await.unwrap_or(true) {
+                    v.push(*u);
+                }
+            }
+            v
+        };
+        if !still_up.is_empty() {
+            tracing::info!(
+                demand = ?demand,
+                units = still_up.len(),
+                "preempting lower-priority tenants for a busy higher tier"
+            );
+            let _ = evict_units(state, cfg, backend, &still_up).await;
+        }
+    }
+
     let held = { read_state(state).held.clone() };
-    let eager_targets = ensure_running_targets(desired, cfg, &held);
+    let eager_targets = ensure_running_targets(desired, cfg, &held, &preempted);
     if !eager_targets.is_empty() {
         // Only units NOT already running are actual start candidates
         // (idempotence — an already-running unit is left alone). Tristate
@@ -620,13 +692,14 @@ pub async fn reconcile(
 /// acquisition per unit, interleaved with the (already sequential, already
 /// slow) per-unit `units::evict` shell-outs, so it adds no new contention
 /// pattern over what this loop already had.
-async fn evict_all_units(
+async fn evict_units(
     state: &Arc<RwLock<ArbiterState>>,
     cfg: &Config,
     backend: GpuBackend,
+    targets: &[&ManagedUnit],
 ) -> bool {
     let mut any_failed = false;
-    for u in cfg.resolved_units() {
+    for u in targets {
         let result = units::evict(u, cfg, backend).await;
         if let Some(outcome) = units::eviction_metric_outcome(&result) {
             write_state(state).metrics.record_eviction(&u.unit, outcome);
@@ -658,13 +731,75 @@ fn ensure_running_targets<'c>(
     desired: State,
     cfg: &'c Config,
     held: &std::collections::HashSet<String>,
-) -> Vec<&'c crate::config::ManagedUnit> {
+    preempted: &[&ManagedUnit],
+) -> Vec<&'c ManagedUnit> {
     if desired != State::Available {
         return Vec::new();
     }
     cfg.resolved_units()
         .iter()
-        .filter(|u| u.eager_restart && !held.contains(&u.unit))
+        .filter(|u| {
+            u.eager_restart
+                && !held.contains(&u.unit)
+                // A unit a higher tier is currently preempting must not be
+                // restarted, or this post-step would immediately undo the
+                // tenant preemption the same pass performed. This is the
+                // priority-ladder analogue of the `held` exclusion above, and of
+                // the `desired == Available` game gate: three different reasons a
+                // unit is deliberately down, all of which this step must respect.
+                && !preempted.iter().any(|p| p.unit == u.unit)
+        })
+        .collect()
+}
+
+/// The highest priority currently demanding the GPU. Pure — unit-tested.
+///
+/// Two kinds of demand, and they are deliberately asymmetric:
+///
+/// - a detected **game** demands at [`Config::game_priority`]. Any claim is
+///   enough; games are not managed units and the arbiter never starts or stops
+///   them.
+/// - a **busy tenant** demands at its own [`ManagedUnit::priority`]. `busy`
+///   carries the units whose `busy_cmd` exited 0 this pass.
+///
+/// `None` means nothing is demanding the GPU, which is distinct from "demanding
+/// at priority 0" — with `Some(0)`, a unit at priority 0 would still be
+/// compared against, and the strict `<` in [`preempted_units`] happens to make
+/// those equivalent today. Keeping them distinct means a future change to that
+/// comparison cannot silently start evicting things when the machine is idle.
+#[must_use]
+pub fn effective_demand(claims: &[Claim], cfg: &Config, busy: &[&ManagedUnit]) -> Option<u8> {
+    let game = (!claims.is_empty()).then_some(cfg.game_priority);
+    let tenant = busy.iter().map(|u| u.priority).max();
+    match (game, tenant) {
+        (Some(g), Some(t)) => Some(g.max(t)),
+        (Some(g), None) => Some(g),
+        (None, t) => t,
+    }
+}
+
+/// Units that must not be running, given the current [`effective_demand`].
+/// Pure — unit-tested.
+///
+/// **Strictly** lower priority is preempted; equal priority coexists. That
+/// strictness carries three properties worth stating, because each would be a
+/// bug if it flipped:
+///
+/// 1. A busy unit never preempts **itself** (its priority is not `<` its own).
+/// 2. Two units at the same tier never fight — neither evicts the other, so
+///    they share the GPU or contend for VRAM on their own terms.
+/// 3. A config that sets no priorities at all leaves every unit equal, so no
+///    tenant preempts any other and behavior is exactly what it was before
+///    priorities existed. A game still evicts them all, because
+///    [`Config::game_priority`] defaults above the unit default.
+#[must_use]
+pub fn preempted_units(cfg: &Config, demand: Option<u8>) -> Vec<&ManagedUnit> {
+    let Some(demand) = demand else {
+        return Vec::new();
+    };
+    cfg.resolved_units()
+        .iter()
+        .filter(|u| u.priority < demand)
         .collect()
 }
 
@@ -1756,6 +1891,252 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
+    // ── priority ladder ─────────────────────────────────────────────────────
+
+    /// The desktop-2 ladder: gaming > comfyui > llm > asr.
+    fn ladder_cfg() -> Config {
+        Config::from_toml(&crate::testutil::portable_toml(
+            r#"
+            game_priority = 100
+
+            [[managed_units]]
+            unit = "comfyui"
+            priority = 75
+
+            [[managed_units]]
+            unit = "ollama"
+            priority = 50
+
+            [[managed_units]]
+            unit = "earmark-asr"
+            priority = 25
+            "#,
+        ))
+        .unwrap()
+    }
+
+    fn unit_named<'c>(cfg: &'c Config, name: &str) -> &'c ManagedUnit {
+        cfg.resolved_units()
+            .iter()
+            .find(|u| u.unit == name)
+            .expect("unit in fixture")
+    }
+
+    fn preempted_names(cfg: &Config, demand: Option<u8>) -> Vec<String> {
+        let mut v: Vec<String> = preempted_units(cfg, demand)
+            .iter()
+            .map(|u| u.unit.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn idle_machine_preempts_nothing() {
+        let cfg = ladder_cfg();
+        assert_eq!(effective_demand(&[], &cfg, &[]), None);
+        assert!(preempted_units(&cfg, None).is_empty());
+    }
+
+    #[test]
+    fn a_game_preempts_every_tenant() {
+        // game_priority (100) is above all three tiers, so nothing survives.
+        let cfg = ladder_cfg();
+        let claims = vec![Claim::Steam("413150".to_string())];
+        let demand = effective_demand(&claims, &cfg, &[]);
+        assert_eq!(demand, Some(100));
+        assert_eq!(
+            preempted_names(&cfg, demand),
+            vec!["comfyui", "earmark-asr", "ollama"]
+        );
+    }
+
+    #[test]
+    fn a_game_evicts_every_unit_under_stock_config() {
+        // Guards the exact misreading a reviewer raised on this change: at the
+        // `available -> gaming` edge the code passes `preempted`, not
+        // `cfg.resolved_units()`, which *looks* like it could leave tenants
+        // running during a game.
+        //
+        // It cannot under any config that does not opt in. A game claim forces
+        // demand to at least `game_priority`, and every unit defaults below that,
+        // so the preempted set is the complete unit list. This pins that for the
+        // stock default (nothing sets a priority at all) rather than only for the
+        // explicit ladder fixture.
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
+            r#"
+            [[managed_units]]
+            unit = "a"
+
+            [[managed_units]]
+            unit = "b"
+
+            [[managed_units]]
+            unit = "c"
+            "#,
+        ))
+        .unwrap();
+        let claims = vec![Claim::Steam("413150".to_string())];
+        let demand = effective_demand(&claims, &cfg, &[]);
+        assert_eq!(
+            preempted_units(&cfg, demand).len(),
+            cfg.resolved_units().len(),
+            "a game must evict every unit when no unit opts above game_priority"
+        );
+    }
+
+    #[test]
+    fn a_busy_middle_tier_preempts_only_below_it() {
+        // The case the whole feature exists for: ollama (50) busy evicts
+        // earmark-asr (25) and leaves comfyui (75) alone.
+        let cfg = ladder_cfg();
+        let ollama = unit_named(&cfg, "ollama");
+        let demand = effective_demand(&[], &cfg, &[ollama]);
+        assert_eq!(demand, Some(50));
+        assert_eq!(preempted_names(&cfg, demand), vec!["earmark-asr"]);
+    }
+
+    #[test]
+    fn a_busy_unit_never_preempts_itself() {
+        // Strict `<`, so a unit is never in its own preempted set — otherwise a
+        // busy tenant would evict itself the moment it started doing work.
+        let cfg = ladder_cfg();
+        for name in ["comfyui", "ollama", "earmark-asr"] {
+            let u = unit_named(&cfg, name);
+            let demand = effective_demand(&[], &cfg, &[u]);
+            assert!(
+                !preempted_names(&cfg, demand).contains(&name.to_string()),
+                "{name} preempted itself"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_priorities_coexist() {
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
+            r#"
+            [[managed_units]]
+            unit = "a"
+            priority = 50
+
+            [[managed_units]]
+            unit = "b"
+            priority = 50
+            "#,
+        ))
+        .unwrap();
+        let a = unit_named(&cfg, "a");
+        let demand = effective_demand(&[], &cfg, &[a]);
+        assert_eq!(demand, Some(50));
+        // Neither evicts the other — same tier.
+        assert!(preempted_units(&cfg, demand).is_empty());
+    }
+
+    #[test]
+    fn a_game_outranks_a_busy_tenant() {
+        // Both demands present: the higher one governs, so a busy top tenant
+        // does not shield the lower tiers from a game.
+        let cfg = ladder_cfg();
+        let comfy = unit_named(&cfg, "comfyui");
+        let claims = vec![Claim::Steam("413150".to_string())];
+        let demand = effective_demand(&claims, &cfg, &[comfy]);
+        assert_eq!(demand, Some(100));
+        assert_eq!(
+            preempted_names(&cfg, demand),
+            vec!["comfyui", "earmark-asr", "ollama"]
+        );
+    }
+
+    #[test]
+    fn a_tenant_above_game_priority_survives_a_game() {
+        // Deliberately supported: lowering game_priority below a tenant's lets
+        // that tenant outrank gaming. Unusual, but it should be expressible and
+        // should behave predictably rather than being silently clamped.
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
+            r#"
+            game_priority = 10
+
+            [[managed_units]]
+            unit = "critical"
+            priority = 90
+
+            [[managed_units]]
+            unit = "expendable"
+            priority = 5
+            "#,
+        ))
+        .unwrap();
+        let claims = vec![Claim::Steam("1".to_string())];
+        let demand = effective_demand(&claims, &cfg, &[]);
+        assert_eq!(demand, Some(10));
+        assert_eq!(preempted_names(&cfg, demand), vec!["expendable"]);
+    }
+
+    #[test]
+    fn config_without_priorities_behaves_exactly_as_before() {
+        // The back-compat guarantee. Every unit lands on the same default tier,
+        // so no tenant preempts another however busy it is...
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama.service"
+
+            [[managed_units]]
+            unit = "asr-runner.service"
+            "#,
+        ))
+        .unwrap();
+        let ollama = unit_named(&cfg, "ollama.service");
+        let demand = effective_demand(&[], &cfg, &[ollama]);
+        assert!(
+            preempted_units(&cfg, demand).is_empty(),
+            "an un-prioritized config must not gain tenant preemption"
+        );
+        // ...and a game still evicts them all, because game_priority defaults
+        // above the unit default.
+        let claims = vec![Claim::Steam("1".to_string())];
+        let game_demand = effective_demand(&claims, &cfg, &[]);
+        assert_eq!(preempted_units(&cfg, game_demand).len(), 2);
+    }
+
+    #[test]
+    fn ensure_running_does_not_restart_a_preempted_unit() {
+        // Without this the ensure-running post-step would immediately undo the
+        // tenant preemption performed earlier in the same pass.
+        let cfg = ladder_cfg();
+        let no_holds = std::collections::HashSet::new();
+        let ollama = unit_named(&cfg, "ollama");
+        let demand = effective_demand(&[], &cfg, &[ollama]);
+        let preempted = preempted_units(&cfg, demand);
+
+        let targets = ensure_running_targets(State::Available, &cfg, &no_holds, &preempted);
+        let names: Vec<&str> = targets.iter().map(|u| u.unit.as_str()).collect();
+        assert!(
+            !names.contains(&"earmark-asr"),
+            "preempted unit was queued for restart: {names:?}"
+        );
+        // The tiers at or above the demand are still eligible.
+        assert!(names.contains(&"comfyui"));
+        assert!(names.contains(&"ollama"));
+    }
+
+    #[test]
+    fn priority_and_busy_cmd_default_when_absent_from_toml() {
+        // Back-compat at the parse layer: a config written before priorities
+        // existed must load, with every unit on one tier and no busy probe.
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "ollama.service"
+            "#,
+        )
+        .unwrap();
+        let u = unit_named(&cfg, "ollama.service");
+        assert_eq!(u.priority, crate::config::DEFAULT_UNIT_PRIORITY);
+        assert!(u.busy_cmd.is_none());
+        assert_eq!(cfg.game_priority, crate::config::DEFAULT_GAME_PRIORITY);
+    }
+
     #[test]
     fn ensure_running_targets_available_returns_eager_units() {
         // The GPU-free path: an eager unit is eligible when desired == Available.
@@ -1768,7 +2149,7 @@ mod tests {
         ))
         .unwrap();
         let no_holds = std::collections::HashSet::new();
-        let targets = ensure_running_targets(State::Available, &cfg, &no_holds);
+        let targets = ensure_running_targets(State::Available, &cfg, &no_holds, &[]);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].unit, "ollama.service");
     }
@@ -1792,8 +2173,8 @@ mod tests {
         ))
         .unwrap();
         let no_holds = std::collections::HashSet::new();
-        assert!(ensure_running_targets(State::Gaming, &cfg, &no_holds).is_empty());
-        assert!(ensure_running_targets(State::Evicting, &cfg, &no_holds).is_empty());
+        assert!(ensure_running_targets(State::Gaming, &cfg, &no_holds, &[]).is_empty());
+        assert!(ensure_running_targets(State::Evicting, &cfg, &no_holds, &[]).is_empty());
     }
 
     #[test]
@@ -1813,7 +2194,7 @@ mod tests {
         ))
         .unwrap();
         let no_holds = std::collections::HashSet::new();
-        let targets = ensure_running_targets(State::Available, &cfg, &no_holds);
+        let targets = ensure_running_targets(State::Available, &cfg, &no_holds, &[]);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].unit, "eager.service");
     }
@@ -1836,7 +2217,7 @@ mod tests {
         .unwrap();
         let mut held = std::collections::HashSet::new();
         held.insert("held.service".to_string());
-        let targets = ensure_running_targets(State::Available, &cfg, &held);
+        let targets = ensure_running_targets(State::Available, &cfg, &held, &[]);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].unit, "free.service");
     }
@@ -1855,7 +2236,7 @@ mod tests {
     // ── wedged-eviction visibility (#6) ─────────────────────────────────────
 
     #[tokio::test]
-    async fn evict_all_units_false_when_every_eviction_succeeds() {
+    async fn evict_units_false_when_every_eviction_succeeds() {
         // is_active_cmd = false → already-clear, no failure.
         let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
@@ -1867,13 +2248,21 @@ mod tests {
         ))
         .unwrap();
         let state = shared(ArbiterState::new());
-        assert!(!evict_all_units(&state, &cfg, GpuBackend::default()).await);
+        assert!(
+            !evict_units(
+                &state,
+                &cfg,
+                GpuBackend::default(),
+                &cfg.resolved_units().iter().collect::<Vec<_>>()
+            )
+            .await
+        );
         // AlreadyClear isn't a real eviction (#14) — nothing recorded.
         assert!(read_state(&state).metrics.evictions.is_empty());
     }
 
     #[tokio::test]
-    async fn evict_all_units_true_when_any_eviction_fails() {
+    async fn evict_units_true_when_any_eviction_fails() {
         // is_active_cmd = true (so evict() actually runs stop_cmd), stop_cmd
         // exits non-zero → a real eviction failure.
         let cfg = Config::from_toml(&crate::testutil::portable_toml(
@@ -1886,7 +2275,15 @@ mod tests {
         ))
         .unwrap();
         let state = shared(ArbiterState::new());
-        assert!(evict_all_units(&state, &cfg, GpuBackend::default()).await);
+        assert!(
+            evict_units(
+                &state,
+                &cfg,
+                GpuBackend::default(),
+                &cfg.resolved_units().iter().collect::<Vec<_>>()
+            )
+            .await
+        );
         // #14: the failure is counted under the "error" bucket for that unit.
         assert_eq!(
             read_state(&state).metrics.evictions["fake.service"].error,
