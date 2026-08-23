@@ -182,15 +182,112 @@ fn scan_proc() -> Result<Vec<ProcInfo>, ReconcileError> {
     Ok(out)
 }
 
-/// Non-Linux stub: there is no `/proc`. Returns an empty snapshot so the crate
-/// compiles and the reconcile loop is exercisable in tests on macOS.
+/// Windows process scan — the `/proc`-walk equivalent, via `sysinfo`.
+///
+/// This is the function whose absence made the old non-Linux stub dangerous: an
+/// empty snapshot yields an empty claim set, which resolves to `available`
+/// forever, so the daemon would never evict *and* would restart managed units
+/// straight into a live game. Nothing may enable the Windows daemon without it.
+///
+/// Mirrors the Linux scanner's contract exactly:
+/// - the cmdline is flattened with the same space-join, so a `game_patterns`
+///   entry means the same thing on both platforms;
+/// - an empty cmdline is skipped (it cannot match any rule);
+/// - mid-scan exits are benign — reconcile is level-triggered, so a pid that
+///   vanishes simply contributes nothing and truth is re-derived next pass.
+///
+/// Two Windows-specific notes. `Process::cmd()` is legitimately **empty for a
+/// process whose command line we may not read** (a protected/system process),
+/// which is not the same as "has no arguments" — falling back to `exe()` keeps
+/// such processes visible by path, which is what `game_patterns` matches on
+/// anyway. And pids are `u32` here against `i32` on Linux; the conversion
+/// saturates rather than wrapping, because a pid that does not fit is one we
+/// could not act on regardless and must never silently alias a different
+/// process.
+#[cfg(target_os = "windows")]
+fn scan_processes() -> Vec<ProcInfo> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+
+    // Refresh only what is read: the command line and the image path. This runs
+    // on the reconcile interval (2 s on Windows), so a full refresh — CPU,
+    // memory, disk I/O per process — would be pure waste every pass.
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(
+            ProcessRefreshKind::nothing()
+                .with_cmd(UpdateKind::Always)
+                .with_exe(UpdateKind::Always),
+        ),
+    );
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    let mut out = Vec::new();
+    for (pid, proc_) in sys.processes() {
+        let joined = proc_
+            .cmd()
+            .iter()
+            .map(|a| a.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let cmdline = if joined.trim().is_empty() {
+            proc_
+                .exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            joined
+        };
+        if cmdline.trim().is_empty() {
+            continue;
+        }
+        out.push(ProcInfo {
+            pid: i32::try_from(pid.as_u32()).unwrap_or(i32::MAX),
+            cmdline,
+        });
+    }
+    out
+}
+
+/// Windows observation pass: enumerate processes via [`scan_processes`].
 ///
 /// # Errors
 ///
-/// Never errors — kept `Result`-returning to match the Linux signature above.
+/// Returns [`ReconcileError`] only if the blocking scan task panics or is
+/// cancelled.
+#[cfg(target_os = "windows")]
+pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
+    // Blocking enumeration off the runtime threads, exactly as the Linux path
+    // does for its `/proc` walk — `refresh_processes` is a synchronous syscall
+    // storm, not something to run on an executor thread.
+    let procs = tokio::task::spawn_blocking(scan_processes).await?;
+
+    // The VRAM heuristic cannot work under WDDM: per-process `used_memory` is
+    // reported as `[N/A]` for every process, unconditionally (measured on
+    // desktop-2, driver 610.88 — including the game itself and llama-server).
+    // Skip the query rather than spend a subprocess per pass on a structurally
+    // unusable result. `cgroup::attribute_units` is likewise a Linux concept.
+    let _ = (cfg, backend);
+
+    Ok(ProcSnapshot {
+        procs,
+        gpu_graphics: Vec::new(),
+    })
+}
+
+/// Stub for platforms that are neither Linux nor Windows (the macOS dev host):
+/// no `/proc`, and `sysinfo` is not a dependency there. Returns an empty
+/// snapshot so the crate compiles and the reconcile loop stays exercisable in
+/// tests.
+///
+/// **Safe only because the daemon refuses to run on such a platform** — an empty
+/// snapshot means "no claims", which reads as `available`. See
+/// [`scan_processes`] for why that is dangerous if the daemon ever does run.
+///
+/// # Errors
+///
+/// Never errors — kept `Result`-returning to match the signatures above.
 // Kept `async` (despite no `.await`) so call sites stay identical across
 // platforms — the Linux impl above genuinely awaits `spawn_blocking`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[allow(clippy::unused_async)]
 pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
     Ok(ProcSnapshot::default())
@@ -807,6 +904,7 @@ mod tests {
         cfg.game_patterns.push(GamePattern {
             name: "heroic".into(),
             match_substr: "Heroic".into(),
+            exclude: Vec::new(),
         });
         let snap = ProcSnapshot {
             procs: vec![

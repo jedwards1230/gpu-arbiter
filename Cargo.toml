@@ -114,6 +114,20 @@ evdev = { version = "0.13", features = ["tokio"] }
 inotify = { version = "0.11", default-features = false, features = ["stream"] }
 tokio-stream = "0.1"
 
+# Windows process enumeration — the `/proc`-walk equivalent backing
+# `reconcile::observe`. Without it the non-Linux `observe` returns an empty
+# snapshot, which means an empty claim set, which resolves to `available`
+# forever: the daemon would never evict, and would restart managed units
+# straight into a live game. That stub is only safe while the daemon refuses to
+# run, which is exactly what this phase changes.
+#
+# `default-features = false` with only `system`: the default set also pulls
+# component (WMI/COM), disk, network, and user, none of which this crate touches.
+# `system` alone exposes the process list, and it is the only Win32 surface worth
+# linking into a service binary that runs as LocalSystem.
+[target.'cfg(target_os = "windows")'.dependencies]
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
 # The `release` profile is what actually ships (the static musl binary built by
 # rust.yml / release.yml) — optimize it for a small, standalone daemon binary
 # over incremental-rebuild speed:

@@ -36,6 +36,29 @@ pub struct GamePattern {
     /// Substring matched against a process cmdline.
     #[serde(rename = "match")]
     pub match_substr: String,
+    /// Substrings that **veto** a match: if any appears in the cmdline, this
+    /// pattern does not claim, even though `match_substr` was found. Empty by
+    /// default, so every pre-existing config behaves exactly as before.
+    ///
+    /// This exists because a location-based `match` cannot distinguish a game
+    /// from the launcher's own machinery living in the same directory tree.
+    /// Measured on desktop-2 (2026-08-22): launching a Steam title first spawns
+    /// the redistributable stage, and all three of these contain
+    /// `steamapps\common` while none is a game —
+    ///
+    /// ```text
+    /// SteamService.exe /installscript "...\steamapps\common\Steamworks Shared\runasadmin.vdf" 413150
+    /// cmd.exe /c ""...\steamapps\common\Steamworks Shared\_CommonRedist\DotNet\4.0\...cmd" "
+    /// dotNetFx40_Full_x86_x64.exe   (under ...\steamapps\common\Steamworks Shared\_CommonRedist\...)
+    /// ```
+    ///
+    /// That stage runs on first launch after any game or Steam update, so
+    /// without a veto the arbiter would evict its tenants for a .NET installer
+    /// as a matter of routine. A parent-image check does not substitute:
+    /// `SteamService.exe` runs as a Windows service, so its parent is not
+    /// `steam.exe`.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// serde default for [`ManagedUnit::eager_restart`] — defaults to eager warm-up.
