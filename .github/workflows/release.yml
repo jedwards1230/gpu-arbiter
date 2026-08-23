@@ -223,13 +223,9 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Windows client build. The daemon half does not run on Windows yet (main.rs
-  # still exits 1 there), but the CLI half — `status`, `wait`, `watch`,
-  # `--check-config` — resolves and exits before that stub, which is exactly
-  # what earmark's optional CLI-delegation contract needs on a Windows GPU host.
-  # Shipping the .exe now means the Ansible role has a pinned, checksummed
-  # artifact to fetch when the daemon port lands, instead of the role and the
-  # binary needing to arrive in the same change.
+  # Windows build — the full daemon since #50, not just the CLI client. Same
+  # binary serves both: `status`/`wait`/`watch`/`--check-config` for a remote
+  # daemon, and the daemon itself when run with no subcommand.
   build_windows:
     name: Build Windows binary
     needs: [detect, prepare]
@@ -360,9 +356,9 @@ jobs:
             echo '```'
             echo ""
             echo ""
-            echo "### Windows (client only)"
+            echo "### Windows"
             echo ""
-            echo "\`gpu-arbiter-x86_64-pc-windows-msvc.exe\` provides the **CLI client** — \`status\`, \`wait\`, \`watch\`, \`--check-config\` — against a daemon running elsewhere. The daemon itself does not run on Windows yet."
+            echo "\`gpu-arbiter-x86_64-pc-windows-msvc.exe\` runs the **full daemon** on Windows 11 — game detection, eviction, and the \`/status\` surface — as well as the CLI client (\`status\`, \`wait\`, \`watch\`, \`--check-config\`) against a daemon anywhere. Eviction gates on service state rather than VRAM, because per-process VRAM is unavailable under WDDM."
             echo ""
             echo '```yaml'
             echo "gpu_arbiter_windows_binary_sha256: ${sha_w}"
