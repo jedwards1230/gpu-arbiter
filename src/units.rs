@@ -1436,7 +1436,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             stop_cmd = ["true"]
             is_active_cmd = "true"
             "#,
-            marker = marker.display(),
+            marker = crate::testutil::toml_path(&marker),
         )))
         .unwrap();
         start_by_name(&cfg, "fake.service").await.unwrap();
@@ -1525,7 +1525,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             stop_cmd = ["true"]
             is_active_cmd = ["{script}"]
             "#,
-            script = script.display(),
+            script = crate::testutil::toml_path(&script),
         )))
         .unwrap();
 

@@ -580,7 +580,16 @@ mod tests {
             c.bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         );
-        assert_eq!(c.socket_path, "/run/gpu-arbiter/gpu-arbiter.sock");
+        // Platform-split: Windows has no unix-socket listener at all
+        // (`http::bind_uds`/`serve_uds_on` are `#[cfg(unix)]` with no Windows
+        // counterpart), so its default is the empty string, which disables the
+        // listener. A `/run/...` default there would name a socket that can
+        // never be bound.
+        if cfg!(windows) {
+            assert_eq!(c.socket_path, "");
+        } else {
+            assert_eq!(c.socket_path, "/run/gpu-arbiter/gpu-arbiter.sock");
+        }
     }
 
     #[test]

@@ -95,8 +95,33 @@ pub(crate) mod testutil {
                 .replace(r#"["false"]"#, r#"["cmd", "/c", "exit 1"]"#)
                 .replace(r#"= "true""#, r#"= "cmd /c exit 0""#)
                 .replace(r#"= "false""#, r#"= "cmd /c exit 1""#)
+                // `touch` is likewise coreutils-only. The fixtures use it as
+                // "create this marker file so the test can prove start_cmd
+                // ran". Replacing the opening of the argv array leaves the
+                // interpolated path and closing `"]` intact, so
+                // `["touch", "<path>"]` becomes
+                // `["cmd", "/c", "type nul > <path>"]` — cmd treats everything
+                // after `/c` as one command string, so the redirect is parsed.
+                .replace(r#"["touch", ""#, r#"["cmd", "/c", "type nul > "#)
         } else {
             toml.to_string()
         }
+    }
+
+    /// Render a filesystem path for embedding in a **TOML basic string**
+    /// (the `"..."` form).
+    ///
+    /// Windows temp paths contain backslashes, and a backslash starts an escape
+    /// sequence in a TOML basic string — so a raw `C:\Users\runneradmin\...`
+    /// makes the whole fixture fail to parse (`\U` is not a valid escape), and
+    /// the test panics at its `.unwrap()` on `Config::from_toml` rather than
+    /// anywhere near the behavior under test. That is exactly how this
+    /// presented in CI: sixteen unrelated-looking reconcile tests all panicking
+    /// on the same line.
+    ///
+    /// Doubling the backslashes is the fix; on Unix this is the identity
+    /// transform, since POSIX paths contain none.
+    pub(crate) fn toml_path(p: &std::path::Path) -> String {
+        p.display().to_string().replace('\\', r"\\")
     }
 }

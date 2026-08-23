@@ -1013,7 +1013,7 @@ mod tests {
             stop_cmd = ["touch", "{marker}"]
             is_active_cmd = "true"
             "#,
-            marker = marker.display(),
+            marker = crate::testutil::toml_path(&marker),
         )))
         .unwrap();
         let state = shared(ArbiterState::new());
@@ -1078,7 +1078,7 @@ mod tests {
             stop_cmd = ["touch", "{marker}"]
             is_active_cmd = "true"
             "#,
-            marker = marker.display(),
+            marker = crate::testutil::toml_path(&marker),
         )))
         .unwrap();
         let state = shared(ArbiterState::new());
@@ -1474,7 +1474,7 @@ mod tests {
             stop_cmd = ["true"]
             is_active_cmd = "{active}"
             "#,
-            marker = marker.display(),
+            marker = crate::testutil::toml_path(marker),
         )))
         .unwrap()
     }
@@ -1577,7 +1577,7 @@ mod tests {
             stop_cmd = ["true"]
             is_active_cmd = "/nonexistent/gpu-arbiter-noexist"
             "#,
-            marker = marker.display(),
+            marker = crate::testutil::toml_path(&marker),
         )))
         .unwrap();
         let mut s = ArbiterState::new();
