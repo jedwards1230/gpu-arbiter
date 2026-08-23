@@ -859,7 +859,7 @@ mod tests {
         // host the systemctl/nvidia-smi shell-outs fail-soft (running=false,
         // vram=None), but reconcile must still produce one ordered UnitStatus per
         // managed unit — the generalization away from the single Ollama block.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "ollama.service"
@@ -869,7 +869,7 @@ mod tests {
             unit = "vllm.service"
             vram_match = "vllm"
             "#,
-        )
+        ))
         .unwrap();
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
@@ -899,7 +899,7 @@ mod tests {
         // post-step's own is_running confirmation loop from also querying these
         // slow units and confounding the timing assertion below — this test is
         // isolated to refresh_substate's concurrency, not ensure-running's.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "slow0.service"
@@ -916,7 +916,7 @@ mod tests {
             eager_restart = false
             is_active_cmd = ["sleep", "1"]
             "#,
-        )
+        ))
         .unwrap();
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
@@ -1004,7 +1004,7 @@ mod tests {
         // already-clear fast path); stop_cmd here just touches a marker so the
         // test can observe it ran.
         let marker = marker_path("manual-stop");
-        let cfg = Config::from_toml(&format!(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             eviction_timeout_s = 0
             [[managed_units]]
@@ -1014,7 +1014,7 @@ mod tests {
             is_active_cmd = "true"
             "#,
             marker = marker.display(),
-        ))
+        )))
         .unwrap();
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
@@ -1069,7 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn manual_stop_records_eviction_metric() {
         let marker = marker_path("metrics-manual-stop");
-        let cfg = Config::from_toml(&format!(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             eviction_timeout_s = 0
             [[managed_units]]
@@ -1079,7 +1079,7 @@ mod tests {
             is_active_cmd = "true"
             "#,
             marker = marker.display(),
-        ))
+        )))
         .unwrap();
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
@@ -1465,7 +1465,7 @@ mod tests {
     /// observable. `is_active_cmd` is `true` (running) or `false` (stopped).
     fn ensure_cfg(running: bool, marker: &std::path::Path, eager: bool) -> Config {
         let active = if running { "true" } else { "false" };
-        Config::from_toml(&format!(
+        Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             [[managed_units]]
             unit = "fake.service"
@@ -1475,7 +1475,7 @@ mod tests {
             is_active_cmd = "{active}"
             "#,
             marker = marker.display(),
-        ))
+        )))
         .unwrap()
     }
 
@@ -1568,7 +1568,7 @@ mod tests {
         // errors), `unwrap_or(false)` treats the unit as stopped and a start is
         // attempted. Exercises the error arm of `is_running(&u).await.unwrap_or(false)`.
         let marker = marker_path("isrun-err");
-        let cfg = Config::from_toml(&format!(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             [[managed_units]]
             unit = "fake.service"
@@ -1578,7 +1578,7 @@ mod tests {
             is_active_cmd = "/nonexistent/gpu-arbiter-noexist"
             "#,
             marker = marker.display(),
-        ))
+        )))
         .unwrap();
         let mut s = ArbiterState::new();
         s.state = State::Available;
@@ -1604,7 +1604,7 @@ mod tests {
     async fn ensure_running_continues_when_start_fails() {
         // A failing start_cmd is logged but must NOT fail the reconcile pass — the
         // daemon stays fault-tolerant (a wedged unit can't take down arbitration).
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "fake.service"
@@ -1613,7 +1613,7 @@ mod tests {
             stop_cmd = ["true"]
             is_active_cmd = "false"
             "#,
-        )
+        ))
         .unwrap();
         let mut s = ArbiterState::new();
         s.state = State::Available;
@@ -1661,13 +1661,13 @@ mod tests {
     #[test]
     fn ensure_running_targets_available_returns_eager_units() {
         // The GPU-free path: an eager unit is eligible when desired == Available.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "ollama.service"
             eager_restart = true
             "#,
-        )
+        ))
         .unwrap();
         let no_holds = std::collections::HashSet::new();
         let targets = ensure_running_targets(State::Available, &cfg, &no_holds);
@@ -1681,7 +1681,7 @@ mod tests {
         // both Gaming and the transient Evicting, so a managed GPU unit can never be
         // started into a live game — regardless of how many eager units are
         // configured.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "ollama.service"
@@ -1691,7 +1691,7 @@ mod tests {
             unit = "asr.service"
             eager_restart = true
             "#,
-        )
+        ))
         .unwrap();
         let no_holds = std::collections::HashSet::new();
         assert!(ensure_running_targets(State::Gaming, &cfg, &no_holds).is_empty());
@@ -1702,7 +1702,7 @@ mod tests {
     fn ensure_running_targets_excludes_non_eager_units() {
         // Only `eager_restart` units are auto-started; a non-eager unit is never in
         // the target set even when the GPU is free.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "eager.service"
@@ -1712,7 +1712,7 @@ mod tests {
             unit = "lazy.service"
             eager_restart = false
             "#,
-        )
+        ))
         .unwrap();
         let no_holds = std::collections::HashSet::new();
         let targets = ensure_running_targets(State::Available, &cfg, &no_holds);
@@ -1724,7 +1724,7 @@ mod tests {
     fn ensure_running_targets_excludes_held_units() {
         // #1: a manually-held unit is excluded from the eager target set even
         // though the GPU is free and the unit is otherwise eager_restart = true.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "held.service"
@@ -1734,7 +1734,7 @@ mod tests {
             unit = "free.service"
             eager_restart = true
             "#,
-        )
+        ))
         .unwrap();
         let mut held = std::collections::HashSet::new();
         held.insert("held.service".to_string());
@@ -1759,14 +1759,14 @@ mod tests {
     #[tokio::test]
     async fn evict_all_units_false_when_every_eviction_succeeds() {
         // is_active_cmd = false → already-clear, no failure.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "fake.service"
             stop_cmd = ["true"]
             is_active_cmd = "false"
             "#,
-        )
+        ))
         .unwrap();
         let state = shared(ArbiterState::new());
         assert!(!evict_all_units(&state, &cfg, GpuBackend::default()).await);
@@ -1778,14 +1778,14 @@ mod tests {
     async fn evict_all_units_true_when_any_eviction_fails() {
         // is_active_cmd = true (so evict() actually runs stop_cmd), stop_cmd
         // exits non-zero → a real eviction failure.
-        let cfg = Config::from_toml(
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
             [[managed_units]]
             unit = "fake.service"
             stop_cmd = ["false"]
             is_active_cmd = "true"
             "#,
-        )
+        ))
         .unwrap();
         let state = shared(ArbiterState::new());
         assert!(evict_all_units(&state, &cfg, GpuBackend::default()).await);

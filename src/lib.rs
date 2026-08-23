@@ -68,3 +68,35 @@ pub mod presence;
 // way a process-name substring match can. The parser is pure & cross-platform;
 // the /proc reads are Linux-gated with a non-Linux stub.
 pub mod cgroup;
+
+/// Test-only helpers shared across the module test suites.
+#[cfg(test)]
+pub(crate) mod testutil {
+    /// Rewrite the POSIX `true`/`false` test binaries in a TOML fixture into
+    /// platform equivalents.
+    ///
+    /// The unit-supervisor tests drive `start_cmd`/`stop_cmd`/`is_active_cmd`
+    /// with `true` and `false` purely as "a program that exits 0" and "a program
+    /// that exits non-zero". Those are POSIX coreutils binaries and **do not
+    /// exist on Windows**, so every such test failed to spawn there — which a
+    /// Linux-only CI matrix could never reveal.
+    ///
+    /// Rewriting the fixture, rather than `#[cfg(unix)]`-gating the tests, keeps
+    /// the coverage where it matters most: the command-driven supervisor path is
+    /// exactly how the Windows daemon will drive Ollama via `sc.exe`, so these
+    /// assertions are *more* load-bearing on Windows than on Linux, not less.
+    ///
+    /// Only quoted forms are rewritten, so a bare TOML boolean
+    /// (`detect_steam = true`) is untouched — it has no surrounding quotes to
+    /// match.
+    pub(crate) fn portable_toml(toml: &str) -> String {
+        if cfg!(windows) {
+            toml.replace(r#"["true"]"#, r#"["cmd", "/c", "exit 0"]"#)
+                .replace(r#"["false"]"#, r#"["cmd", "/c", "exit 1"]"#)
+                .replace(r#"= "true""#, r#"= "cmd /c exit 0""#)
+                .replace(r#"= "false""#, r#"= "cmd /c exit 1""#)
+        } else {
+            toml.to_string()
+        }
+    }
+}
