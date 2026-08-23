@@ -347,6 +347,82 @@ pub struct Metrics {
     pub unit_restarts: std::collections::HashMap<String, u64>,
     /// Reconcile passes run, bucketed by [`PassTrigger`].
     pub reconcile_passes: ReconcilePassCounts,
+    /// How long evictions actually take, per unit per stage — the data the
+    /// `yield_timeout_s` / `eviction_timeout_s` values should be set from
+    /// instead of guessed.
+    pub eviction_durations: std::collections::HashMap<(String, EvictionStage), DurationHistogram>,
+}
+
+/// Which half of a two-stage eviction a duration sample belongs to — the
+/// `{stage=...}` label on `gpu_arbiter_eviction_duration_seconds`.
+///
+/// Kept separate rather than summed because the two tune *different* knobs, and
+/// a combined number would hide the thing you most want to know: whether the
+/// cooperative stage is paying for itself or just adding latency before the stop
+/// that was always going to happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EvictionStage {
+    /// Cooperative release: `yield_cmd` sent → tenant reports not busy. Tunes
+    /// `yield_timeout_s`.
+    Yield,
+    /// The stop path: `stop_cmd` → freed (or SIGKILL). Tunes
+    /// `eviction_timeout_s`.
+    Stop,
+    /// The whole eviction, end to end — what a game actually waits through.
+    Total,
+}
+
+impl EvictionStage {
+    /// The Prometheus label value.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            EvictionStage::Yield => "yield",
+            EvictionStage::Stop => "stop",
+            EvictionStage::Total => "total",
+        }
+    }
+}
+
+/// Upper bounds (seconds) for the eviction-duration histogram.
+///
+/// Chosen for the decisions they inform, not as a round-number ladder. The dense
+/// sub-second range is where a cooperative yield should land, so it can be told
+/// apart from "instant"; 3s is the default `yield_timeout_s`; 5s is the default
+/// `eviction_timeout_s`; the tail exists so a wedged tenant is visibly a tail
+/// rather than silently clamped into the last finite bucket.
+pub const EVICTION_DURATION_BUCKETS: &[f64] = &[0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0];
+
+/// A minimal Prometheus-shaped histogram: cumulative bucket counts plus the sum
+/// and count needed for `histogram_quantile()` and a rate-based mean.
+///
+/// Hand-rolled because the crate has no metrics library and adding one for a
+/// single histogram would be a poor trade. `buckets[i]` counts observations
+/// `<= EVICTION_DURATION_BUCKETS[i]`; the implicit `+Inf` bucket is `count`.
+#[derive(Debug, Clone, Default)]
+pub struct DurationHistogram {
+    /// Cumulative counts, parallel to [`EVICTION_DURATION_BUCKETS`].
+    pub buckets: Vec<u64>,
+    /// Total observations (the `+Inf` bucket).
+    pub count: u64,
+    /// Sum of all observed durations, in seconds.
+    pub sum: f64,
+}
+
+impl DurationHistogram {
+    /// Record one observation.
+    pub fn observe(&mut self, seconds: f64) {
+        if self.buckets.is_empty() {
+            self.buckets = vec![0; EVICTION_DURATION_BUCKETS.len()];
+        }
+        for (i, bound) in EVICTION_DURATION_BUCKETS.iter().enumerate() {
+            if seconds <= *bound {
+                self.buckets[i] += 1;
+            }
+        }
+        self.count += 1;
+        self.sum += seconds;
+    }
 }
 
 impl Metrics {
@@ -358,10 +434,19 @@ impl Metrics {
         use crate::units::EvictionMetricOutcome;
         let counts = self.evictions.entry(unit.to_string()).or_default();
         match outcome {
+            EvictionMetricOutcome::Yielded => counts.yielded += 1,
             EvictionMetricOutcome::Graceful => counts.graceful += 1,
             EvictionMetricOutcome::Sigkill => counts.sigkill += 1,
             EvictionMetricOutcome::Error => counts.error += 1,
         }
+    }
+
+    /// Record how long one eviction stage took for `unit`.
+    pub fn record_eviction_duration(&mut self, unit: &str, stage: EvictionStage, seconds: f64) {
+        self.eviction_durations
+            .entry((unit.to_string(), stage))
+            .or_default()
+            .observe(seconds);
     }
 
     /// Record one successful managed-unit start for `unit`.
@@ -384,6 +469,9 @@ impl Metrics {
 /// for `gpu_arbiter_evictions_total{unit}`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EvictionCounts {
+    /// Count of evictions where the tenant released the GPU cooperatively and
+    /// was never stopped — the best available outcome.
+    pub yielded: u64,
     /// Count of gracefully-freed evictions (VRAM drained within the timeout).
     pub graceful: u64,
     /// Count of evictions that needed a SIGKILL escalation.
@@ -796,6 +884,83 @@ mod tests {
         assert_eq!(ollama.error, 0);
         let vllm = m.evictions["vllm.service"];
         assert_eq!(vllm.error, 1);
+    }
+
+    #[test]
+    fn histogram_buckets_are_cumulative() {
+        // Prometheus histogram buckets are cumulative — `le="1.0"` must include
+        // everything at or below 1.0, not just the (0.5, 1.0] slice. Getting
+        // this wrong produces a histogram that looks plausible and makes
+        // histogram_quantile() return nonsense.
+        let mut h = DurationHistogram::default();
+        h.observe(0.05);
+        h.observe(0.4);
+        h.observe(2.5);
+
+        let idx = |b: f64| {
+            EVICTION_DURATION_BUCKETS
+                .iter()
+                .position(|x| (*x - b).abs() < f64::EPSILON)
+                .expect("bucket bound")
+        };
+        assert_eq!(h.buckets[idx(0.1)], 1, "0.05 only");
+        assert_eq!(h.buckets[idx(0.5)], 2, "0.05 + 0.4");
+        assert_eq!(h.buckets[idx(1.0)], 2, "still 0.05 + 0.4");
+        assert_eq!(h.buckets[idx(3.0)], 3, "all three");
+        assert_eq!(h.count, 3);
+        assert!((h.sum - 2.95).abs() < 1e-9, "sum was {}", h.sum);
+    }
+
+    #[test]
+    fn histogram_counts_an_observation_above_every_bound() {
+        // A wedged eviction longer than the last finite bucket must still be
+        // counted (it lands only in +Inf, which `count` represents), or the
+        // exact pathology the histogram exists to reveal would be invisible.
+        let mut h = DurationHistogram::default();
+        h.observe(120.0);
+        assert_eq!(h.count, 1);
+        assert!(
+            h.buckets.iter().all(|c| *c == 0),
+            "a 120s observation must not land in any finite bucket"
+        );
+        assert!((h.sum - 120.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_eviction_duration_keys_by_unit_and_stage() {
+        let mut m = Metrics::default();
+        m.record_eviction_duration("earmark-asr", EvictionStage::Yield, 0.4);
+        m.record_eviction_duration("earmark-asr", EvictionStage::Total, 0.45);
+        m.record_eviction_duration("ollama", EvictionStage::Stop, 1.2);
+
+        assert_eq!(
+            m.eviction_durations[&("earmark-asr".to_string(), EvictionStage::Yield)].count,
+            1
+        );
+        // Same unit, different stage — must be a separate series, otherwise the
+        // yield and stop costs get summed and neither timeout can be tuned.
+        assert_eq!(
+            m.eviction_durations[&("earmark-asr".to_string(), EvictionStage::Total)].count,
+            1
+        );
+        assert_eq!(
+            m.eviction_durations[&("ollama".to_string(), EvictionStage::Stop)].count,
+            1
+        );
+        assert_eq!(m.eviction_durations.len(), 3);
+    }
+
+    #[test]
+    fn record_eviction_counts_yielded_separately() {
+        use crate::units::EvictionMetricOutcome;
+        let mut m = Metrics::default();
+        m.record_eviction("earmark-asr", EvictionMetricOutcome::Yielded);
+        m.record_eviction("earmark-asr", EvictionMetricOutcome::Yielded);
+        m.record_eviction("earmark-asr", EvictionMetricOutcome::Graceful);
+        let c = m.evictions["earmark-asr"];
+        assert_eq!(c.yielded, 2);
+        assert_eq!(c.graceful, 1);
+        assert_eq!(c.sigkill, 0);
     }
 
     #[test]

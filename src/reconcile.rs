@@ -14,8 +14,8 @@ use crate::classify::{self, GpuGraphicsProc};
 use crate::config::{Config, ManagedUnit};
 use crate::gpu::{self, GpuBackend};
 use crate::state::{
-    ArbiterState, Claim, ManualActionError, ReconcileTrigger, State, UnitStatus, read_state,
-    write_state,
+    ArbiterState, Claim, EvictionStage, ManualActionError, ReconcileTrigger, State, UnitStatus,
+    read_state, write_state,
 };
 use crate::units;
 
@@ -624,6 +624,20 @@ pub async fn reconcile(
         // instead of silently coerced.
         let mut to_start = Vec::new();
         for u in eager_targets {
+            // Undo any cooperative yield first, for EVERY eligible unit — not
+            // just the stopped ones. A unit that released the GPU via
+            // `yield_cmd` is still *running*, so it never reaches `to_start`,
+            // and gating the resume on "needs starting" would leave it paused
+            // forever: alive, healthy by every check here, and quietly not doing
+            // any work.
+            //
+            // Safe to run unconditionally because `resume_cmd` is required to be
+            // idempotent, which is also why the daemon tracks no
+            // yielded-vs-stopped ledger — such state would have to survive a
+            // daemon restart to be trustworthy, and a desynced ledger fails in
+            // exactly the silent way described above.
+            units::resume(u).await;
+
             let confirmed_running = units::is_running(u)
                 .await
                 .inspect_err(|e| {
@@ -700,9 +714,36 @@ async fn evict_units(
 ) -> bool {
     let mut any_failed = false;
     for u in targets {
-        let result = units::evict(u, cfg, backend).await;
-        if let Some(outcome) = units::eviction_metric_outcome(&result) {
-            write_state(state).metrics.record_eviction(&u.unit, outcome);
+        let (result, timings) = units::evict_timed(u, cfg, backend).await;
+        {
+            // One lock for both the outcome counter and the duration samples,
+            // rather than reacquiring per metric.
+            let mut guard = write_state(state);
+            if let Some(outcome) = units::eviction_metric_outcome(&result) {
+                guard.metrics.record_eviction(&u.unit, outcome);
+            }
+            // A no-op eviction (nothing was running) is excluded from durations
+            // for the same reason it is excluded from the outcome counter: a
+            // pile of ~0s samples from steady-state passes would drag every
+            // quantile toward zero and make the timeouts look far more generous
+            // than they are.
+            if !matches!(result, Ok(units::EvictionOutcome::AlreadyClear)) {
+                if let Some(s) = timings.yield_secs {
+                    guard
+                        .metrics
+                        .record_eviction_duration(&u.unit, EvictionStage::Yield, s);
+                }
+                if let Some(s) = timings.stop_secs {
+                    guard
+                        .metrics
+                        .record_eviction_duration(&u.unit, EvictionStage::Stop, s);
+                }
+                guard.metrics.record_eviction_duration(
+                    &u.unit,
+                    EvictionStage::Total,
+                    timings.total_secs,
+                );
+            }
         }
         match result {
             Ok(outcome) => tracing::info!(unit = %u.unit, ?outcome, "evicted unit for gaming"),

@@ -418,7 +418,30 @@ where
 /// or an unknown/malformed key), or if it can't be read for a reason other
 /// than "not found".
 pub fn check_config(path: &str) -> Result<String, ConfigError> {
-    Config::load(path).map(|_| format!("OK: {path}"))
+    let cfg = Config::load(path)?;
+
+    // A `yield_cmd` with no `busy_cmd` parses fine but is inert: release is
+    // unobservable, so the daemon skips the cooperative stage and stops the unit
+    // instead. That is safe, but it silently isn't the behavior the operator
+    // asked for — surfacing it here means the mistake is caught by the Ansible
+    // role's validate step at deploy time rather than discovered later from an
+    // eviction that never yields.
+    let inert: Vec<&str> = cfg
+        .resolved_units()
+        .iter()
+        .filter(|u| u.yield_cmd.is_some() && u.busy_cmd.is_none())
+        .map(|u| u.unit.as_str())
+        .collect();
+    if !inert.is_empty() {
+        return Ok(format!(
+            "OK: {path}\nWARNING: yield_cmd without busy_cmd on: {}. \
+             Cooperative release cannot be verified without a busy probe, so these units \
+             will skip the yield stage and be stopped instead.",
+            inert.join(", ")
+        ));
+    }
+
+    Ok(format!("OK: {path}"))
 }
 
 /// The `--help` text. A function (not a `const`) so the version is interpolated.

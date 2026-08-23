@@ -90,6 +90,17 @@ fn default_game_priority() -> u8 {
     DEFAULT_GAME_PRIORITY
 }
 
+/// Default [`Config::yield_timeout_s`]: 3s.
+///
+/// A starting point, not a measured value — it is the first of two eviction
+/// stages, so its budget is spent before the stop path begins and directly
+/// delays a game getting the GPU. Short enough that a tenant which ignores the
+/// request costs little, long enough that a real park-to-host-RAM has a chance
+/// to complete. Tune from the `stage="yield"` histogram.
+fn default_yield_timeout_s() -> u64 {
+    3
+}
+
 /// Maximum accepted length (in bytes) of an [`ManagedUnit::introspect_cmd`]. A
 /// value longer than this is treated as **unset** (resolution falls through to the
 /// next precedence level, just like a blank string), never run.
@@ -220,6 +231,44 @@ pub struct ManagedUnit {
     /// able to evict a lower tier on a false pretext.
     #[serde(default)]
     pub busy_cmd: Option<ArgvCmd>,
+    /// Optional **cooperative** GPU release, tried before any stop.
+    ///
+    /// Asks the tenant to let go of the GPU while staying alive — for
+    /// earmark's asr-runner that means flipping its `runner_control` gate, on
+    /// which `runner.py` parks its model to host RAM (`asr_model.cpu()` +
+    /// `torch.cuda.empty_cache()`) and restores it on resume. The win over a
+    /// stop is real: no in-flight transcription is lost and there is no cold
+    /// model reload afterwards.
+    ///
+    /// Exit 0 means "the request was accepted", **not** "the GPU is free" — the
+    /// tenant needs time to actually drop its context, so the eviction then
+    /// polls for release. Failing to release within
+    /// [`ManagedUnit::yield_timeout_s`] escalates to the normal
+    /// stop → wait → kill path, so a tenant that ignores or mishandles the
+    /// request can never hold the GPU against a higher tier.
+    ///
+    /// `None` (the default) skips straight to the stop path, which is how every
+    /// tenant behaved before this existed.
+    #[serde(default)]
+    pub yield_cmd: Option<ArgvCmd>,
+    /// Undo for [`ManagedUnit::yield_cmd`] — lets the tenant use the GPU again.
+    ///
+    /// Run on the restore path **before** any start, and expected to be
+    /// idempotent: the arbiter deliberately does not track whether a given unit
+    /// was yielded or stopped, because that state would have to survive a daemon
+    /// restart to be trustworthy. Running an idempotent resume unconditionally
+    /// is cheaper and cannot desync.
+    #[serde(default)]
+    pub resume_cmd: Option<ArgvCmd>,
+    /// How long to wait for a cooperative release before escalating to the stop
+    /// path. `None` falls back to [`Config::yield_timeout_s`].
+    ///
+    /// Per-unit because the right value is tenant-specific: parking a 17 GB
+    /// model to host RAM is not the same operation as draining a small one, and
+    /// the whole point of the duration metrics is to set this from observation
+    /// rather than guesswork.
+    #[serde(default)]
+    pub yield_timeout_s: Option<u64>,
     /// **Fallback** substring (case-insensitive) matched against `nvidia-smi`
     /// compute-proc names to attribute this unit's VRAM in `/status`. For a
     /// systemd-supervised unit, cgroup PID resolution (#7) attributes VRAM
@@ -427,6 +476,17 @@ pub struct Config {
     /// event-driven (`cn_proc`); this only covers dropped events.
     pub reconcile_interval_s: u64,
 
+    /// Default cooperative-release timeout, for units that set `yield_cmd` but
+    /// not their own [`ManagedUnit::yield_timeout_s`].
+    ///
+    /// Deliberately shorter than `eviction_timeout_s`: this is the *first* of
+    /// two stages, and its budget is spent before the stop path even begins, so
+    /// a generous value here directly delays a game getting the GPU. Tune it
+    /// from the `gpu_arbiter_eviction_duration_seconds{stage="yield"}` histogram
+    /// rather than by guessing — that is what the histogram is for.
+    #[serde(default = "default_yield_timeout_s")]
+    pub yield_timeout_s: u64,
+
     /// The priority a detected **game** claims at. Higher wins; see
     /// [`ManagedUnit::priority`] for the ladder's semantics.
     ///
@@ -524,6 +584,7 @@ impl Default for Config {
             port: 48750,
             bind: default_bind(),
             game_priority: DEFAULT_GAME_PRIORITY,
+            yield_timeout_s: default_yield_timeout_s(),
             ollama_unit,
             eager_ollama,
             managed_units,
@@ -591,6 +652,9 @@ fn synthesize_units(
             // which is exactly the pre-priorities behavior.
             priority: DEFAULT_UNIT_PRIORITY,
             busy_cmd: None,
+            yield_cmd: None,
+            resume_cmd: None,
+            yield_timeout_s: None,
             vram_match: Some("ollama".to_string()),
             kind: Some("ollama".to_string()),
             introspect_cmd: None,
