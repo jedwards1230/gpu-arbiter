@@ -1480,6 +1480,13 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
 
     // ── tristate is_running: the recheck-can't-confirm decision (#15) ───────
 
+    // Unix-only in premise, not just in the chmod: the fixture is a `#!/bin/sh`
+    // script whose self-disarming depends on shebang execution and on the
+    // executable permission bit gating spawn with EACCES. Windows has neither —
+    // it dispatches by file extension and has no `chmod -x` equivalent — so the
+    // second invocation would succeed and the "couldn't tell" state the test
+    // exists to exercise would never arise.
+    #[cfg(unix)]
     #[tokio::test]
     async fn evict_escalates_when_recheck_cannot_confirm_still_running() {
         // A self-disarming is_active_cmd script: the FIRST invocation (evict()'s

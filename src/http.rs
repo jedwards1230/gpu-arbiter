@@ -41,6 +41,9 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
+// Only the `#[cfg(unix)]` stale-socket probe timeout uses the bare name; the
+// tests below spell out `std::time::Duration` in full.
+#[cfg(unix)]
 use std::time::Duration;
 
 use axum::Json;
@@ -691,6 +694,10 @@ pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
 /// microseconds) while still bounding daemon startup — a probe that hangs
 /// this long is itself treated as "can't prove it's safe" (see
 /// [`socket_is_live`]'s docs), not as an infinite wait.
+/// Only referenced by the `#[cfg(unix)]` unix-socket listener below; on Windows
+/// there is no UDS path to probe, so the constant is deliberately unused rather
+/// than deleted (it belongs with the doc comment above it).
+#[cfg(unix)]
 const STALE_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Whether another process is actively listening on the unix socket at
@@ -1589,6 +1596,9 @@ mod tests {
     /// ever creating the socket file — not a real-world concern (the daemon's
     /// actual default/configured paths are short), but exactly what would
     /// happen here. `/tmp` is short on every unix `cargo test` runs on.
+    // Unix-only: exercises the `#[cfg(unix)]` unix-socket listener, which has
+    // no Windows counterpart (the control surface is TCP-only there).
+    #[cfg(unix)]
     fn short_unique_socket_dir(label: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1601,6 +1611,7 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn serve_uds_creates_0700_parent_dir_and_0600_socket() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1649,6 +1660,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn serve_uds_leaves_a_preexisting_parent_dir_mode_untouched() {
         // Mirrors what systemd's RuntimeDirectory=/RuntimeDirectoryMode=0700
@@ -1696,6 +1708,7 @@ mod tests {
 
     // ── stale-socket live-probe (#61) ───────────────────────────────────────
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_is_live_false_when_no_file_exists() {
         let dir = short_unique_socket_dir("probe-missing");
@@ -1705,6 +1718,7 @@ mod tests {
         assert!(!socket_is_live(&path).await);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_is_live_false_for_a_genuinely_stale_socket_file() {
         // A socket *file* left behind with nothing listening on it — the
@@ -1742,6 +1756,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_is_live_true_while_a_listener_is_bound() {
         let dir = short_unique_socket_dir("probe-live");
@@ -1758,6 +1773,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bind_uds_refuses_to_steal_a_live_socket() {
         // The headline #61 fix: bind_uds must never unlink-and-rebind over a
@@ -1782,6 +1798,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bind_uds_removes_a_genuinely_stale_socket_and_binds_fresh() {
         // The non-regression half: a stale (probe-false) socket file must

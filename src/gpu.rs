@@ -206,14 +206,30 @@ impl GpuBackend {
 /// Best-effort PATH probe for `nvidia-smi` (drives `auto` detection). Pure-ish
 /// (reads `PATH` + stats files); never panics.
 fn nvidia_smi_on_path() -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join("nvidia-smi").is_file()))
+    // Windows needs the `.exe` suffix: the binary ships as `nvidia-smi.exe`
+    // (verified on desktop-2 at `C:\Windows\System32\nvidia-smi.exe`), so
+    // probing the bare stem finds nothing and `auto` detection silently
+    // concludes there is no NVIDIA GPU on a machine holding an RTX 5090.
+    const NAMES: &[&str] = if cfg!(windows) {
+        &["nvidia-smi.exe"]
+    } else {
+        &["nvidia-smi"]
+    };
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|p| NAMES.iter().any(|name| p.join(name).is_file()))
+    })
 }
 
 /// Best-effort probe for an `amdgpu` DRM card (drives `auto` detection). A card is
 /// "amdgpu" if `/sys/class/drm/card*/device/driver` resolves to a path ending in
 /// `amdgpu`. Never panics; any read error is treated as "no AMD card".
 fn amdgpu_card_present() -> bool {
+    // `/sys/class/drm` is a Linux concept; skip the probe entirely elsewhere
+    // rather than paying a guaranteed-failing directory read on every `auto`
+    // resolution.
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
         return false;
     };
@@ -415,6 +431,11 @@ mod nvidia {
 
 /// AMD backend: sysfs VRAM probe. No per-proc VRAM is available via sysfs, so only
 /// total memory is reported; the proc lists degrade to empty at the dispatch layer.
+///
+/// Linux-only: every path it reads lives under `/sys/class/drm`, which does not
+/// exist on Windows. Gating the module keeps it from dead-weighting the Windows
+/// binary with code that could only ever return "no card".
+#[cfg(target_os = "linux")]
 mod amd {
     use super::{GpuError, GpuMemory, parse_vram_sysfs};
 
@@ -461,6 +482,24 @@ mod amd {
             return parse_vram_sysfs(&used, &total);
         }
         Err(GpuError::NoAmdCard(DRM_BASE.to_string()))
+    }
+}
+
+/// Non-Linux stub for the AMD backend, mirroring [`amd`]'s public surface so the
+/// [`GpuBackend::query_memory`] dispatch needs no `cfg` of its own.
+///
+/// `GpuBackend::Amd` remains constructible everywhere (it is a config-selectable
+/// value), so the dispatch arm must still compile off Linux — it just cannot
+/// succeed, because the sysfs nodes it reads are a Linux concept. Reporting the
+/// same [`GpuError::NoAmdCard`] the real probe returns when no card is found
+/// keeps the error path identical rather than inventing a platform-specific one.
+#[cfg(not(target_os = "linux"))]
+mod amd {
+    use super::{GpuError, GpuMemory};
+
+    /// Always `Err(NoAmdCard)`: there is no `/sys/class/drm` off Linux.
+    pub async fn query_memory() -> Result<GpuMemory, GpuError> {
+        Err(GpuError::NoAmdCard("/sys/class/drm".to_string()))
     }
 }
 

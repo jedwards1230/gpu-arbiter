@@ -412,8 +412,18 @@ fn default_bind() -> IpAddr {
 /// A dedicated subdirectory of `/run` (not bare `/run/gpu-arbiter.sock`, the
 /// pre-#61 default) — see [`crate::http::serve_uds`]'s docs for why the
 /// parent directory itself needs to be lockable to mode `0700`.
+///
+/// Empty on Windows, which disables the unix-socket listener. `http::bind_uds`
+/// and `serve_uds_on` are `#[cfg(unix)]` with no Windows counterpart, so a
+/// non-empty default here would name a socket that can never be bound. The
+/// control surface is TCP-only on Windows until the named-pipe listener lands;
+/// see the port plan's §5.5 for the security tradeoff that implies.
 fn default_socket_path() -> String {
-    "/run/gpu-arbiter/gpu-arbiter.sock".to_string()
+    if cfg!(windows) {
+        String::new()
+    } else {
+        "/run/gpu-arbiter/gpu-arbiter.sock".to_string()
+    }
 }
 
 impl Default for Config {

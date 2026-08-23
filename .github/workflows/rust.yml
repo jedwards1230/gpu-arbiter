@@ -4,6 +4,15 @@
 # container (toolchain preinstalled; no system libs needed — all deps are
 # pure-Rust). The daemon is Linux-only at runtime but builds/tests anywhere; the
 # Linux runner exercises the real (cfg-gated) code paths.
+#
+# The `windows` job guards the cross-platform invariant the Linux job cannot
+# see. Every Linux-only crate is already behind
+# `[target.'cfg(target_os = "linux")'.dependencies]`, but nothing enforced that
+# the *first-party* code stayed portable — and it had not: seven unix-socket
+# tests in `http.rs` referenced `std::os::unix` and `tokio::net::UnixListener`
+# unconditionally, so `cargo test` for an MSVC target failed to compile with 18
+# errors. That is invisible on a Linux-only matrix, which is exactly why this
+# job exists.
 
 name: Rust
 
@@ -74,4 +83,69 @@ jobs:
             echo "| Build (release) | ${{ steps.build.outcome }} |"
             echo "| Test | ${{ steps.test.outcome }} |"
             echo "| Build (musl static) | ${{ steps.build_musl.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Native Windows runner rather than a cross-`check` from Linux: only a real
+  # MSVC host can link the binary and actually *run* the test suite, which is
+  # what catches a platform-conditional logic bug (as opposed to a compile
+  # error, which a cross-`cargo check` would also surface).
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Add clippy
+        run: rustup component add clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # No `cargo fmt` here — formatting is platform-independent and the Linux
+      # job already gates it; running it twice only adds a second place to fail
+      # for the same reason.
+      - name: Clippy
+        id: clippy_win
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (release)
+        id: build_win
+        run: cargo build --release
+
+      - name: Test
+        id: test_win
+        run: cargo test
+
+      # Smoke-test the client half of the binary, which is the whole point of
+      # shipping a Windows build before the daemon is ported: `status` against a
+      # daemon that is not running must exit 2 ("unreachable"), NOT 1
+      # ("claimed"). earmark maps 2 — and any unexpected code — to
+      # "degrade, don't block", so collapsing 2 into 1 would make an unreachable
+      # daemon look like a permanently running game and silently wedge the
+      # transcription pipeline.
+      - name: Smoke-test CLI client (exit 2 = daemon unreachable)
+        id: smoke_win
+        shell: pwsh
+        run: |
+          $exe = ".\target\release\gpu-arbiter.exe"
+          & $exe --version
+          & $exe status --url http://127.0.0.1:1 --quiet
+          if ($LASTEXITCODE -ne 2) {
+            Write-Error "expected exit 2 (daemon unreachable), got $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "OK: unreachable daemon reported exit 2"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Rust CI (Windows)"
+            echo ""
+            echo "| Step | Result |"
+            echo "|------|--------|"
+            echo "| Clippy | ${{ steps.clippy_win.outcome }} |"
+            echo "| Build (release) | ${{ steps.build_win.outcome }} |"
+            echo "| Test | ${{ steps.test_win.outcome }} |"
+            echo "| CLI smoke test | ${{ steps.smoke_win.outcome }} |"
           } >> "$GITHUB_STEP_SUMMARY"
