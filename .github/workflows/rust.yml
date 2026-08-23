@@ -125,15 +125,26 @@ jobs:
       - name: Smoke-test CLI client (exit 2 = daemon unreachable)
         id: smoke_win
         shell: pwsh
+        # The explicit `exit 0` at the end is load-bearing, not decoration. The
+        # step under test deliberately exits NON-ZERO (2 = unreachable), and
+        # GitHub's pwsh wrapper propagates a lingering $LASTEXITCODE as the
+        # step's own result — so without it the step failed even though the
+        # assertion had already printed OK. Capture the code immediately, then
+        # end with an explicit success. `Write-Host` rather than `Write-Error`
+        # for the failure path, too: under the wrapper's ErrorActionPreference
+        # a Write-Error is itself a terminating error, which muddies which of
+        # the two things actually failed.
         run: |
           $exe = ".\target\release\gpu-arbiter.exe"
           & $exe --version
           & $exe status --url http://127.0.0.1:1 --quiet
-          if ($LASTEXITCODE -ne 2) {
-            Write-Error "expected exit 2 (daemon unreachable), got $LASTEXITCODE"
+          $code = $LASTEXITCODE
+          if ($code -ne 2) {
+            Write-Host "FAIL: expected exit 2 (daemon unreachable), got $code"
             exit 1
           }
           Write-Host "OK: unreachable daemon reported exit 2"
+          exit 0
 
       - name: Summary
         if: always()
