@@ -285,6 +285,31 @@ pub enum UnitVramReading {
     /// falls back to the legacy total-GPU-VRAM gate. `None` when even the
     /// total-VRAM read itself failed ("unknown-memory").
     Fallback(Option<GpuMemory>),
+    /// VRAM cannot gate this eviction **at all** on this platform, so the
+    /// unit's own run state is the authority instead.
+    ///
+    /// This is the WDDM case, and it is a structural fact rather than a
+    /// transient failure — which is why it is a distinct variant and not a
+    /// `Fallback(None)`. NVIDIA reports `NVML_VALUE_NOT_AVAILABLE` for
+    /// per-process VRAM on **every** WDDM system, unconditionally, and a
+    /// display-attached `GeForce` card cannot leave WDDM (no `GeForce` product
+    /// supports TCC, and TCC is deprecated regardless). Measured on desktop-2
+    /// (RTX 5090, driver 610.88): every process — the game itself and
+    /// `llama-server.exe` included — reports `[N/A]`.
+    ///
+    /// The total-VRAM `Fallback` is *also* wrong here, and more subtly so.
+    /// Device-level `memory.used` does vary meaningfully on WDDM (877 MiB idle
+    /// → 12 502 MiB with an 8.4 GB model resident, same measurement run), so it
+    /// is good enough to *report* on the dashboard — but it is the whole
+    /// device, including the game that just launched. Gating eviction on it
+    /// would mean waiting for total VRAM to fall below a threshold that the
+    /// incoming game is simultaneously pushing up, so the gate would never open
+    /// and every eviction would run to timeout and SIGKILL.
+    ///
+    /// Gating on service state is not a workaround, it is *more* correct here:
+    /// a Windows service that reaches `SERVICE_STOPPED` has had its process
+    /// exit, and WDDM reclaims that process's VRAM deterministically at exit.
+    Unavailable,
 }
 
 /// Pure decision for one eviction poll. Unit-tested without any process I/O.
@@ -308,7 +333,16 @@ pub fn eviction_step(reading: UnitVramReading, elapsed: Duration, cfg: &Config) 
     let freed = match reading {
         UnitVramReading::Attributed(mb) => mb < cfg.vram_free_threshold_mb,
         UnitVramReading::Fallback(Some(mem)) => vram_is_free(mem, cfg),
-        UnitVramReading::Fallback(None) => false,
+        // Two distinct reasons VRAM cannot report "freed", deliberately kept as
+        // separate arms despite the identical value: `Fallback(None)` is a
+        // transient read failure, while `Unavailable` is a structural property
+        // of WDDM where the caller consults run state instead (see the variant
+        // docs). Collapsing them would hide that difference from the next
+        // reader, and they diverge the moment either gains a distinct policy.
+        //
+        // Either way, an inconclusive reading degrades to KeepWaiting/Escalate
+        // exactly like a confirmed non-free one, so eviction can never stall.
+        UnitVramReading::Fallback(None) | UnitVramReading::Unavailable => false,
     };
     if freed {
         EvictionStep::Freed
@@ -666,6 +700,22 @@ pub async fn evict(
         {
             seen_nonzero = true;
         }
+        // VRAM cannot answer on this platform (WDDM), so the unit's own run
+        // state is the gate instead — a service that has reached SERVICE_STOPPED
+        // has had its process exit, and WDDM reclaims that process's VRAM
+        // deterministically at exit.
+        //
+        // An inconclusive check deliberately does NOT free the gate: on error
+        // this falls through to `eviction_step`, which never reports
+        // `Unavailable` as freed, so the eviction proceeds to its timeout and
+        // the existing escalation path (which re-checks run state itself before
+        // deciding whether a SIGKILL would even hit anything). Same
+        // unsure-means-keep-waiting default as everywhere else here.
+        if matches!(reading, UnitVramReading::Unavailable)
+            && let Ok(false) = is_running(u).await
+        {
+            return Ok(EvictionOutcome::Freed);
+        }
         match eviction_step(reading, start.elapsed(), cfg) {
             EvictionStep::Freed => return Ok(EvictionOutcome::Freed),
             EvictionStep::Escalate => {
@@ -730,6 +780,17 @@ async fn unit_vram_reading(
     attribution_capable: bool,
     seen_nonzero: bool,
 ) -> UnitVramReading {
+    // WDDM short-circuit (§5.2). Neither VRAM channel can gate an eviction on
+    // Windows: per-process VRAM is `[N/A]` for every process unconditionally,
+    // and the total-VRAM fallback covers the whole device *including the game
+    // that just launched* — so it would wait for a threshold the incoming game
+    // is simultaneously pushing up, and never open. Return early rather than
+    // pay for two `nvidia-smi` shell-outs per 250 ms poll whose answers are
+    // structurally unusable; the caller gates on run state instead.
+    if cfg!(windows) {
+        return UnitVramReading::Unavailable;
+    }
+
     let attributed = if attribution_capable && backend.attribution_capable() {
         let compute = if is_systemd {
             match backend.query_compute_procs().await {
@@ -951,6 +1012,47 @@ mod tests {
             ),
             EvictionStep::Escalate
         );
+    }
+
+    #[test]
+    fn eviction_step_unavailable_never_reports_freed() {
+        // WDDM (§5.2): VRAM is structurally unable to gate this eviction, so it
+        // must never be the thing that says "freed" — the caller consults the
+        // unit's run state instead. Critically this holds even at VRAM readings
+        // that WOULD free the gate under either other variant, because the
+        // number simply does not describe this unit.
+        let cfg = Config::default();
+        assert_eq!(
+            eviction_step(UnitVramReading::Unavailable, Duration::from_secs(1), &cfg),
+            EvictionStep::KeepWaiting
+        );
+        // And it still escalates on timeout rather than hanging — an eviction
+        // can never stall waiting on an answer that will never come.
+        assert_eq!(
+            eviction_step(UnitVramReading::Unavailable, Duration::from_secs(5), &cfg),
+            EvictionStep::Escalate
+        );
+    }
+
+    #[test]
+    fn eviction_step_unavailable_matches_unknown_memory_semantics() {
+        // `Unavailable` and `Fallback(None)` are distinct variants carrying
+        // different *reasons* (structural vs transient), but their gating
+        // behavior must stay identical: neither is ever freed, both escalate on
+        // timeout. If these ever diverge it should be a deliberate change with
+        // its own test, not a silent one.
+        let cfg = Config::default();
+        for elapsed in [
+            Duration::from_secs(0),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ] {
+            assert_eq!(
+                eviction_step(UnitVramReading::Unavailable, elapsed, &cfg),
+                eviction_step(UnitVramReading::Fallback(None), elapsed, &cfg),
+                "divergence at elapsed={elapsed:?}"
+            );
+        }
     }
 
     // ── attributed (#8: per-unit VRAM gating) ───────────────────────────────
