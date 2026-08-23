@@ -498,6 +498,13 @@ mod amd {
     use super::{GpuError, GpuMemory};
 
     /// Always `Err(NoAmdCard)`: there is no `/sys/class/drm` off Linux.
+    ///
+    /// The `async` is load-bearing despite there being nothing to await: the
+    /// signature must mirror the real Linux `query_memory` so the shared
+    /// `GpuBackend::query_memory` dispatch can `.await` it without a `cfg` of
+    /// its own. Dropping `async` here would just move the platform branch up
+    /// into the dispatch, which is what this stub exists to avoid.
+    #[allow(clippy::unused_async)]
     pub async fn query_memory() -> Result<GpuMemory, GpuError> {
         Err(GpuError::NoAmdCard("/sys/class/drm".to_string()))
     }
