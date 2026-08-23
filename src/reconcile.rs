@@ -493,9 +493,21 @@ pub async fn reconcile(
     match unit_action(current, desired) {
         UnitAction::Evict => {
             // available → gaming: announce `evicting` first (brief lock) so remote
-            // machines back off, then tear every managed unit down (in order) with
+            // machines back off, then tear the preempted units down (in order) with
             // the lock DROPPED so `/status` stays responsive across the whole kill
             // window. Gaming wins unconditionally even if one unit errors.
+            //
+            // `preempted` is NOT the tenant-ladder-only set here, which is easy to
+            // misread. We are on the `available → gaming` edge, so `claims` is
+            // non-empty, so `effective_demand` returned at least
+            // `cfg.game_priority` — and `preempted_units` therefore selected every
+            // unit below that. With stock config (all units 50, game 100) that is
+            // literally every unit, identical to the pre-priorities behavior.
+            //
+            // A unit that survives here is one an operator deliberately placed at
+            // or above `game_priority`, which is a supported configuration, not a
+            // leak: see `a_tenant_above_game_priority_survives_a_game`. Passing
+            // `cfg.resolved_units()` instead would silently delete that ability.
             write_state(state).set_state(State::Evicting);
             let any_eviction_failed = evict_units(state, cfg, backend, &preempted).await;
             if any_eviction_failed {
@@ -1936,6 +1948,40 @@ mod tests {
         assert_eq!(
             preempted_names(&cfg, demand),
             vec!["comfyui", "earmark-asr", "ollama"]
+        );
+    }
+
+    #[test]
+    fn a_game_evicts_every_unit_under_stock_config() {
+        // Guards the exact misreading a reviewer raised on this change: at the
+        // `available -> gaming` edge the code passes `preempted`, not
+        // `cfg.resolved_units()`, which *looks* like it could leave tenants
+        // running during a game.
+        //
+        // It cannot under any config that does not opt in. A game claim forces
+        // demand to at least `game_priority`, and every unit defaults below that,
+        // so the preempted set is the complete unit list. This pins that for the
+        // stock default (nothing sets a priority at all) rather than only for the
+        // explicit ladder fixture.
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
+            r#"
+            [[managed_units]]
+            unit = "a"
+
+            [[managed_units]]
+            unit = "b"
+
+            [[managed_units]]
+            unit = "c"
+            "#,
+        ))
+        .unwrap();
+        let claims = vec![Claim::Steam("413150".to_string())];
+        let demand = effective_demand(&claims, &cfg, &[]);
+        assert_eq!(
+            preempted_units(&cfg, demand).len(),
+            cfg.resolved_units().len(),
+            "a game must evict every unit when no unit opts above game_priority"
         );
     }
 
