@@ -494,6 +494,30 @@ async fn try_yield(u: &ManagedUnit, cfg: &Config) -> YieldOutcome {
     let Some(cmd) = u.yield_cmd.as_ref() else {
         return YieldOutcome::Failed;
     };
+
+    // No `busy_cmd` means release is UNOBSERVABLE, so the cooperative stage
+    // cannot run at all — skip it before sending anything.
+    //
+    // This guard is load-bearing, not defensive. `is_busy` reports `false` for a
+    // unit with no probe, so without it the poll below reads "not busy" on its
+    // first iteration and returns `Released` — declaring the tenant let go of the
+    // GPU on zero evidence, leaving it running and holding VRAM while the daemon
+    // reports a completed eviction. That is the worst possible failure here: the
+    // game never gets the card and nothing looks wrong.
+    //
+    // Escalating immediately rather than sleeping out the budget is deliberate.
+    // Waiting cannot produce information we are structurally unable to observe,
+    // so it would be pure added latency ahead of the stop we are going to do
+    // anyway — and sending a `yield_cmd` whose effect we can never confirm just
+    // perturbs the tenant for nothing.
+    if u.busy_cmd.is_none() {
+        tracing::warn!(
+            unit = %u.unit,
+            "yield_cmd is set without busy_cmd, so a cooperative release cannot be verified; \
+             skipping the yield stage and stopping the unit instead"
+        );
+        return YieldOutcome::Failed;
+    }
     match run_argv("yield", &u.unit, &cmd.0, "").await {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
@@ -1788,6 +1812,78 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             .await
             .unwrap_err();
         assert!(matches!(err, UnitError::Exit { .. }));
+    }
+
+    #[tokio::test]
+    async fn yield_without_a_busy_probe_does_not_claim_release() {
+        // Regression guard for a real bug caught in review on this PR.
+        //
+        // `is_busy` reports `false` for a unit with no `busy_cmd`, so the yield
+        // poll's `!is_busy(u)` read "not busy" on its very first iteration and
+        // returned `Released` — declaring the tenant had let go of the GPU on
+        // zero evidence. The unit was left running and still holding VRAM while
+        // the daemon recorded a completed, successful eviction: the game never
+        // got the card and nothing looked wrong anywhere.
+        //
+        // The unit here is configured to be "running" and to have a yield that
+        // succeeds, so a regression genuinely reaches the buggy path. The
+        // eviction must NOT come back `Yielded`.
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(
+            r#"
+            eviction_timeout_s = 0
+
+            [[managed_units]]
+            unit = "fake.service"
+            yield_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = "true"
+            "#,
+        ))
+        .unwrap();
+        let u = &cfg.resolved_units()[0];
+        assert!(u.busy_cmd.is_none(), "fixture must omit busy_cmd");
+
+        let outcome = evict(u, &cfg, GpuBackend::default()).await.unwrap();
+        assert_ne!(
+            outcome,
+            EvictionOutcome::Yielded,
+            "a unit with no busy probe must never be reported as having yielded"
+        );
+    }
+
+    #[test]
+    fn check_config_warns_on_yield_without_busy() {
+        // The same misconfiguration, caught at deploy time by the Ansible role's
+        // validate step instead of only at the next eviction.
+        let dir = std::env::temp_dir().join(format!(
+            "ga-yieldcheck-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            crate::testutil::portable_toml(
+                r#"
+                [[managed_units]]
+                unit = "fake.service"
+                yield_cmd = ["true"]
+                "#,
+            ),
+        )
+        .unwrap();
+
+        let out = crate::cli::check_config(path.to_str().unwrap()).unwrap();
+        assert!(out.starts_with("OK:"), "still a valid config: {out}");
+        assert!(
+            out.contains("WARNING") && out.contains("fake.service"),
+            "expected a warning naming the unit, got: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
