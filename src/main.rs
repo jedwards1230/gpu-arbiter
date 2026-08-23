@@ -264,16 +264,22 @@ fn run_watch(base_url: &str, json: bool) -> i32 {
 // Linux is the only runtime target (netlink cn_proc, /proc, nvidia-smi,
 // systemctl). The crate still builds/tests on macOS via the non-Linux `main`
 // stub below and the cfg-gated/stubbed module internals.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = handle_cli_or_get_daemon_config();
-    linux::run(config_path)
+    daemon::run(config_path)
 }
 
-/// All the Linux runtime wiring, kept in a submodule so the (large) imports and
-/// helpers don't leak into the non-Linux stub build.
-#[cfg(target_os = "linux")]
-mod linux {
+/// All the daemon runtime wiring, kept in a submodule so the (large) imports and
+/// helpers don't leak into the stub build for platforms with no daemon.
+///
+/// Shared by Linux and Windows. The wiring is genuinely the same on both — the
+/// reconcile loop is level-triggered, so the only platform-specific pieces are
+/// the shutdown signals and the Linux-only watchers (`procmon`'s `cn_proc`
+/// netlink listener, `presence`'s evdev watcher), each handled with a narrow
+/// `cfg` below rather than by duplicating the whole module.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod daemon {
     use std::net::SocketAddr;
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
@@ -457,6 +463,15 @@ mod linux {
         // directory — #61), no bearer tokens. Serves ONLY `/units/*` +
         // `/ollama/*`; the read-only surface above stays TCP/LAN.
         // `socket_path = ""` opts out entirely.
+        //
+        // Windows has no unix-socket listener at all (`http::bind_uds` and
+        // `serve_uds_on` are `#[cfg(unix)]` with no counterpart), so the whole
+        // block is unix-gated and `socket_path` defaults to empty there. That
+        // is a real, deliberate security downgrade to name: on Windows the only
+        // write path is the TCP surface, which has no peer-credential check —
+        // so `bind` must be scoped by firewall rule rather than left open. The
+        // named-pipe listener that restores parity is Phase 3.
+        #[cfg(unix)]
         let socket_handle = if cfg.socket_path.is_empty() {
             tracing::info!("unix control socket disabled (socket_path is empty)");
             None
@@ -469,6 +484,20 @@ mod linux {
                 }
             }))
         };
+        #[cfg(not(unix))]
+        let socket_handle: Option<tokio::task::JoinHandle<()>> = {
+            // Not merely "disabled": there is no implementation to enable. Warn
+            // if an operator configured one anyway, so a `socket_path` copied
+            // from a Linux config isn't silently ignored.
+            if !cfg.socket_path.is_empty() {
+                tracing::warn!(
+                    socket_path = %cfg.socket_path,
+                    "socket_path is set but unix sockets are unsupported on this platform; ignoring"
+                );
+            }
+            drop(uds_app);
+            None
+        };
 
         // 6c. SIGHUP: config is an immutable `Arc` threaded into every task
         // (procmon, presence, reconcile, http) — a real hot-reload would need
@@ -479,6 +508,10 @@ mod linux {
         // is the supported reload path, and it's safe by construction: step
         // 3 above always reconciles against observed truth before anything
         // can touch a managed unit, so a restart never "loses" state.
+        //
+        // Unix-only: Windows has no SIGHUP to acknowledge. The restart-to-reload
+        // contract is identical there, just unannounced.
+        #[cfg(unix)]
         let sighup_handle = tokio::spawn(sighup_task());
 
         // 7. Block until a shutdown signal, then tear down.
@@ -515,6 +548,7 @@ mod linux {
         if let Some(h) = socket_handle {
             h.abort();
         }
+        #[cfg(unix)]
         sighup_handle.abort();
         if let Some(h) = presence_handle {
             h.abort();
@@ -527,6 +561,9 @@ mod linux {
     /// site). Runs for the daemon's lifetime; a failure to even register the
     /// handler is non-fatal (the daemon still runs, it just won't react to
     /// SIGHUP at all — same fallback as [`wait_for_shutdown`]).
+    /// Unix-only: Windows has no SIGHUP. The restart-to-reload contract is the
+    /// same there, it simply has no signal to acknowledge.
+    #[cfg(unix)]
     async fn sighup_task() {
         use tokio::signal::unix::{SignalKind, signal};
         let mut sighup = match signal(SignalKind::hangup()) {
@@ -650,6 +687,7 @@ mod linux {
     }
 
     /// Resolve when SIGTERM (systemd stop) or SIGINT (Ctrl-C) arrives.
+    #[cfg(unix)]
     async fn wait_for_shutdown() {
         use tokio::signal::unix::{SignalKind, signal};
         // If signal handler registration fails, fall back to a never-resolving
@@ -681,6 +719,31 @@ mod linux {
         }
     }
 
+    /// Windows shutdown wait: Ctrl-C, which is also what the service wrapper
+    /// (`WinSW`) delivers on stop — so it covers both ways this process actually
+    /// gets told to exit.
+    ///
+    /// As on Unix, a failed handler registration degrades to a never-resolving
+    /// future rather than aborting startup: the daemon still runs, it just
+    /// loses the graceful path, and the supervisor's hard kill stays available.
+    ///
+    /// Graceful shutdown matters more here than on Linux. The reconcile task
+    /// owns the eviction window, and a hard kill mid-eviction would leave a
+    /// managed unit stopped with nothing running to restart it — on Linux
+    /// systemd's `Restart=always` boots a fresh process that reconciles on
+    /// startup, but a `WinSW` `<onfailure>` only fires on a *non-zero* exit, not
+    /// on a clean kill.
+    #[cfg(windows)]
+    async fn wait_for_shutdown() {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => tracing::debug!("ctrl-c / service stop"),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to register ctrl-c handler; graceful shutdown unavailable");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     fn init_tracing() {
         use tracing_subscriber::{EnvFilter, fmt};
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -688,18 +751,24 @@ mod linux {
     }
 }
 
-/// The daemon only runs on Linux (it needs the `cn_proc` netlink socket,
-/// `/proc`, `nvidia-smi`, and `systemctl`). On any other host the binary exits
-/// immediately — but the library still compiles and tests, which is the whole
-/// point of the lib/main split.
-#[cfg(not(target_os = "linux"))]
+/// The daemon runs on Linux and Windows. On any other host (the macOS dev box)
+/// the binary exits immediately — but the library still compiles and tests,
+/// which is the whole point of the lib/main split.
+///
+/// macOS has no process-enumeration implementation behind
+/// [`gpu_arbiter::reconcile::observe`], which returns an empty snapshot there.
+/// That is exactly why the daemon must refuse to start: an empty snapshot means
+/// no claims, which reads as `available`, so the daemon would never evict and
+/// would restart managed units into a live game.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn main() {
     // The cross-platform commands (version, help, --check-config, status) all
     // handle-and-exit inside this call; only RunDaemon returns — and the daemon
     // can't run here, so report and exit non-zero.
     let _config_path = handle_cli_or_get_daemon_config();
     eprintln!(
-        "gpu-arbiter only runs on Linux (requires cn_proc netlink, /proc, nvidia-smi, systemctl)."
+        "gpu-arbiter's daemon runs only on Linux and Windows (it needs a process-enumeration \
+         backend). The CLI client subcommands — status, wait, watch, --check-config — work here."
     );
     std::process::exit(1);
 }

@@ -700,6 +700,22 @@ pub async fn evict(
         {
             seen_nonzero = true;
         }
+        // VRAM cannot answer on this platform (WDDM), so the unit's own run
+        // state is the gate instead — a service that has reached SERVICE_STOPPED
+        // has had its process exit, and WDDM reclaims that process's VRAM
+        // deterministically at exit.
+        //
+        // An inconclusive check deliberately does NOT free the gate: on error
+        // this falls through to `eviction_step`, which never reports
+        // `Unavailable` as freed, so the eviction proceeds to its timeout and
+        // the existing escalation path (which re-checks run state itself before
+        // deciding whether a SIGKILL would even hit anything). Same
+        // unsure-means-keep-waiting default as everywhere else here.
+        if matches!(reading, UnitVramReading::Unavailable)
+            && let Ok(false) = is_running(u).await
+        {
+            return Ok(EvictionOutcome::Freed);
+        }
         match eviction_step(reading, start.elapsed(), cfg) {
             EvictionStep::Freed => return Ok(EvictionOutcome::Freed),
             EvictionStep::Escalate => {
@@ -764,6 +780,17 @@ async fn unit_vram_reading(
     attribution_capable: bool,
     seen_nonzero: bool,
 ) -> UnitVramReading {
+    // WDDM short-circuit (§5.2). Neither VRAM channel can gate an eviction on
+    // Windows: per-process VRAM is `[N/A]` for every process unconditionally,
+    // and the total-VRAM fallback covers the whole device *including the game
+    // that just launched* — so it would wait for a threshold the incoming game
+    // is simultaneously pushing up, and never open. Return early rather than
+    // pay for two `nvidia-smi` shell-outs per 250 ms poll whose answers are
+    // structurally unusable; the caller gates on run state instead.
+    if cfg!(windows) {
+        return UnitVramReading::Unavailable;
+    }
+
     let attributed = if attribution_capable && backend.attribution_capable() {
         let compute = if is_systemd {
             match backend.query_compute_procs().await {
@@ -985,6 +1012,47 @@ mod tests {
             ),
             EvictionStep::Escalate
         );
+    }
+
+    #[test]
+    fn eviction_step_unavailable_never_reports_freed() {
+        // WDDM (§5.2): VRAM is structurally unable to gate this eviction, so it
+        // must never be the thing that says "freed" — the caller consults the
+        // unit's run state instead. Critically this holds even at VRAM readings
+        // that WOULD free the gate under either other variant, because the
+        // number simply does not describe this unit.
+        let cfg = Config::default();
+        assert_eq!(
+            eviction_step(UnitVramReading::Unavailable, Duration::from_secs(1), &cfg),
+            EvictionStep::KeepWaiting
+        );
+        // And it still escalates on timeout rather than hanging — an eviction
+        // can never stall waiting on an answer that will never come.
+        assert_eq!(
+            eviction_step(UnitVramReading::Unavailable, Duration::from_secs(5), &cfg),
+            EvictionStep::Escalate
+        );
+    }
+
+    #[test]
+    fn eviction_step_unavailable_matches_unknown_memory_semantics() {
+        // `Unavailable` and `Fallback(None)` are distinct variants carrying
+        // different *reasons* (structural vs transient), but their gating
+        // behavior must stay identical: neither is ever freed, both escalate on
+        // timeout. If these ever diverge it should be a deliberate change with
+        // its own test, not a silent one.
+        let cfg = Config::default();
+        for elapsed in [
+            Duration::from_secs(0),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ] {
+            assert_eq!(
+                eviction_step(UnitVramReading::Unavailable, elapsed, &cfg),
+                eviction_step(UnitVramReading::Fallback(None), elapsed, &cfg),
+                "divergence at elapsed={elapsed:?}"
+            );
+        }
     }
 
     // ── attributed (#8: per-unit VRAM gating) ───────────────────────────────
