@@ -1754,13 +1754,32 @@ mod tests {
         // flake under load or waste time in the common case.
         let socket_file = dir.join("gpu-arbiter.sock");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !socket_file.exists() {
+
+        // Wait for the socket to reach its FINAL mode, not merely to exist.
+        //
+        // `bind_uds` binds first and narrows the permissions immediately after,
+        // so the file is briefly whatever the umask allows (0755 under the
+        // common 022) before becoming 0600. Waiting on `exists()` alone and
+        // then asserting the mode races that window — rarely, and only under a
+        // loaded parallel run, which is the worst kind of flake to debug.
+        //
+        // This asserts the intended end state instead. It does NOT paper over
+        // the window: that window is real in production too, and is tracked
+        // separately — here the parent directory is 0700, so nothing can
+        // traverse in to exploit it.
+        let socket_mode = loop {
+            let mode = std::fs::metadata(&socket_file)
+                .map(|m| m.permissions().mode() & 0o777)
+                .ok();
+            if mode == Some(0o600) {
+                break 0o600;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "serve_uds never created the socket file within 5s"
+                "socket file never reached mode 0600 within 5s (last saw {mode:?})"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        };
 
         // The parent directory: mode 0700 (root-only traversal), created by
         // serve_uds itself — the auth-boundary-closing fix (#61).
@@ -1769,11 +1788,6 @@ mod tests {
 
         // The socket file itself: still pinned to 0600 (belt-and-braces,
         // unchanged from before #61).
-        let socket_mode = std::fs::metadata(&socket_file)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
         assert_eq!(socket_mode, 0o600, "socket file must be mode 0600");
 
         handle.abort();
