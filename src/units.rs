@@ -209,6 +209,140 @@ pub fn eviction_metric_outcome(
 /// release is caught promptly, yet coarse enough not to hammer `nvidia-smi`.
 const EVICTION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Which tenant hook a failure came from — the `{hook=...}` label on
+/// `gpu_arbiter_hook_failures_total`.
+///
+/// Deliberately only the three *tenant-supplied* hooks. `is-active`/`stop`/
+/// `start` already surface as typed [`UnitError`]s that callers propagate and
+/// count elsewhere; these three are the ones whose failures are swallowed by
+/// design (best-effort resume, fail-toward-not-busy probe) and therefore need a
+/// counter to be observable at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Hook {
+    /// `busy_cmd` — the preemption-source probe.
+    Busy,
+    /// `yield_cmd` — the cooperative-release request.
+    Yield,
+    /// `resume_cmd` — the undo for a cooperative yield.
+    Resume,
+}
+
+impl Hook {
+    /// Stable metric-label form. Never change these: they are a public metric
+    /// contract, and renaming one silently breaks every alert built on it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Hook::Busy => "busy",
+            Hook::Yield => "yield",
+            Hook::Resume => "resume",
+        }
+    }
+}
+
+/// How a hook failed — the `{outcome=...}` label.
+///
+/// The split matters operationally: `nonzero` means the tenant's own script ran
+/// and rejected the request (a config/credential/logic fault inside the script),
+/// while `unrunnable` means the daemon never got an exit status at all (missing
+/// interpreter, bad path, or a timeout). They have completely different fixes,
+/// and collapsing them was part of why gpu-arbiter#56 took 31 hours to spot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HookFailure {
+    /// Spawned and exited with a non-zero status.
+    NonZero,
+    /// Could not be spawned, or timed out before producing a status.
+    Unrunnable,
+}
+
+impl HookFailure {
+    /// Stable metric-label form (see [`Hook::label`]).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            HookFailure::NonZero => "nonzero",
+            HookFailure::Unrunnable => "unrunnable",
+        }
+    }
+}
+
+/// One `gpu_arbiter_hook_failures_total` series: the unit, which hook, and how
+/// it failed. Ordered so `/metrics` exposition is deterministic at the source.
+pub type HookFailureKey = (String, Hook, HookFailure);
+
+/// The hook-failure counter map. `BTreeMap` (not `HashMap`) so iteration order
+/// is stable without the caller sorting.
+type HookFailureCounts = std::collections::BTreeMap<HookFailureKey, u64>;
+
+/// Cumulative tenant-hook failures since daemon start, keyed by
+/// `(unit, hook, outcome)` and rendered as
+/// `gpu_arbiter_hook_failures_total{unit,hook,outcome}` (gpu-arbiter#57).
+///
+/// A module-global rather than a field on [`crate::state::ArbiterState`],
+/// following [`crate::procmon`]'s dropped-event counter: these hooks are invoked
+/// from free functions that take only a `&ManagedUnit` and have no state handle,
+/// and threading one through every call site purely to bump a counter would
+/// distort the API for the sake of instrumentation.
+///
+/// **Never reset except by a daemon restart** — consumers must use
+/// `increase()`/`rate()`, exactly as with every other counter here.
+static HOOK_FAILURES: std::sync::LazyLock<std::sync::Mutex<HookFailureCounts>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HookFailureCounts::new()));
+
+/// Record one hook failure. Infallible and non-blocking in practice: the
+/// critical section is a single map bump, and a poisoned lock is recovered
+/// rather than propagated — losing a metric sample must never take down a
+/// reconcile pass.
+fn record_hook_failure(unit: &str, hook: Hook, outcome: HookFailure) {
+    let mut guard = match HOOK_FAILURES.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard.entry((unit.to_string(), hook, outcome)).or_insert(0) += 1;
+}
+
+/// Test-only shim so the `/metrics` renderer can be tested against a real
+/// recorded failure. Not part of the public API: `record_hook_failure` stays
+/// private so the only production writers are the three hook call sites here.
+#[cfg(test)]
+pub fn record_hook_failure_for_test(unit: &str, hook: Hook, outcome: HookFailure) {
+    record_hook_failure(unit, hook, outcome);
+}
+
+/// Snapshot of every hook-failure counter, for `/metrics`.
+///
+/// Returns a `BTreeMap`-ordered `Vec`, so exposition order is deterministic
+/// without the caller having to sort (matching the explicit sort the other
+/// per-unit counters do in `http.rs`).
+pub fn hook_failures() -> Vec<(HookFailureKey, u64)> {
+    let guard = match HOOK_FAILURES.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
+
+/// Trim captured stderr into something safe to put in a log line: first
+/// non-empty line, whitespace-trimmed, capped.
+///
+/// Hook stderr is attacker-adjacent only in the sense that it is arbitrary
+/// tenant output — it can be megabytes, contain newlines that would forge extra
+/// log records, or be invalid UTF-8. One bounded line keeps a broken hook from
+/// flooding the journal it is trying to report through.
+fn stderr_excerpt(stderr: &[u8]) -> String {
+    const MAX: usize = 300;
+    let text = String::from_utf8_lossy(stderr);
+    let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return "<no stderr>".to_string();
+    };
+    if line.chars().count() > MAX {
+        let truncated: String = line.chars().take(MAX).collect();
+        format!("{truncated}… (truncated)")
+    } else {
+        line.to_string()
+    }
+}
+
 /// Hard ceiling on any `systemctl` control verb (start/stop/kill/is-active).
 /// A wedged systemd (stuck D-Bus, hung PID 1 transaction) would otherwise
 /// block the single reconcile task indefinitely — wedging `/status`, the
@@ -521,14 +655,17 @@ async fn try_yield(u: &ManagedUnit, cfg: &Config) -> YieldOutcome {
     match run_argv("yield", &u.unit, &cmd.0, "").await {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
+            record_hook_failure(&u.unit, Hook::Yield, HookFailure::NonZero);
             tracing::warn!(
                 unit = %u.unit,
                 code = ?out.status.code(),
+                stderr = %stderr_excerpt(&out.stderr),
                 "yield_cmd exited non-zero; escalating to stop"
             );
             return YieldOutcome::Failed;
         }
         Err(e) => {
+            record_hook_failure(&u.unit, Hook::Yield, HookFailure::Unrunnable);
             tracing::warn!(unit = %u.unit, error = %e, "yield_cmd could not be run; escalating to stop");
             return YieldOutcome::Failed;
         }
@@ -564,9 +701,16 @@ pub async fn resume(u: &ManagedUnit) {
             tracing::debug!(unit = %u.unit, "tenant resumed");
         }
         Ok(out) => {
-            tracing::warn!(unit = %u.unit, code = ?out.status.code(), "resume_cmd exited non-zero");
+            record_hook_failure(&u.unit, Hook::Resume, HookFailure::NonZero);
+            tracing::warn!(
+                unit = %u.unit,
+                code = ?out.status.code(),
+                stderr = %stderr_excerpt(&out.stderr),
+                "resume_cmd exited non-zero"
+            );
         }
         Err(e) => {
+            record_hook_failure(&u.unit, Hook::Resume, HookFailure::Unrunnable);
             tracing::warn!(unit = %u.unit, error = %e, "resume_cmd could not be run");
         }
     }
@@ -593,8 +737,26 @@ pub async fn is_busy(u: &ManagedUnit) -> bool {
         return false;
     };
     match run_argv("busy", &u.unit, &cmd.0, "").await {
-        Ok(out) => out.status.success(),
+        Ok(out) if out.status.success() => true,
+        // The probe ran and said "not busy" only if it exited 0 above. Any other
+        // status means it *broke* — a distinct condition that used to return a
+        // bare `false` with no log line at all, making a permanently-broken probe
+        // indistinguishable from a permanently-idle tenant (gpu-arbiter#56). The
+        // fail-toward-not-busy return is unchanged and still deliberate; what
+        // changes is that it is now observable.
+        Ok(out) => {
+            record_hook_failure(&u.unit, Hook::Busy, HookFailure::NonZero);
+            tracing::warn!(
+                unit = %u.unit,
+                code = ?out.status.code(),
+                stderr = %stderr_excerpt(&out.stderr),
+                "busy probe exited non-zero; treating as not busy (the unit cannot defend itself \
+                 against preemption while this persists)"
+            );
+            false
+        }
         Err(e) => {
+            record_hook_failure(&u.unit, Hook::Busy, HookFailure::Unrunnable);
             tracing::warn!(unit = %u.unit, error = %e, "busy probe failed; treating as not busy");
             false
         }
@@ -1146,6 +1308,69 @@ async fn kill_unit(sup: &Supervisor, unit: &str) -> Result<(), UnitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_excerpt_takes_first_nonempty_line() {
+        assert_eq!(stderr_excerpt(b"\n\n  boom  \nsecond line\n"), "boom");
+    }
+
+    #[test]
+    fn stderr_excerpt_handles_empty_and_invalid_utf8() {
+        assert_eq!(stderr_excerpt(b""), "<no stderr>");
+        assert_eq!(stderr_excerpt(b"   \n  \n"), "<no stderr>");
+        // Invalid UTF-8 must not panic; lossy conversion keeps the line.
+        assert!(!stderr_excerpt(&[0xff, 0xfe, b'h', b'i']).is_empty());
+    }
+
+    #[test]
+    fn stderr_excerpt_truncates_a_flood() {
+        // A hook that dumps a megabyte must not put a megabyte in the journal.
+        let flood = "x".repeat(10_000);
+        let got = stderr_excerpt(flood.as_bytes());
+        assert!(got.ends_with("… (truncated)"), "got: {got}");
+        assert!(
+            got.chars().count() < 400,
+            "excerpt not bounded: {}",
+            got.chars().count()
+        );
+    }
+
+    #[test]
+    fn hook_and_failure_labels_are_stable() {
+        // These strings are a public metric contract (gpu-arbiter#57). If this
+        // test is changed, every alert built on the metric breaks.
+        assert_eq!(Hook::Busy.label(), "busy");
+        assert_eq!(Hook::Yield.label(), "yield");
+        assert_eq!(Hook::Resume.label(), "resume");
+        assert_eq!(HookFailure::NonZero.label(), "nonzero");
+        assert_eq!(HookFailure::Unrunnable.label(), "unrunnable");
+    }
+
+    #[test]
+    fn hook_failures_accumulate_and_are_keyed_by_unit_hook_outcome() {
+        // Unique unit name so this is independent of other tests sharing the
+        // process-global counter.
+        let unit = "tst-hookcount-unit";
+        let before = hook_failures()
+            .into_iter()
+            .filter(|((u, _, _), _)| u == unit)
+            .count();
+        assert_eq!(before, 0, "unit name must be unique to this test");
+
+        record_hook_failure(unit, Hook::Busy, HookFailure::NonZero);
+        record_hook_failure(unit, Hook::Busy, HookFailure::NonZero);
+        record_hook_failure(unit, Hook::Resume, HookFailure::Unrunnable);
+
+        let mine: Vec<_> = hook_failures()
+            .into_iter()
+            .filter(|((u, _, _), _)| u == unit)
+            .collect();
+        assert_eq!(mine.len(), 2, "distinct (hook,outcome) keys: {mine:?}");
+        assert_eq!(mine[0].0.1, Hook::Busy);
+        assert_eq!(mine[0].1, 2, "same key must accumulate, not overwrite");
+        assert_eq!(mine[1].0.1, Hook::Resume);
+        assert_eq!(mine[1].1, 1);
+    }
 
     #[test]
     fn vram_free_predicate() {
