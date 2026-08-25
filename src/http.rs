@@ -476,6 +476,36 @@ pub fn render_metrics(
         );
     }
 
+    // Tenant-hook failures (gpu-arbiter#57). Without this, a hook that fails on
+    // every invocation is invisible to Prometheus: `resume`/`busy` failures are
+    // swallowed by design (best-effort / fail-toward-not-busy) and reach the
+    // journal only as WARN lines, which is not something an alert can be built
+    // on. `up` stays 1 and `degraded` stays false throughout such an outage.
+    metric_header(
+        &mut o,
+        "counter",
+        "gpu_arbiter_hook_failures_total",
+        &format!(
+            "Cumulative tenant-hook failures by hook (busy|yield|resume) and outcome \
+             (nonzero = ran and exited non-zero; unrunnable = could not be spawned or timed out). \
+             {MONOTONIC_NOTE}"
+        ),
+    );
+    // Already deterministic: the counter is a BTreeMap keyed by
+    // (unit, hook, outcome), so this is sorted at the source.
+    for ((unit, hook, outcome), count) in crate::units::hook_failures() {
+        sample(
+            &mut o,
+            "gpu_arbiter_hook_failures_total",
+            &[
+                ("unit", unit.as_str()),
+                ("hook", hook.label()),
+                ("outcome", outcome.label()),
+            ],
+            count,
+        );
+    }
+
     // Eviction durations. This exists so `yield_timeout_s` and
     // `eviction_timeout_s` can be set from what evictions actually cost on the
     // host rather than guessed. The `stage` label is what makes that possible —
@@ -1521,6 +1551,52 @@ mod tests {
         assert!(out.contains(
             "gpu_arbiter_claim{token=\"pattern:heroic\",kind=\"pattern\",id=\"heroic\"} 1"
         ));
+    }
+
+    /// gpu-arbiter#57: a hook that fails must produce a real, well-formed
+    /// `gpu_arbiter_hook_failures_total` series — the whole point is that this is
+    /// alertable, which it is not if the line never renders.
+    #[test]
+    fn render_metrics_exposes_hook_failures() {
+        // Unique unit: the counter is process-global and shared across tests.
+        let unit = "tst-render-hookfail.service";
+        crate::units::record_hook_failure_for_test(
+            unit,
+            crate::units::Hook::Busy,
+            crate::units::HookFailure::NonZero,
+        );
+
+        let snap = StatusSnapshot {
+            version: "0.0.0".into(),
+            state: State::Available,
+            claims: vec![],
+            units: vec![],
+            ollama: UnitStatus::default(),
+            gpu_vram_used_mb: 0,
+            gpu_vram_total_mb: 0,
+            since: "1970-01-01T00:00:00Z".into(),
+            local_input_last_unix: 0,
+            physical_input_devices: 0,
+            input_monitor_up: false,
+            degraded: false,
+        };
+        let out = render_metrics(
+            &snap,
+            &Metrics::default(),
+            1_700_000_000,
+            1_700_000_000,
+            600,
+            0,
+        );
+
+        assert!(
+            out.contains("# TYPE gpu_arbiter_hook_failures_total counter"),
+            "missing TYPE header:\n{out}"
+        );
+        let expected = format!(
+            "gpu_arbiter_hook_failures_total{{unit=\"{unit}\",hook=\"busy\",outcome=\"nonzero\"}} 1"
+        );
+        assert!(out.contains(&expected), "missing sample {expected}:\n{out}");
     }
 
     /// Label escaping: backslash/quote are escaped; clean tokens borrow unchanged.
