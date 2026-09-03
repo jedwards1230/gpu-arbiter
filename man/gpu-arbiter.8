@@ -232,6 +232,41 @@ evict, the daemon still hands the GPU to gaming, but marks the state
 until the next clean eviction pass or a clean return to
 .IR available ,
 so an operator can tell a wedged tenant apart from a fully\-reclaimed GPU.
+.PP
+A unit that configures
+.B yield_cmd
+(together with
+.BR busy_cmd ,
+which is required to observe release) gets a
+.B cooperative
+stage ahead of that loop: the daemon asks the tenant to drop the GPU while
+staying alive and polls
+.B busy_cmd
+until it reports not busy, up to
+.BR yield_timeout_s .
+On success the unit is never stopped \(em no in\-flight work is lost and there
+is no cold model reload afterwards. On timeout or failure it falls through to
+the stop loop above, so a tenant can never hold the GPU against a higher tier
+by ignoring the request.
+.PP
+Tenants also rank against
+.I each other
+on a priority ladder: a demand at priority
+.I P
+preempts every unit with
+.IR "priority < P," and a game claims at
+.B game_priority
+(default 100), above every tenant's default (50). Inter\-tenant preemption does
+.B not
+move
+.I state
+to
+.IR gaming / evicting
+\(em those are reserved for a real game holding the GPU \(em and is visible
+through
+.I units[].running
+instead. See
+.BR gpu-arbiter-config (5).
 .SH HTTP CONTROL SURFACE
 The read\-only surface is a single TCP port (default 48750, bind address
 .BR bind ,

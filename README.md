@@ -45,6 +45,10 @@ delta-maintained, so it self-heals across crashes, restarts, and dropped events.
   already in flight — including an eviction's stop → poll-VRAM → SIGKILL
   window — always runs to completion before the daemon exits.
 
+Tenants also rank against *each other* on a priority ladder, and one that
+supports it can be asked to release the GPU without being killed — see
+[Priority ladder and cooperative eviction](#priority-ladder-and-cooperative-eviction).
+
 Detection rules: every Steam game runs under `reaper SteamLaunch AppId=<id>` →
 claim `steam:<appid>` (zero config, covers all Steam games). Non-Steam launchers
 are added to a config pattern list as needed. An opt-in VRAM heuristic can flag
@@ -95,6 +99,7 @@ curl --unix-socket /run/gpu-arbiter/gpu-arbiter.sock -X POST http://localhost/un
 
 ```json
 {
+  "version": "0.11.0",
   "state": "gaming",
   "claims": ["steam:440"],
   "units": [
@@ -197,7 +202,8 @@ across a restart:
 
 | Metric | Meaning |
 |---|---|
-| `gpu_arbiter_evictions_total{unit,outcome}` | Cumulative eviction attempts, `outcome` ∈ `graceful`\|`sigkill`\|`error`. A no-op (the unit wasn't running) is not counted. |
+| `gpu_arbiter_evictions_total{unit,outcome}` | Cumulative eviction attempts, `outcome` ∈ `yielded`\|`graceful`\|`sigkill`\|`error`. `yielded` means the tenant released the GPU cooperatively and was never stopped. A no-op (the unit wasn't running) is not counted. |
+| `gpu_arbiter_eviction_duration_seconds{unit,stage}` | **Histogram** of eviction wall-clock, `stage` ∈ `yield`\|`stop`\|`total`. Exists so `yield_timeout_s` and `eviction_timeout_s` can be set from observed cost rather than guessed — the stage split is what shows whether the cooperative stage is paying for itself or just adding latency ahead of an inevitable stop. No-op evictions are excluded. |
 | `gpu_arbiter_unit_restarts_total{unit}` | Cumulative successful managed-unit starts driven by the daemon (eager restore or manual start) |
 | `gpu_arbiter_proc_events_dropped_total` | Cumulative `cn_proc` drop occurrences: kernel `ENOBUFS` overflow plus full-trigger-channel drops |
 | `gpu_arbiter_reconcile_passes_total{trigger}` | Cumulative reconcile passes, `trigger` ∈ `proc_event`\|`timer`\|`manual`\|`startup` |
@@ -301,6 +307,8 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 | `ollama_unit` | `"ollama.service"` | **Legacy** single managed unit (used when `managed_units` is unset) |
 | `eager_ollama` | `true` | **Legacy** restart-on-gaming-end for the single unit |
 | `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation |
+| `yield_timeout_s` | `3` | Default cooperative-release budget, for units that set `yield_cmd` but no per-unit `yield_timeout_s` (see [Priority ladder](#priority-ladder-and-cooperative-eviction)) |
+| `game_priority` | `100` | The priority a detected **game** claims at. Above every tenant's default (`50`), which is what makes gaming preempt everything |
 | `vram_free_threshold_mb` | `2000` | VRAM-used below this = GPU "freed" — applied to the evicting unit's own attributed VRAM when available, else total GPU VRAM (see [Eviction VRAM gating](#eviction-vram-gating)) |
 | `reconcile_interval_s` | `30` | Slow backstop interval (detection is event-driven) |
 | `detect_steam` | `true` | Match `SteamLaunch AppId=` (all Steam games) |
@@ -316,12 +324,19 @@ key is optional; a missing file yields the defaults below. Keys mirror the
 
 `managed_units` is an **ordered list** of systemd units the arbiter evicts from
 the GPU when a game launches (each runs the same `stop → poll-VRAM-free →
-SIGKILL` loop, in order) and restores when gaming ends. Each entry:
+SIGKILL` loop, in order — optionally preceded by a cooperative yield stage, see
+[Priority ladder](#priority-ladder-and-cooperative-eviction)) and restores when
+gaming ends. Each entry:
 
 | Field | Default | Purpose |
 |---|---|---|
 | `unit` | _(required)_ | systemd unit the daemon owns (or a free-form label when command overrides are set) |
 | `eager_restart` | `true` | Restart this unit when gaming ends |
+| `priority` | `50` | Tier on the [priority ladder](#priority-ladder-and-cooperative-eviction). A demand at `P` preempts every unit with `priority < P`; the comparison is strict, so equal tiers coexist |
+| `busy_cmd` | _(none)_ | Probe for "this tenant has work right now" — **exit 0 = busy**. Required for a unit to *preempt* lower tiers, and required for `yield_cmd` to work at all |
+| `yield_cmd` | _(none)_ | Cooperative release: ask the tenant to drop the GPU while staying alive, tried before any stop. **Ignored unless `busy_cmd` is also set** |
+| `resume_cmd` | _(none)_ | Undo for `yield_cmd`, run on the restore path before any start. Must be idempotent |
+| `yield_timeout_s` | _(none)_ | Per-unit cooperative-release budget before escalating to the stop path; falls back to the top-level `yield_timeout_s` |
 | `vram_match` | _(none)_ | **Fallback** substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution. A systemd-supervised unit is attributed automatically via cgroup PID resolution with no config needed; `vram_match` is only consulted for command-driven (`*_cmd`) units and non-systemd hosts (see [VRAM attribution](#vram-attribution)) |
 | `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (runs `ollama ps`); any other value reports no models and suppresses the name heuristic |
 | `introspect_cmd` | _(none)_ | Explicit command (shell-free argv) whose stdout lists loaded model/process names, one per line. Takes precedence over `kind` and the name heuristic |
@@ -334,6 +349,87 @@ If `managed_units` is omitted, a single entry is synthesized from the legacy
 `ollama_unit` / `eager_ollama` fields (with `vram_match = "ollama"` and
 `kind = "ollama"`), so an unconfigured daemon behaves exactly as before —
 including `ollama ps` model introspection.
+
+### Priority ladder and cooperative eviction
+
+Gaming-beats-everything is the floor, not the whole model. Tenants also sit on a
+ladder relative to *each other*, and a tenant can be asked to let go of the GPU
+without being killed.
+
+**The ladder.** Every unit has a `priority` (default `50`); a game claims at
+`game_priority` (default `100`). A demand at priority `P` preempts every unit
+with `priority < P` and leaves everything at `>= P` alone. The comparison is
+strict, so two units at the same tier coexist rather than fighting, and a config
+that never mentions priorities keeps every unit on one equal tier — exactly the
+pre-ladder behavior, with a game still evicting them all.
+
+```toml
+game_priority = 100        # gaming wins unconditionally (the default)
+
+[[managed_units]]
+unit = "comfyui.service"
+priority = 75              # interactive image gen — beats the LLM
+busy_cmd = ["curl", "-sf", "http://127.0.0.1:8188/queue/running"]
+
+[[managed_units]]
+unit = "ollama.service"
+priority = 50              # the default tier
+
+[[managed_units]]
+unit = "asr.service"
+priority = 25              # background batch work — yields to everyone
+```
+
+**Demand requires a probe.** A unit only *preempts* a lower tier when its
+`busy_cmd` exits 0 ("I have work right now"). Without a `busy_cmd` a unit is a
+preemption target only, never a source — the right default, since a
+merely-running server holding an idle model should not evict anything. The probe
+runs on every reconcile pass, so it must be cheap and non-blocking; one that
+fails to spawn, times out, or exits non-zero reads as **not busy**, so a broken
+probe can never evict a lower tier on a false pretext.
+
+Inter-tenant preemption deliberately does **not** move `state` to `gaming` or
+`evicting` — those words are the `/status` contract for "a game owns the GPU,
+back off entirely", and reporting them because one tenant outranked another
+would tell a remote AI-routing consumer the box is unavailable for AI work at
+exactly the moment it is doing AI work. Preemption is visible through
+`units[].running` instead.
+
+**Cooperative release.** When a unit sets `yield_cmd`, eviction runs in two
+stages instead of one:
+
+1. **Yield** — run `yield_cmd` and poll `busy_cmd` until the tenant reports not
+   busy, up to `yield_timeout_s`. The tenant stays alive; it just parks its
+   model. For a PyTorch service that is typically `model.cpu()` +
+   `torch.cuda.empty_cache()`. Success is `EvictionOutcome::Yielded` and the
+   unit is never stopped — no in-flight work lost, no cold model reload after.
+2. **Stop** — the ordinary `stop` → poll-VRAM → SIGKILL path, reached whenever
+   the yield times out, exits non-zero, or isn't configured.
+
+Exit 0 from `yield_cmd` means "request accepted", **not** "the GPU is free" —
+which is why release is confirmed by polling `busy_cmd` rather than trusted. A
+tenant that ignores or mishandles the request therefore cannot hold the GPU
+against a higher tier; it just falls through to stage 2.
+
+> **`yield_cmd` without `busy_cmd` does nothing.** Release would be
+> unobservable, so the daemon logs a warning, skips the yield stage entirely,
+> and stops the unit. It escalates immediately rather than sleeping out the
+> budget: waiting cannot produce information it is structurally unable to
+> observe. Always configure the two together.
+
+`resume_cmd` is the undo, run on the restore path before any start. It must be
+**idempotent** — the daemon deliberately does not track whether a given unit was
+yielded or stopped, because that state would have to survive a daemon restart to
+be trustworthy; running an idempotent resume unconditionally is cheaper and
+cannot desync.
+
+Tune the two budgets from
+`gpu_arbiter_eviction_duration_seconds{stage="yield"|"stop"}` rather than by
+guessing — the stage split exists precisely to show whether the cooperative
+stage is paying for itself or merely adding latency ahead of a stop that was
+always going to happen. `yield_timeout_s` defaults to a deliberately short `3`
+seconds: it is spent *before* the stop path even begins, so it directly delays a
+game getting the GPU.
 
 ### VRAM attribution
 

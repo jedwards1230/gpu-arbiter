@@ -113,6 +113,39 @@ How long to wait for a graceful teardown (VRAM drop below
 .BR vram_free_threshold_mb )
 before escalating to SIGKILL.
 .TP
+.B yield_timeout_s
+Integer (seconds). Default
+.BR 3 .
+Default budget for a
+.B cooperative
+release, used by units that set
+.B yield_cmd
+but no per\-unit
+.BR yield_timeout_s .
+Deliberately shorter than
+.BR eviction_timeout_s :
+this is the
+.I first
+of two eviction stages and its budget is spent before the stop path even
+begins, so a generous value here directly delays a game getting the GPU. Tune
+it from the
+.B gpu_arbiter_eviction_duration_seconds{stage="yield"}
+histogram rather than by guessing. See
+.B THE PRIORITY LADDER
+below.
+.TP
+.B game_priority
+Integer 0\(en255. Default
+.BR 100 .
+The priority a detected
+.B game
+claims at; higher wins. The default sits above every unit's default
+.B priority
+.RB ( 50 ),
+which is what makes gaming preempt everything. Lowering it below a tenant's
+priority would let that tenant survive a game launch \(em a real option (a
+tenant you never want interrupted), but a deliberate one.
+.TP
 .B vram_free_threshold_mb
 Integer (MiB). Default
 .BR 2000 .
@@ -266,6 +299,76 @@ and log lines.
 Boolean. Default
 .BR true .
 Restart this unit when gaming ends (eager warm\-up).
+.TP
+.B priority
+Integer 0\(en255. Default
+.BR 50 .
+This tenant's tier on the priority ladder. A demand at priority
+.I P
+preempts every unit with
+.IR "priority < P" ,
+and leaves everything at
+.I ">= P"
+alone. The comparison is strict, so a unit can never preempt itself and two
+units at the same tier coexist rather than fighting. The mid\-range default
+means a config that never mentions priorities keeps every unit on one equal
+tier \(em pre\-ladder behavior, with a game still evicting them all. See
+.B THE PRIORITY LADDER
+below.
+.TP
+.B busy_cmd
+String or array of strings. Default: none.
+Probe for "this tenant has work right now" \(em
+.B exit 0 means busy.
+This is what lets a tenant
+.I preempt
+lower tiers rather than merely surviving them; without it a unit is a
+preemption target only, never a source (the right default, since a
+merely\-running server holding an idle model should not evict anything). Run on
+.B every
+reconcile pass, so it must be cheap and must not block. A probe that fails to
+spawn, times out, or exits non\-zero reads as
+.BR "not busy" ,
+the conservative direction \(em a broken probe must not be able to evict a
+lower tier on a false pretext.
+.TP
+.B yield_cmd
+String or array of strings. Default: none.
+.B Cooperative
+GPU release, tried before any stop: asks the tenant to let go of the GPU while
+staying alive. Exit 0 means "the request was accepted",
+.B not
+"the GPU is free" \(em the daemon then polls
+.B busy_cmd
+until the tenant reports not busy. Failing to release within
+.B yield_timeout_s
+escalates to the ordinary stop \(-> wait \(-> kill path, so a tenant that
+ignores or mishandles the request can never hold the GPU against a higher tier.
+.IP
+.B "Ignored unless busy_cmd is also set."
+Release would be unobservable, so the daemon logs a warning, skips the yield
+stage entirely, and stops the unit instead. It escalates immediately rather
+than sleeping out the budget: waiting cannot produce information it is
+structurally unable to observe.
+.TP
+.B resume_cmd
+String or array of strings. Default: none. Undo for
+.BR yield_cmd ,
+letting the tenant use the GPU again. Run on the restore path
+.B before
+any start, and expected to be
+.BR idempotent :
+the daemon deliberately does not track whether a given unit was yielded or
+stopped, because that state would have to survive a daemon restart to be
+trustworthy. Running an idempotent resume unconditionally is cheaper and
+cannot desync.
+.TP
+.B yield_timeout_s
+Integer (seconds). Default: none (falls back to the top\-level
+.BR yield_timeout_s ).
+How long to wait for this unit's cooperative release before escalating to the
+stop path. Per\-unit because the right value is tenant\-specific: parking a
+17 GB model to host RAM is not the same operation as draining a small one.
 .TP
 .B stop_cmd
 String or array of strings. Default: none. Override for stopping/evicting the
@@ -421,6 +524,73 @@ since this query runs on every reconcile pass's
 .I /status
 refresh and must stay fast); a custom introspection command that runs longer
 is killed and silently yields an empty list, so keep it fast.
+.SH THE PRIORITY LADDER
+Gaming\-beats\-everything is the floor, not the whole model. Tenants also rank
+against
+.I each other,
+and a tenant that supports it can be asked to let go of the GPU without being
+killed.
+.PP
+Every unit has a
+.B priority
+(default 50); a game claims at
+.B game_priority
+(default 100). A demand at priority
+.I P
+preempts every unit with
+.I "priority < P."
+Because the comparison is strict, equal tiers coexist, and a config that never
+mentions priorities behaves exactly as it did before the ladder existed.
+.PP
+A unit only
+.I preempts
+a lower tier when its
+.B busy_cmd
+exits 0. Inter\-tenant preemption deliberately does
+.B not
+move
+.I state
+to
+.I gaming
+or
+.IR evicting :
+those words are the
+.I /status
+contract for "a game owns the GPU, back off entirely", and reporting them
+because one tenant outranked another would tell a remote AI\-routing consumer
+the box is unavailable for AI work at exactly the moment it is doing AI work.
+Preemption is visible through
+.I units[].running
+instead.
+.PP
+When a unit sets
+.BR yield_cmd ,
+eviction runs in two stages rather than one:
+.IP 1. 4
+.B Yield
+\(em run
+.B yield_cmd
+and poll
+.B busy_cmd
+until the tenant reports not busy, up to
+.BR yield_timeout_s .
+The tenant stays alive; it just parks its model (for a PyTorch service,
+typically
+.B model.cpu()
++
+.BR torch.cuda.empty_cache() ).
+On success the unit is never stopped \(em no in\-flight work is lost and there
+is no cold model reload afterwards.
+.IP 2. 4
+.B Stop
+\(em the ordinary stop \(-> poll\-VRAM \(-> SIGKILL path, reached whenever the
+yield times out, exits non\-zero, or is not configured.
+.PP
+Tune both budgets from the
+.B gpu_arbiter_eviction_duration_seconds{stage=...}
+histogram; the yield/stop split exists precisely to show whether the
+cooperative stage is paying for itself or merely adding latency ahead of a stop
+that was always going to happen.
 .SH INTROSPECTION RESOLUTION
 For each managed unit, the
 .B models[]
