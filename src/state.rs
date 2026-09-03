@@ -16,8 +16,8 @@ use tokio::sync::oneshot;
 /// The reconcile pass recomputes the full claim set from observed reality each
 /// pass (never delta-maintained). The presence of *any* claim means `gaming`.
 ///
-/// Serializes as a flat string token (`"steam:440"`, `"pattern:heroic"`,
-/// `"gpu:12345"`) for the `/status` payload's `claims` array.
+/// Serializes as a flat string token (`"steam:440"`, `"pattern:heroic"`)
+/// for the `/status` payload's `claims` array.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Claim {
     /// A Steam game: cmdline contained `SteamLaunch AppId=<id>`. Holds the
@@ -26,20 +26,15 @@ pub enum Claim {
     /// A non-Steam launcher matched by a configured cmdline substring pattern.
     /// Holds the pattern's `name`. Serializes as `pattern:<name>`.
     Pattern(String),
-    /// The opt-in VRAM heuristic flagged a heavy, non-allowlisted *graphics*
-    /// GPU process. Holds the pid. Serializes as `gpu:<pid>`.
-    Gpu(i32),
 }
 
 impl Claim {
-    /// Render the flat `/status` token (`steam:440`, `pattern:heroic`,
-    /// `gpu:12345`).
+    /// Render the flat `/status` token (`steam:440`, `pattern:heroic`).
     #[must_use]
     pub fn token(&self) -> String {
         match self {
             Claim::Steam(id) => format!("steam:{id}"),
             Claim::Pattern(name) => format!("pattern:{name}"),
-            Claim::Gpu(pid) => format!("gpu:{pid}"),
         }
     }
 }
@@ -709,7 +704,6 @@ mod tests {
     fn claim_tokens() {
         assert_eq!(Claim::Steam("440".into()).token(), "steam:440");
         assert_eq!(Claim::Pattern("heroic".into()).token(), "pattern:heroic");
-        assert_eq!(Claim::Gpu(12345).token(), "gpu:12345");
     }
 
     #[test]

@@ -70,20 +70,6 @@
 # Match "SteamLaunch AppId=" in exec'd cmdlines (covers all Steam games).
 #detect_steam = true
 
-# Opt-in: treat heavy, non-allowlisted *graphics* GPU processes as games.
-# (It cannot see Ollama, which is a compute process.)
-#vram_heuristic = false
-
-# VRAM threshold (MiB) for the opt-in vram_heuristic.
-#vram_game_threshold_mb = 4000
-
-# Sanctioned GPU tenants, used by the heuristic (and a sanity log line) to avoid
-# flagging known-good processes as games. Each entry is matched
-# case-insensitively (no substrings) against a proc's full name/path, its
-# path basename (e.g. "1password" matches /opt/1Password/1password), and its
-# owning systemd unit when cgroup attribution resolved one.
-#gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
-
 # --- presence ----------------------------------------------------------------
 
 # Watch physical input devices (keyboard/mouse/gamepad) to report local at-desk

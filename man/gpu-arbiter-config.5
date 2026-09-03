@@ -185,47 +185,6 @@ String. Human\-readable claim name (becomes
 String. Substring matched against a process cmdline.
 .RE
 .TP
-.B vram_heuristic
-Boolean. Default
-.BR false .
-Opt\-in: treat heavy, non\-allowlisted
-.B graphics
-GPU processes as games. (It cannot see Ollama, which is a compute process.)
-.TP
-.B vram_game_threshold_mb
-Integer (MiB). Default
-.BR 4000 .
-VRAM threshold for the opt\-in
-.B vram_heuristic.
-.TP
-.B gpu_allowlist
-Array of strings. Default
-.BR "[""ollama"", ""kwin_wayland"", ""plasmashell"", ""Xwayland""]" .
-Sanctioned GPU tenants, used by the
-.B vram_heuristic
-(and a sanity log line) to avoid flagging known\-good processes as games. Each
-entry is matched
-.B case\-insensitively
-against three identities of an observed graphics process, in order: its full
-name/path as
-.B nvidia-smi
-reports it (e.g.\&
-.IR /opt/1Password/1password ),
-the path's
-.B basename
-(so
-.B "gpu_allowlist = [\(dq1password\(dq]"
-matches that same path), and, when cgroup attribution (#7) resolved one, its
-.B owning systemd unit
-(compared both verbatim and with a trailing
-.B .service
-/
-.B .scope
-stripped). There is
-.B no substring matching
-anywhere \(em every check is an exact equality, so a broadly\-named entry
-cannot accidentally exempt an unrelated process that merely contains it.
-.TP
 .B gpu_backend
 String. Default
 .BR """auto""" .

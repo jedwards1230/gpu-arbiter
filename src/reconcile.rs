@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::classify::{self, GpuGraphicsProc};
+use crate::classify;
 use crate::config::{Config, ManagedUnit};
 use crate::gpu::{self, GpuBackend};
 use crate::state::{
@@ -62,26 +62,18 @@ pub struct ProcInfo {
 pub struct ProcSnapshot {
     /// All scanned processes (cmdlines) at observation time.
     pub procs: Vec<ProcInfo>,
-    /// GPU *graphics* processes (only populated when the VRAM heuristic is on).
-    pub gpu_graphics: Vec<GpuGraphicsProc>,
 }
 
 /// Compute the full claim set from an observed snapshot. **Pure** — the heart of
 /// level-triggered reconciliation.
 ///
-/// Applies [`classify::classify`] to every cmdline and [`classify::heuristic_claim`]
-/// to every GPU graphics proc, then de-duplicates. Order is deterministic
-/// (sorted) so `/status` output is stable.
+/// Applies [`classify::classify`] to every cmdline, then de-duplicates. Order
+/// is deterministic (sorted) so `/status` output is stable.
 #[must_use]
 pub fn claim_set(snap: &ProcSnapshot, cfg: &Config) -> Vec<Claim> {
     let mut claims: Vec<Claim> = Vec::new();
     for p in &snap.procs {
         if let Some(c) = classify::classify(&p.cmdline, cfg) {
-            claims.push(c);
-        }
-    }
-    for g in &snap.gpu_graphics {
-        if let Some(c) = classify::heuristic_claim(g, cfg) {
             claims.push(c);
         }
     }
@@ -107,44 +99,23 @@ pub fn flatten_cmdline(raw: &[u8]) -> String {
         .join(" ")
 }
 
-/// Scan `/proc` (and, when the heuristic is enabled, GPU graphics procs) into a
-/// [`ProcSnapshot`]. Linux-only.
+/// Scan `/proc` into a [`ProcSnapshot`]. Linux-only.
 ///
 /// The `/proc` walk is **synchronous, blocking** filesystem work, so it runs
 /// under [`tokio::task::spawn_blocking`] — it never stalls the runtime or the
-/// HTTP server. The optional `nvidia-smi`
-/// graphics-proc query (only when the VRAM heuristic is on) is an async
-/// `tokio::process` shell-out and stays on the runtime; each returned proc is
-/// then cgroup-enriched (#7, [`crate::cgroup::attribute_units`]) so
-/// [`classify::matches_allowlist`]'s owning-unit check (#13) has data to work
-/// with.
+/// HTTP server.
 ///
 /// # Errors
 ///
 /// Returns [`ReconcileError`] if the blocking `/proc` scan panics (a
 /// `spawn_blocking` join failure) or itself errors (e.g. `/proc` unreadable).
-/// A failed graphics-proc query is handled internally (degrades to an empty
-/// list), never propagated.
 #[cfg(target_os = "linux")]
 pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
     // Blocking /proc walk off the runtime threads.
     let procs = tokio::task::spawn_blocking(scan_proc).await??;
+    let _ = (cfg, backend);
 
-    // Only pay for the GPU graphics query when the heuristic actually needs it.
-    let gpu_graphics = if cfg.vram_heuristic {
-        let graphics = backend.query_graphics_procs().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "graphics-proc query failed; heuristic sees nothing this pass");
-            Vec::new()
-        });
-        crate::cgroup::attribute_units(graphics).await
-    } else {
-        Vec::new()
-    };
-
-    Ok(ProcSnapshot {
-        procs,
-        gpu_graphics,
-    })
+    Ok(ProcSnapshot { procs })
 }
 
 /// Synchronous `/proc` walk: read every numeric `/proc/<pid>` entry's `cmdline`.
@@ -259,18 +230,9 @@ pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, 
     // does for its `/proc` walk — `refresh_processes` is a synchronous syscall
     // storm, not something to run on an executor thread.
     let procs = tokio::task::spawn_blocking(scan_processes).await?;
-
-    // The VRAM heuristic cannot work under WDDM: per-process `used_memory` is
-    // reported as `[N/A]` for every process, unconditionally (measured on
-    // a Windows RTX 5090 host, driver 610.88 — including the game itself and llama-server).
-    // Skip the query rather than spend a subprocess per pass on a structurally
-    // unusable result. `cgroup::attribute_units` is likewise a Linux concept.
     let _ = (cfg, backend);
 
-    Ok(ProcSnapshot {
-        procs,
-        gpu_graphics: Vec::new(),
-    })
+    Ok(ProcSnapshot { procs })
 }
 
 /// Stub for platforms that are neither Linux nor Windows (the macOS dev host):
@@ -1055,7 +1017,6 @@ mod tests {
                 proc(1, "/usr/bin/firefox"),
                 proc(2, "reaper SteamLaunch AppId=440 -- tf2"),
             ],
-            gpu_graphics: vec![],
         };
         assert_eq!(claim_set(&snap, &cfg), vec![Claim::Steam("440".into())]);
     }
@@ -1068,7 +1029,6 @@ mod tests {
                 proc(2, "SteamLaunch AppId=440 -- a"),
                 proc(3, "SteamLaunch AppId=440 -- b"),
             ],
-            gpu_graphics: vec![],
         };
         assert_eq!(claim_set(&snap, &cfg), vec![Claim::Steam("440".into())]);
     }
@@ -1086,7 +1046,6 @@ mod tests {
                 proc(2, "SteamLaunch AppId=10 -- cs"),
                 proc(3, "/opt/Heroic/heroic"),
             ],
-            gpu_graphics: vec![],
         };
         let claims = claim_set(&snap, &cfg);
         assert!(claims.contains(&Claim::Steam("10".into())));

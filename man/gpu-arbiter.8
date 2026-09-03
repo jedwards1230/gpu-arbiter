@@ -211,9 +211,6 @@ and yields a
 claim (zero config, covers all Steam games). Non\-Steam launchers are matched by
 configured cmdline substrings
 .RI ( game_patterns ).
-An opt\-in VRAM heuristic can additionally flag heavy, non\-allowlisted
-.B graphics
-GPU processes as games.
 .PP
 Eviction of each managed unit runs the same bounded loop, in the configured
 order: stop the unit via its supervisor

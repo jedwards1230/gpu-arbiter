@@ -276,9 +276,6 @@ yields the defaults below.
 | `reconcile_interval_s` | `30` | Slow backstop interval (detection is event-driven) |
 | `detect_steam` | `true` | Match `SteamLaunch AppId=` (all Steam games) |
 | `game_patterns` | `[]` | `[[game_patterns]] name/match` for non-Steam launchers |
-| `vram_heuristic` | `false` | Opt-in: heavy non-allowlisted graphics procs = games. ⚠️ **Known broken — see [#49](https://github.com/jedwards1230/gpu-arbiter/issues/49).** It queries a `nvidia-smi` flag that does not exist, so it has never worked on any platform and fails every pass. Leave it off; Steam detection and `game_patterns` cover the real cases. |
-| `vram_game_threshold_mb` | `4000` | Threshold for the heuristic |
-| `gpu_allowlist` | `["ollama", "kwin_wayland", "plasmashell", "Xwayland"]` | Sanctioned tenants for the `vram_heuristic` — matched (case-insensitively, no substrings) against a proc's full name/path, its basename, and its owning systemd unit when cgroup-resolved |
 | `presence_detection` | `true` | Watch physical input devices for local-presence reporting |
 | `presence_idle_threshold_s` | `600` | Physical-input silence after which `local_present = 0` |
 | `gpu_backend` | `"auto"` | GPU vendor backend: `"auto"` (nvidia-smi if present, else amdgpu sysfs, else nvidia), `"nvidia"`, or `"amd"` |
