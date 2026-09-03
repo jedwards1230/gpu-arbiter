@@ -155,7 +155,7 @@ pub enum EvictionOutcome {
     AlreadyClear,
 }
 
-/// The `outcome` label bucket for `gpu_arbiter_evictions_total{unit,outcome}`
+/// The `outcome` label bucket for `gpu_arbiter_evictions_total{unit,outcome}`.
 /// A durable counter: journald's retention is short, so this is the only
 /// lasting record of whether an eviction was graceful or had to be
 /// force-killed once the log window has passed.
