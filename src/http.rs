@@ -844,22 +844,23 @@ async fn socket_is_live(path: &std::path::Path) -> bool {
 /// - Only once the probe clears: removes a stale socket file left by an
 ///   unclean prior shutdown before binding (a leftover file makes `bind`
 ///   fail with `AddrInUse`).
-/// - Sets the socket file mode to `0600` **after** binding (the mode a
-///   freshly-created unix socket gets is umask-dependent, so this pins it
-///   explicitly) — root-owned (the daemon runs as root), so this is
-///   *additional* hardening for the write path's auth boundary, not the
-///   whole of it (see the parent-directory note below).
+/// - Binds under a temporary sibling name in the same directory, chmods it
+///   to `0600`, then `rename`s it onto `socket_path` (same-filesystem
+///   rename is atomic and carries the inode's mode with it). The mode a
+///   freshly-created unix socket gets is umask-dependent, so binding
+///   directly at the final path and chmod-ing afterward would leave it
+///   briefly observable at that wider mode; going through a temp name means
+///   `socket_path` never exists at any mode other than `0600` — root-owned
+///   (the daemon runs as root), so this is the write path's auth boundary,
+///   alongside the parent-directory note below.
 ///
-/// **The parent directory is part of the auth boundary, not just the
-/// post-bind `0600` file mode:** between `UnixListener::bind()` creating the
-/// socket file (with an umask-derived, potentially world-connectable mode)
-/// and the `set_permissions` call above pinning it to `0600`, the listener
-/// is already accepting connections. Creating the parent directory at mode
-/// `0700` (root-only traversal) closes that window structurally — no other
-/// user can resolve the socket path to attempt a connection during it,
-/// regardless of the file's own mode at any instant. The post-bind chmod is
-/// defense in depth for a `socket_path` pointed at a pre-existing, more
-/// permissive directory, not the sole defense.
+/// **The parent directory is part of the auth boundary too, not just the
+/// socket's own `0600` mode:** creating it at mode `0700` (root-only
+/// traversal) means no other user can resolve the socket path at all,
+/// regardless of the file's mode. That matters because a `socket_path`
+/// pointed at a pre-existing, more permissive directory falls back to
+/// relying on the file mode alone — the bind-temp-then-rename sequence is
+/// what keeps that fallback sound.
 ///
 /// `#[cfg(unix)]`: `tokio::net::UnixListener`/`UnixStream`,
 /// `tokio::fs::DirBuilder::mode`, and the `0600`-mode step all need a unix
@@ -871,7 +872,8 @@ async fn socket_is_live(path: &std::path::Path) -> bool {
 /// Returns [`HttpError::SocketInUse`] if a live process is already listening
 /// at `socket_path`. Returns [`HttpError::Io`] if the parent directory can't
 /// be created at mode `0700`, a stale socket file can't be removed, binding
-/// the unix listener fails, or its mode can't be set to `0600`.
+/// the temporary socket fails, its mode can't be set to `0600`, or the
+/// rename onto `socket_path` fails.
 #[cfg(unix)]
 pub async fn bind_uds(socket_path: &str) -> Result<tokio::net::UnixListener, HttpError> {
     use std::os::unix::fs::PermissionsExt;
@@ -905,10 +907,41 @@ pub async fn bind_uds(socket_path: &str) -> Result<tokio::net::UnixListener, Htt
         Err(e) => return Err(e.into()),
     }
 
-    let listener = tokio::net::UnixListener::bind(path)?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    // Bind under a temporary sibling name in the same (0700) directory, pin
+    // its mode to 0600, then atomically rename it onto `socket_path`. This
+    // is what keeps the socket from ever being observable at `socket_path`
+    // at a mode wider than 0600 — binding directly at the final path would
+    // create the inode at an umask-derived mode before any chmod call could
+    // narrow it. Clean up the temp file on any failure along the way so a
+    // half-finished attempt doesn't leave it behind.
+    let tmp_path = uds_temp_sibling_path(path);
+    let listener = tokio::net::UnixListener::bind(&tmp_path)?;
+    if let Err(e) =
+        tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await
+    {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e.into());
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e.into());
+    }
     tracing::info!(socket = socket_path, "unix control socket listening");
     Ok(listener)
+}
+
+/// A unique sibling path to bind [`bind_uds`]'s temporary socket at, in the
+/// same directory as `path` so the final `rename` stays on one filesystem
+/// (required for POSIX rename atomicity). The counter (rather than just the
+/// PID) keeps concurrent binds within the same process — as `cargo test`
+/// runs them — from colliding on the same temp name.
+#[cfg(unix)]
+fn uds_temp_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}-{n}", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// Serve [`write_router`] (the manual start/stop write path) on an
@@ -1828,33 +1861,24 @@ mod tests {
         });
 
         // Poll for the socket file to appear rather than a fixed sleep — bind
-        // + chmod is fast, but not instant, and a fixed sleep would either
-        // flake under load or waste time in the common case.
+        // + chmod + rename is fast, but not instant, and a fixed sleep would
+        // either flake under load or waste time in the common case.
+        //
+        // `bind_uds` binds its listener under a temp sibling name, chmods
+        // that to 0600, then renames it onto `socket_path` — an atomic,
+        // same-filesystem operation that carries the inode's mode with it.
+        // So unlike a bind-then-chmod-in-place sequence, the file is never
+        // observable at `socket_path` at any mode other than 0600: assert
+        // that on first sight instead of looping for the mode to settle.
         let socket_file = dir.join("gpu-arbiter.sock");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-
-        // Wait for the socket to reach its FINAL mode, not merely to exist.
-        //
-        // `bind_uds` binds first and narrows the permissions immediately after,
-        // so the file is briefly whatever the umask allows (0755 under the
-        // common 022) before becoming 0600. Waiting on `exists()` alone and
-        // then asserting the mode races that window — rarely, and only under a
-        // loaded parallel run, which is the worst kind of flake to debug.
-        //
-        // This asserts the intended end state instead. It does NOT paper over
-        // the window: that window is real in production too, and is tracked
-        // separately — here the parent directory is 0700, so nothing can
-        // traverse in to exploit it.
         let socket_mode = loop {
-            let mode = std::fs::metadata(&socket_file)
-                .map(|m| m.permissions().mode() & 0o777)
-                .ok();
-            if mode == Some(0o600) {
-                break 0o600;
+            if let Ok(meta) = std::fs::metadata(&socket_file) {
+                break meta.permissions().mode() & 0o777;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "socket file never reached mode 0600 within 5s (last saw {mode:?})"
+                "serve_uds never created the socket file within 5s"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
@@ -1864,8 +1888,22 @@ mod tests {
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "parent directory must be mode 0700");
 
-        // The socket file itself: still pinned to 0600 (belt-and-braces).
-        assert_eq!(socket_mode, 0o600, "socket file must be mode 0600");
+        assert_eq!(
+            socket_mode, 0o600,
+            "socket file must be mode 0600 the first time it is observable at its final path"
+        );
+
+        // No temp sibling should be left behind in the directory either.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "gpu-arbiter.sock")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp sibling file left behind in socket dir: {leftovers:?}"
+        );
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&dir);
