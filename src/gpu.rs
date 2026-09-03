@@ -532,7 +532,7 @@ fn unit_vram_sum(compute: &[GpuComputeProc], unit_name: &str) -> u64 {
         .sum()
 }
 
-/// Attribute one managed unit's own VRAM (MiB) for an eviction-gating poll
+/// Attribute one managed unit's own VRAM (MiB) for an eviction-gating poll.
 /// Pure — the decision core [`crate::units::eviction_step`] builds its
 /// [`crate::units::UnitVramReading`] from.
 ///
