@@ -118,10 +118,10 @@ jobs:
       # Smoke-test the client half of the binary, which is the whole point of
       # shipping a Windows build before the daemon is ported: `status` against a
       # daemon that is not running must exit 2 ("unreachable"), NOT 1
-      # ("claimed"). earmark maps 2 — and any unexpected code — to
+      # ("claimed"). A remote AI-routing consumer maps 2 — and any unexpected code — to
       # "degrade, don't block", so collapsing 2 into 1 would make an unreachable
       # daemon look like a permanently running game and silently wedge the
-      # transcription pipeline.
+      # downstream pipeline.
       - name: Smoke-test CLI client (exit 2 = daemon unreachable)
         id: smoke_win
         shell: pwsh

@@ -1736,47 +1736,47 @@ mod tests {
         // absent. Locking the shape here is cheaper than discovering it from an
         // empty Grafana panel.
         let mut metrics = Metrics::default();
-        metrics.record_eviction_duration("earmark-asr", crate::state::EvictionStage::Yield, 0.4);
-        metrics.record_eviction_duration("earmark-asr", crate::state::EvictionStage::Total, 0.45);
+        metrics.record_eviction_duration("asr-runner", crate::state::EvictionStage::Yield, 0.4);
+        metrics.record_eviction_duration("asr-runner", crate::state::EvictionStage::Total, 0.45);
 
         let out = render_metrics(&empty_snapshot(), &metrics, 0, 0, 600, 0);
 
         assert!(out.contains("# TYPE gpu_arbiter_eviction_duration_seconds histogram"));
         // Buckets are cumulative, so a 0.4s sample is in every bound >= 0.4.
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"earmark-asr\",stage=\"yield\",le=\"0.5\"} 1"
+            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"asr-runner\",stage=\"yield\",le=\"0.5\"} 1"
         ));
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"earmark-asr\",stage=\"yield\",le=\"0.25\"} 0"
+            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"asr-runner\",stage=\"yield\",le=\"0.25\"} 0"
         ));
         // +Inf is mandatory.
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"earmark-asr\",stage=\"yield\",le=\"+Inf\"} 1"
+            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"asr-runner\",stage=\"yield\",le=\"+Inf\"} 1"
         ));
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_count{unit=\"earmark-asr\",stage=\"yield\"} 1"
+            "gpu_arbiter_eviction_duration_seconds_count{unit=\"asr-runner\",stage=\"yield\"} 1"
         ));
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_sum{unit=\"earmark-asr\",stage=\"yield\"}"
+            "gpu_arbiter_eviction_duration_seconds_sum{unit=\"asr-runner\",stage=\"yield\"}"
         ));
         // Stages are separate series — summing them would make neither timeout
         // tunable, which is the whole point of the label.
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_count{unit=\"earmark-asr\",stage=\"total\"} 1"
+            "gpu_arbiter_eviction_duration_seconds_count{unit=\"asr-runner\",stage=\"total\"} 1"
         ));
     }
 
     #[test]
     fn render_metrics_exposes_the_yielded_eviction_outcome() {
         let mut metrics = Metrics::default();
-        metrics.record_eviction("earmark-asr", crate::units::EvictionMetricOutcome::Yielded);
+        metrics.record_eviction("asr-runner", crate::units::EvictionMetricOutcome::Yielded);
         let out = render_metrics(&empty_snapshot(), &metrics, 0, 0, 600, 0);
         assert!(
-            out.contains("gpu_arbiter_evictions_total{unit=\"earmark-asr\",outcome=\"yielded\"} 1")
+            out.contains("gpu_arbiter_evictions_total{unit=\"asr-runner\",outcome=\"yielded\"} 1")
         );
         // The pre-existing outcomes still render at zero for that unit.
         assert!(
-            out.contains("gpu_arbiter_evictions_total{unit=\"earmark-asr\",outcome=\"sigkill\"} 0")
+            out.contains("gpu_arbiter_evictions_total{unit=\"asr-runner\",outcome=\"sigkill\"} 0")
         );
     }
 

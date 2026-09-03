@@ -929,18 +929,18 @@ mod tests {
     #[test]
     fn record_eviction_duration_keys_by_unit_and_stage() {
         let mut m = Metrics::default();
-        m.record_eviction_duration("earmark-asr", EvictionStage::Yield, 0.4);
-        m.record_eviction_duration("earmark-asr", EvictionStage::Total, 0.45);
+        m.record_eviction_duration("asr-runner", EvictionStage::Yield, 0.4);
+        m.record_eviction_duration("asr-runner", EvictionStage::Total, 0.45);
         m.record_eviction_duration("ollama", EvictionStage::Stop, 1.2);
 
         assert_eq!(
-            m.eviction_durations[&("earmark-asr".to_string(), EvictionStage::Yield)].count,
+            m.eviction_durations[&("asr-runner".to_string(), EvictionStage::Yield)].count,
             1
         );
         // Same unit, different stage — must be a separate series, otherwise the
         // yield and stop costs get summed and neither timeout can be tuned.
         assert_eq!(
-            m.eviction_durations[&("earmark-asr".to_string(), EvictionStage::Total)].count,
+            m.eviction_durations[&("asr-runner".to_string(), EvictionStage::Total)].count,
             1
         );
         assert_eq!(
@@ -954,10 +954,10 @@ mod tests {
     fn record_eviction_counts_yielded_separately() {
         use crate::units::EvictionMetricOutcome;
         let mut m = Metrics::default();
-        m.record_eviction("earmark-asr", EvictionMetricOutcome::Yielded);
-        m.record_eviction("earmark-asr", EvictionMetricOutcome::Yielded);
-        m.record_eviction("earmark-asr", EvictionMetricOutcome::Graceful);
-        let c = m.evictions["earmark-asr"];
+        m.record_eviction("asr-runner", EvictionMetricOutcome::Yielded);
+        m.record_eviction("asr-runner", EvictionMetricOutcome::Yielded);
+        m.record_eviction("asr-runner", EvictionMetricOutcome::Graceful);
+        let c = m.evictions["asr-runner"];
         assert_eq!(c.yielded, 2);
         assert_eq!(c.graceful, 1);
         assert_eq!(c.sigkill, 0);
