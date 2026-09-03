@@ -1,251 +1,24 @@
 # gpu-arbiter
 
-A small root daemon for a Linux gaming workstation that also doubles as an AI
-compute box — it treats the machine as a **gaming PC first, AI workstation
-second**. It detects game launches via the kernel process-event connector
-(`cn_proc`) — local *or* Moonlight-streamed, both are just local processes —
-instantly evicts GPU compute tenants (Ollama by default, plus any configured
-managed unit) from the GPU when a game starts, restores them when gaming ends,
-and exposes an HTTP `/status` endpoint so other machines can tell whether the
-box is free for AI work.
+[![CI](https://github.com/jedwards1230/gpu-arbiter/actions/workflows/rust.yml/badge.svg)](https://github.com/jedwards1230/gpu-arbiter/actions/workflows/rust.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)
 
-## Requirements
+**Give games first claim on a GPU that also runs AI workloads.**
 
-- **Linux** (the `cn_proc` netlink connector and `/proc` scanning are Linux-only)
-- A **GPU**: NVIDIA (`nvidia-smi` on `PATH`, the default) or AMD (VRAM read from
-  `/sys/class/drm/card*/device/mem_info_vram_*`). The backend auto-detects; see
-  `gpu_backend` below. On AMD there is no per-process VRAM via sysfs, so the
-  opt-in VRAM heuristic and `/status` per-unit VRAM attribution degrade to
-  empty (they never error) — eviction itself works identically.
-- **systemd** by default (`systemctl` controls the managed units; the daemon
-  ships as a systemd service). Non-systemd hosts (OpenRC/runit/plain processes)
-  are supported via per-unit `*_cmd` overrides — see [Init systems other than
-  systemd](#init-systems-other-than-systemd)
-- **root** (the `cn_proc` multicast socket needs `CAP_NET_ADMIN`; the daemon
-  also drives `systemctl` and `nvidia-smi`)
-- **Ollama** installed as a systemd unit (kept `disabled` — the daemon owns its
-  lifecycle)
+One machine, two jobs. Between games it is an inference box — Ollama, vLLM, a
+transcription worker. The moment you launch a game, all of that needs to get off
+the GPU, and the moment you quit, it needs to come back. Doing that by hand
+means remembering to stop services before you play and restart them after; doing
+it with a timer means either stuttering games or an idle card.
 
-The crate builds and tests on any host (including macOS) — Linux-only edges are
-`#[cfg(target_os = "linux")]` with non-Linux stubs.
+`gpu-arbiter` is a small Linux root daemon that does it automatically. It watches
+the kernel's process-event connector (`cn_proc`) for game launches, evicts the
+configured GPU tenants, restores them when you quit, and publishes machine
+availability over HTTP so *other* hosts can route AI work elsewhere while you
+play.
 
-## How it works
-
-The daemon is the **only** thing that starts/stops `ollama.service` (systemd
-keeps it `disabled`). Control is **level-triggered reconciliation** — the K8s
-controller pattern: `reconcile()` observes ground truth (`/proc` scan, optional
-GPU procs), recomputes the claim set, and drives the managed units. State is never
-delta-maintained, so it self-heals across crashes, restarts, and dropped events.
-
-- **cn_proc events** trigger a debounced reconcile (millisecond reaction).
-- **A periodic timer** (~30 s) also reconciles — backstop for dropped events.
-- **Startup reconciles first** — a restart or boot never starts Ollama into a
-  live game.
-- **SIGTERM/SIGINT trigger a real graceful shutdown**: any reconcile pass
-  already in flight — including an eviction's stop → poll-VRAM → SIGKILL
-  window — always runs to completion before the daemon exits.
-
-Tenants also rank against *each other* on a priority ladder, and one that
-supports it can be asked to release the GPU without being killed — see
-[Priority ladder and cooperative eviction](#priority-ladder-and-cooperative-eviction).
-
-Detection rules: every Steam game runs under `reaper SteamLaunch AppId=<id>` →
-claim `steam:<appid>` (zero config, covers all Steam games). Non-Steam launchers
-are added to a config pattern list as needed. An opt-in VRAM heuristic can flag
-heavy non-allowlisted *graphics* GPU procs (it physically cannot see Ollama,
-which is a *compute* proc).
-
-## HTTP API
-
-The read-only surface (`/status`, `/metrics`, `/healthz`) is a single TCP port
-(default `48750`, bind address configurable via `bind` — see
-[Configuration](#configuration)), LAN-restricted by a firewalld rich rule (the
-configurable bind is defense-in-depth *on top of*, not instead of, that rule).
-
-The **write** path (`POST /units/{unit}/start|stop`, `/ollama/*`) is served
-twice: on a **unix control socket** (`socket_path`, default
-`/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned, inside a
-mode-`0700` root-owned parent directory) — the sanctioned surface,
-local-root-only, no bearer tokens — and, **deprecated**, on the same TCP port
-(loopback-only) for back-compat with the tray and any existing scripts. Both
-transports validate `{unit}` against `managed_units` before touching
-`systemctl`.
-
-| Method | Path | Transport | Purpose |
-|---|---|---|---|
-| GET | `/status` | TCP (LAN) | Full state snapshot (below) |
-| GET | `/metrics` | TCP (LAN) | Prometheus text-format exposition (below) |
-| GET | `/healthz` | TCP (LAN) | Liveness |
-| POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket | Manual override — the sanctioned write path |
-| POST | `/ollama/start`, `/ollama/stop` | unix socket | Back-compat alias for the first managed unit |
-| POST | `/units/{unit}/start`, `/units/{unit}/stop` | TCP, localhost | **Deprecated** — same alias, kept for back-compat |
-| POST | `/ollama/start`, `/ollama/stop` | TCP, localhost | **Deprecated** alias |
-
-State is fully **auto** — derived from observed reality; there is no manual
-override of `state` itself. The `{unit}` must be one of the configured
-`managed_units`; an unknown unit is rejected with `404`, so the endpoint can't
-drive arbitrary systemd units. A manual start/stop is handled by the same
-reconcile task that drives automatic eviction/restart (never a directly-racing
-HTTP handler), and `POST /units/{unit}/stop` now **holds** the unit down —
-see [Manual start/stop and holds](#manual-startstop-and-holds) below.
-
-Talk to the unix socket with any HTTP client that supports one, e.g.:
-
-```sh
-curl --unix-socket /run/gpu-arbiter/gpu-arbiter.sock -X POST http://localhost/units/ollama.service/stop
-```
-
-`/status` payload:
-
-```json
-{
-  "version": "0.11.0",
-  "state": "gaming",
-  "claims": ["steam:440"],
-  "units": [
-    { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false },
-    { "unit": "vllm.service", "running": null, "models": [], "held": true }
-  ],
-  "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false },
-  "gpu_vram_used_mb": 21500,
-  "gpu_vram_total_mb": 32768,
-  "since": "2026-06-07T20:00:00Z",
-  "local_input_last_unix": 1717790400,
-  "physical_input_devices": 2,
-  "input_monitor_up": true,
-  "degraded": false
-}
-```
-
-`units` is the per-managed-unit array, in eviction order. `ollama` is a
-**back-compat alias** mirroring the Ollama unit (or the first managed unit if
-none is named `ollama`), so consumers written against the old singular block keep
-working. `state` is `gaming` | `available` | `evicting` (the transient kill
-window — remote consumers treat `evicting` as busy).
-
-Per-unit `running` is a **tristate**: `true`/`false` are confirmed
-running/stopped, and `null` means the daemon's `is-active` check itself failed
-(a wedged supervisor, a missing `*_cmd` binary) — "couldn't tell", not a
-confirmed answer. `held` is `true` while an operator has manually stopped that
-unit and it hasn't been manually started again (see below). Top-level
-`degraded` is `true` when the most recent eviction had at least one unit fail
-to evict — gaming still won the GPU unconditionally, but a tenant may still be
-holding VRAM.
-
-**Wire note:** `running` is a JSON-visible type change from a plain boolean —
-a consumer that deserializes `/status` into a strict `bool` field (rather than
-`Option<bool>`/`bool | null`) will fail to parse on a `null`. This is rare in
-practice (it only happens when `is-active` itself can't be run), but a
-strict-typed client should be updated to expect it.
-
-### Manual start/stop and holds
-
-`POST /units/{unit}/stop` now **holds** the unit down: without a hold, the
-ensure-running self-heal step would restart the unit on the very next
-reconcile pass (even the periodic backstop timer), making a manual stop a
-self-reverting no-op. A held unit stays down across game launches/exits until
-either `POST /units/{unit}/start` (which clears the hold and starts it) or a
-daemon restart (holds are in-memory only — a fresh process re-derives
-everything from observed truth, it does not remember a hold from a prior
-run). `/status` surfaces the hold per-unit via `units[].held`.
-
-`POST /units/{unit}/start` is **rejected with `409 Conflict` while a game
-holds the GPU** (state `gaming` or `evicting`): the
-never-start-a-managed-unit-into-a-live-game invariant that startup
-reconciliation enforces applies to operators too. Eviction is edge-triggered
-(it fires on the available → gaming *transition*), so a unit started mid-game
-would **not** be re-evicted by the next pass — it would sit on the GPU
-alongside the game until the game exited. On rejection nothing changes: the
-unit is not started and any hold stays in place; retry once `/status` reports
-`available`.
-
-`local_input_last_unix` / `physical_input_devices` / `input_monitor_up` report
-**local human presence**: the daemon watches *physical* input devices (keyboard /
-mouse / gamepad) and tracks input recency. Virtual devices injected by
-Moonlight/Sunshine streaming are excluded by sysfs parentage (they live under
-`/sys/devices/virtual/`), so "someone at the desk" is distinguishable from a
-remote stream. `input_monitor_up = false` means presence is **unknown** (fail-safe
-— don't suppress an "abandoned game" alert on a down monitor).
-
-### Metrics
-
-`/metrics` exposes the current state as Prometheus **gauges**:
-
-| Metric | Meaning |
-|---|---|
-| `gpu_arbiter_up` | Always `1` (the daemon answered the scrape) |
-| `gpu_arbiter_build_info{version}` | Constant `1`; build version in the label |
-| `gpu_arbiter_state{state}` | `1` for the active state (`gaming`/`available`/`evicting`), `0` for the others |
-| `gpu_arbiter_gaming` | `1` while a game holds the GPU |
-| `gpu_arbiter_degraded` | `1` while the most recent eviction pass had at least one managed unit fail to evict (gaming still wins the GPU unconditionally — this is visibility only; a wedged tenant may still hold VRAM) |
-| `gpu_arbiter_state_since_seconds` | Unix time the current state was entered |
-| `gpu_arbiter_claims` | Count of active gaming claims |
-| `gpu_arbiter_claim{token,kind,id}` | `1` per active claim; the series appearing/disappearing over time is the launch/close record |
-| `gpu_arbiter_vram_used_mib` / `gpu_arbiter_vram_total_mib` | Total GPU VRAM used / capacity (MiB) |
-| `gpu_arbiter_unit_running{unit}` | `1` if a managed unit is active (an unconfirmed tristate `null` renders `0` here — `/status` is where "unknown" surfaces distinctly) |
-| `gpu_arbiter_unit_held{unit}` | `1` if an operator has manually stopped (held) this unit — it won't be restarted until a manual start or a daemon restart |
-| `gpu_arbiter_unit_vram_mib{unit}` | VRAM attributed to a managed unit (omitted when unknown) |
-| `gpu_arbiter_local_present` | `1` if a human is at the desk (recent physical input AND monitor up) |
-| `gpu_arbiter_local_input_last_seconds` | Unix time of the most recent physical human input |
-| `gpu_arbiter_physical_input_devices` | Count of watched physical input devices (virtual excluded) |
-| `gpu_arbiter_input_monitor_up` | `1` if presence detection is healthy (else presence is unknown) |
-
-`gpu_arbiter_gaming AND NOT gpu_arbiter_local_present` (gated on
-`gpu_arbiter_input_monitor_up`) is the signal an "abandoned game left running"
-alert should key off — so it stops false-firing during local at-desk play.
-
-It also exposes four **counters** — durable eviction/restart/reconcile history
-that outlives journald's short retention on the deployment host. Monotonic for
-the daemon's process lifetime; a restart resets them to 0, so alert/dashboard
-queries should use `rate()`/`increase()` rather than comparing raw values
-across a restart:
-
-| Metric | Meaning |
-|---|---|
-| `gpu_arbiter_evictions_total{unit,outcome}` | Cumulative eviction attempts, `outcome` ∈ `yielded`\|`graceful`\|`sigkill`\|`error`. `yielded` means the tenant released the GPU cooperatively and was never stopped. A no-op (the unit wasn't running) is not counted. |
-| `gpu_arbiter_eviction_duration_seconds{unit,stage}` | **Histogram** of eviction wall-clock, `stage` ∈ `yield`\|`stop`\|`total`. Exists so `yield_timeout_s` and `eviction_timeout_s` can be set from observed cost rather than guessed — the stage split is what shows whether the cooperative stage is paying for itself or just adding latency ahead of an inevitable stop. No-op evictions are excluded. |
-| `gpu_arbiter_unit_restarts_total{unit}` | Cumulative successful managed-unit starts driven by the daemon (eager restore or manual start) |
-| `gpu_arbiter_proc_events_dropped_total` | Cumulative `cn_proc` drop occurrences: kernel `ENOBUFS` overflow plus full-trigger-channel drops |
-| `gpu_arbiter_reconcile_passes_total{trigger}` | Cumulative reconcile passes, `trigger` ∈ `proc_event`\|`timer`\|`manual`\|`startup` |
-| `gpu_arbiter_hook_failures_total{unit,hook,outcome}` | Cumulative tenant-hook failures, `hook` ∈ `busy`\|`yield`\|`resume`, `outcome` ∈ `nonzero` (ran, exited non-zero) \| `unrunnable` (could not spawn, or timed out). A hook failing on every call is otherwise invisible: `up` stays 1 and `degraded` stays false. |
-
-## Command-line usage
-
-```text
-gpu-arbiter [--config <PATH>] [--check-config]              Run the daemon (Linux), or validate config
-gpu-arbiter status [--config <PATH>] [--url <URL>] [--json | -q]
-gpu-arbiter wait [--for available|claimed] [--timeout <SECS>] [--url <URL>]
-gpu-arbiter watch [--json] [--url <URL>]
-gpu-arbiter --version | --help
-```
-
-| Flag / subcommand | Purpose |
-|---|---|
-| `-c, --config <PATH>` | Config file path (precedence below) |
-| `--check-config` | Load + validate the resolved config, print `OK: <path>` or the typed error, exit 0/1. Rejects unknown/typo'd keys at every level (top-level, `[[managed_units]]`, `[[game_patterns]]`) — a config that parses is a config with no typos, not just no type errors. |
-| `--url <URL>` | (`status`/`wait`/`watch`) explicit daemon base URL (precedence below) |
-| `status` | GET `/status`, print a human summary |
-| `status --json` | Print the raw `/status` JSON instead of the summary |
-| `status -q` / `--quiet` | No output; exit code alone reports state (see [Exit codes](#exit-codes)) |
-| `wait [--for available\|claimed] [--timeout <SECS>]` | Poll `/status` (every 2s) until the state is reached; default `--for available`, default `--timeout 60` |
-| `watch [--json]` | Poll `/status` (every 2s) and print one line per state transition until killed; `--json` for NDJSON |
-| `-V, --version` / `-h, --help` | Print version / help and exit |
-
-**Daemon location** (`status`/`wait`/`watch`, highest precedence first):
-`--url <URL>` → `GPU_ARBITER_URL` env var (matching the tray's convention) →
-`http://127.0.0.1:<port>` from the local config.
-
-**Config-path precedence** (highest first): `--config`/`-c` → `GPU_ARBITER_CONFIG`
-env var → `/etc/gpu-arbiter/config.toml` (the default). A missing file is not an
-error — the daemon falls back to built-in defaults.
-
-The daemon itself takes no required arguments; the existing systemd unit and
-`/etc/gpu-arbiter/config.toml` keep working unchanged (these flags are additive).
-`status`/`wait`/`watch` are plain HTTP clients (no TLS, `ureq` — the same
-client the tray uses), so they run on any host that can reach the daemon.
-Example:
-
-```text
+```console
 $ gpu-arbiter status
 State:   gaming
 Since:   2026-06-13T18:00:00Z
@@ -254,302 +27,189 @@ GPU:     21500 / 32768 MiB VRAM used
 Units:
   ollama.service: stopped
   vllm.service: unknown
-Daemon:  v0.7.2
+Daemon:  v0.11.0
 ```
 
-`wait` replaces a hand-rolled poll loop in a launch script, e.g. block until
-the GPU is free before starting an AI workload:
+Steam games need **zero configuration** — every one of them execs under
+`reaper SteamLaunch AppId=<id>`, which is the detection rule. Moonlight-streamed
+games work identically, because a streamed game is just a local process.
+
+## Install
+
+**Prebuilt binary** — every release ships a static
+`x86_64-unknown-linux-musl` build with no runtime dependencies:
 
 ```sh
-gpu-arbiter wait --for available --timeout 30 && ./start-inference-server.sh
+curl -fsSLO https://github.com/jedwards1230/gpu-arbiter/releases/latest/download/gpu-arbiter-x86_64-unknown-linux-musl
+install -Dm755 gpu-arbiter-x86_64-unknown-linux-musl /usr/bin/gpu-arbiter
+install -Dm644 packaging/gpu-arbiter.service /usr/lib/systemd/system/gpu-arbiter.service
+install -Dm644 packaging/config.example.toml /etc/gpu-arbiter/config.toml
+systemctl enable --now gpu-arbiter
 ```
 
-`watch` streams state transitions for local observability — useful on hosts
-where journald retention is short enough to lose the daemon's own log record:
+Releases also carry `gpu-arbiter-tray-x86_64-unknown-linux-musl`, an optional
+user-session tray indicator, and a Windows build of the *client* half
+(`status`/`wait`/`watch`) — the daemon itself is Linux-only.
 
-```text
-$ gpu-arbiter watch
-2026-06-13T18:00:00Z  (start) available  claims=-
-2026-06-13T18:00:12Z  available -> gaming  claims=steam:440
-2026-06-13T19:14:03Z  gaming -> available  claims=-
+**From source** — `cargo build --release`, or
+`cargo build --release --target x86_64-unknown-linux-musl` for the static build.
+
+**Arch (AUR)** — PKGBUILDs for a binary and a source package are prepared under
+[`packaging/aur/`](packaging/aur) but are **not published to the AUR yet**
+(tracked in [#20](https://github.com/jedwards1230/gpu-arbiter/issues/20)); build
+them locally with `makepkg -si` in the meantime.
+
+The daemon runs with **zero config**: with no file at all it evicts
+`ollama.service` on any Steam game launch. Check a config before deploying it
+with `gpu-arbiter --check-config`.
+
+## How it works
+
+Control is **level-triggered reconciliation** — the Kubernetes controller
+pattern. `reconcile()` observes ground truth (a `/proc` scan, optionally the
+GPU's process list), recomputes the full claim set from scratch, and drives the
+managed units to match. No state is delta-maintained, so the daemon self-heals
+across crashes, restarts, and dropped kernel events.
+
+```
+  cn_proc netlink ─┐
+  30s backstop  ───┤
+  daemon startup ──┼──▶  reconcile()  ──▶  observe /proc + GPU
+  manual HTTP POST ┘          │                    │
+                              │              recompute claims
+                              │                    │
+                              ▼                    ▼
+                    gaming ──────────▶  evict tenants (yield → stop → SIGKILL)
+                       ▲                           │
+                       └──── available ◀───────────┘  restore tenants
 ```
 
-### Exit codes
+Four things fall out of that design:
 
-Any command line rejected by the parser (bad/missing flag, invalid
-combination) exits **2** before doing any work, regardless of subcommand.
-Beyond that, each subcommand's own codes:
+- **Sub-second reaction.** `cn_proc` is an event stream, not a poll — zero CPU
+  between launches.
+- **Dropped events cannot wedge it.** A ~30 s backstop timer reconciles
+  regardless, and since state is recomputed rather than patched, a missed event
+  costs latency, never correctness.
+- **A restart never starts a tenant into a live game.** Startup reconciles
+  before doing anything else.
+- **Shutdown is genuinely graceful.** `SIGTERM`/`SIGINT` let an in-flight
+  eviction — including its stop → poll-VRAM → `SIGKILL` window — run to
+  completion first.
 
-| Command | `0` | `1` | other |
-|---|---|---|---|
-| `status` | printed successfully | fetch/render error, daemon unreachable | — |
-| `status -q` | state is `available` | state is `gaming`/`evicting` | `2` = daemon unreachable |
-| `wait` | state reached | timed out, or daemon unreachable | — |
-| `--check-config` | config valid | config invalid | — |
+Tenants also rank against *each other* on a priority ladder, and a tenant that
+supports it can be asked to release the GPU **without being killed** — a
+PyTorch service can park its model to host RAM and pick up where it left off,
+losing no in-flight work and paying no cold-reload cost. See
+[Priority ladder and cooperative eviction](docs/reference.md#priority-ladder-and-cooperative-eviction).
 
-A unit's status line renders `running` / `stopped` / `unknown` (the tristate
-above); when `degraded` is set the summary also prints a `Degraded: ...` line.
+## Configure
 
-## Configuration
-
-Loaded from a TOML file (e.g. rendered by your deployment tooling). The path is
-resolved as above (`--config` → `GPU_ARBITER_CONFIG` → default). Every
-key is optional; a missing file yields the defaults below. Keys mirror the
-`gpu_arbiter_*` variable names minus the prefix.
-
-| Key | Default | Purpose |
-|---|---|---|
-| `enabled` | `true` | Master enable |
-| `port` | `48750` | HTTP listen port |
-| `bind` | `"0.0.0.0"` | TCP bind address for the read-only surface + deprecated TCP write routes |
-| `socket_path` | `"/run/gpu-arbiter/gpu-arbiter.sock"` | Unix control socket path for the write path (mode `0600`, root-owned, inside a mode-`0700` root-owned parent directory); empty string disables it |
-| `managed_units` | _(synthesized from `ollama_unit`)_ | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
-| `ollama_unit` | `"ollama.service"` | **Legacy** single managed unit (used when `managed_units` is unset) |
-| `eager_ollama` | `true` | **Legacy** restart-on-gaming-end for the single unit |
-| `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation |
-| `yield_timeout_s` | `3` | Default cooperative-release budget, for units that set `yield_cmd` but no per-unit `yield_timeout_s` (see [Priority ladder](#priority-ladder-and-cooperative-eviction)) |
-| `game_priority` | `100` | The priority a detected **game** claims at. Above every tenant's default (`50`), which is what makes gaming preempt everything |
-| `vram_free_threshold_mb` | `2000` | VRAM-used below this = GPU "freed" — applied to the evicting unit's own attributed VRAM when available, else total GPU VRAM (see [Eviction VRAM gating](#eviction-vram-gating)) |
-| `reconcile_interval_s` | `30` | Slow backstop interval (detection is event-driven) |
-| `detect_steam` | `true` | Match `SteamLaunch AppId=` (all Steam games) |
-| `game_patterns` | `[]` | `[[game_patterns]] name/match` for non-Steam launchers |
-| `vram_heuristic` | `false` | Opt-in: heavy non-allowlisted graphics procs = games |
-| `vram_game_threshold_mb` | `4000` | Threshold for the heuristic |
-| `gpu_allowlist` | `["ollama", "kwin_wayland", "plasmashell", "Xwayland"]` | Sanctioned tenants for the `vram_heuristic` — matched (case-insensitively, no substrings) against a proc's full name/path, its basename, and its owning systemd unit when cgroup-resolved |
-| `presence_detection` | `true` | Watch physical input devices for local-presence reporting |
-| `presence_idle_threshold_s` | `600` | Physical-input silence after which `local_present = 0` |
-| `gpu_backend` | `"auto"` | GPU vendor backend: `"auto"` (nvidia-smi if present, else amdgpu sysfs, else nvidia), `"nvidia"`, or `"amd"` |
-
-### Managed units
-
-`managed_units` is an **ordered list** of systemd units the arbiter evicts from
-the GPU when a game launches (each runs the same `stop → poll-VRAM-free →
-SIGKILL` loop, in order — optionally preceded by a cooperative yield stage, see
-[Priority ladder](#priority-ladder-and-cooperative-eviction)) and restores when
-gaming ends. Each entry:
-
-| Field | Default | Purpose |
-|---|---|---|
-| `unit` | _(required)_ | systemd unit the daemon owns (or a free-form label when command overrides are set) |
-| `eager_restart` | `true` | Restart this unit when gaming ends |
-| `priority` | `50` | Tier on the [priority ladder](#priority-ladder-and-cooperative-eviction). A demand at `P` preempts every unit with `priority < P`; the comparison is strict, so equal tiers coexist |
-| `busy_cmd` | _(none)_ | Probe for "this tenant has work right now" — **exit 0 = busy**. Required for a unit to *preempt* lower tiers, and required for `yield_cmd` to work at all |
-| `yield_cmd` | _(none)_ | Cooperative release: ask the tenant to drop the GPU while staying alive, tried before any stop. **Ignored unless `busy_cmd` is also set** |
-| `resume_cmd` | _(none)_ | Undo for `yield_cmd`, run on the restore path before any start. Must be idempotent |
-| `yield_timeout_s` | _(none)_ | Per-unit cooperative-release budget before escalating to the stop path; falls back to the top-level `yield_timeout_s` |
-| `vram_match` | _(none)_ | **Fallback** substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution. A systemd-supervised unit is attributed automatically via cgroup PID resolution with no config needed; `vram_match` is only consulted for command-driven (`*_cmd`) units and non-systemd hosts (see [VRAM attribution](#vram-attribution)) |
-| `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (runs `ollama ps`); any other value reports no models and suppresses the name heuristic |
-| `introspect_cmd` | _(none)_ | Explicit command (shell-free argv) whose stdout lists loaded model/process names, one per line. Takes precedence over `kind` and the name heuristic |
-| `stop_cmd` | _(none)_ | Override: command to stop/evict the tenant (`None` → `systemctl stop`) |
-| `start_cmd` | _(none)_ | Override: command to start the tenant (`None` → `systemctl start`) |
-| `is_active_cmd` | _(none)_ | Override: command whose **exit 0 = running** (`None` → `systemctl is-active`) |
-| `kill_cmd` | _(none)_ | Override: SIGKILL-escalation command (`None` → re-run `stop_cmd`) |
-
-If `managed_units` is omitted, a single entry is synthesized from the legacy
-`ollama_unit` / `eager_ollama` fields (with `vram_match = "ollama"` and
-`kind = "ollama"`), so an unconfigured daemon behaves exactly as before —
-including `ollama ps` model introspection.
-
-### Priority ladder and cooperative eviction
-
-Gaming-beats-everything is the floor, not the whole model. Tenants also sit on a
-ladder relative to *each other*, and a tenant can be asked to let go of the GPU
-without being killed.
-
-**The ladder.** Every unit has a `priority` (default `50`); a game claims at
-`game_priority` (default `100`). A demand at priority `P` preempts every unit
-with `priority < P` and leaves everything at `>= P` alone. The comparison is
-strict, so two units at the same tier coexist rather than fighting, and a config
-that never mentions priorities keeps every unit on one equal tier — exactly the
-pre-ladder behavior, with a game still evicting them all.
+TOML at `/etc/gpu-arbiter/config.toml` (override with `--config` or
+`GPU_ARBITER_CONFIG`). Every key is optional.
+[`packaging/config.example.toml`](packaging/config.example.toml) is the annotated
+reference; a typo'd key is a **parse error**, not a silent no-op, so
+`--check-config` is trustworthy.
 
 ```toml
-game_priority = 100        # gaming wins unconditionally (the default)
-
-[[managed_units]]
-unit = "comfyui.service"
-priority = 75              # interactive image gen — beats the LLM
-busy_cmd = ["curl", "-sf", "http://127.0.0.1:8188/queue/running"]
-
 [[managed_units]]
 unit = "ollama.service"
-priority = 50              # the default tier
+priority = 50
+busy_cmd = ["sh", "-c", "ollama ps | grep -q ."]    # a busy_cmd is what lets a unit preempt
 
 [[managed_units]]
 unit = "asr.service"
-priority = 25              # background batch work — yields to everyone
-```
-
-**Demand requires a probe.** A unit only *preempts* a lower tier when its
-`busy_cmd` exits 0 ("I have work right now"). Without a `busy_cmd` a unit is a
-preemption target only, never a source — the right default, since a
-merely-running server holding an idle model should not evict anything. The probe
-runs on every reconcile pass, so it must be cheap and non-blocking; one that
-fails to spawn, times out, or exits non-zero reads as **not busy**, so a broken
-probe can never evict a lower tier on a false pretext.
-
-Inter-tenant preemption deliberately does **not** move `state` to `gaming` or
-`evicting` — those words are the `/status` contract for "a game owns the GPU,
-back off entirely", and reporting them because one tenant outranked another
-would tell a remote AI-routing consumer the box is unavailable for AI work at
-exactly the moment it is doing AI work. Preemption is visible through
-`units[].running` instead.
-
-**Cooperative release.** When a unit sets `yield_cmd`, eviction runs in two
-stages instead of one:
-
-1. **Yield** — run `yield_cmd` and poll `busy_cmd` until the tenant reports not
-   busy, up to `yield_timeout_s`. The tenant stays alive; it just parks its
-   model. For a PyTorch service that is typically `model.cpu()` +
-   `torch.cuda.empty_cache()`. Success is `EvictionOutcome::Yielded` and the
-   unit is never stopped — no in-flight work lost, no cold model reload after.
-2. **Stop** — the ordinary `stop` → poll-VRAM → SIGKILL path, reached whenever
-   the yield times out, exits non-zero, or isn't configured.
-
-Exit 0 from `yield_cmd` means "request accepted", **not** "the GPU is free" —
-which is why release is confirmed by polling `busy_cmd` rather than trusted. A
-tenant that ignores or mishandles the request therefore cannot hold the GPU
-against a higher tier; it just falls through to stage 2.
-
-> **`yield_cmd` without `busy_cmd` does nothing.** Release would be
-> unobservable, so the daemon logs a warning, skips the yield stage entirely,
-> and stops the unit. It escalates immediately rather than sleeping out the
-> budget: waiting cannot produce information it is structurally unable to
-> observe. Always configure the two together.
-
-`resume_cmd` is the undo, run on the restore path before any start. It must be
-**idempotent** — the daemon deliberately does not track whether a given unit was
-yielded or stopped, because that state would have to survive a daemon restart to
-be trustworthy; running an idempotent resume unconditionally is cheaper and
-cannot desync.
-
-Tune the two budgets from
-`gpu_arbiter_eviction_duration_seconds{stage="yield"|"stop"}` rather than by
-guessing — the stage split exists precisely to show whether the cooperative
-stage is paying for itself or merely adding latency ahead of a stop that was
-always going to happen. `yield_timeout_s` defaults to a deliberately short `3`
-seconds: it is spent *before* the stop path even begins, so it directly delays a
-game getting the GPU.
-
-### VRAM attribution
-
-Each managed unit's own VRAM (surfaced as `units[].vram_mb` in `/status`, and
-used to gate graceful eviction — see [Eviction VRAM
-gating](#eviction-vram-gating)) is attributed via two channels, tried in order:
-
-1. **cgroup PID resolution** (primary, systemd units only, no config needed):
-   every GPU compute process's `/proc/<pid>/cgroup` names the systemd unit
-   that spawned it, regardless of what binary the unit actually execs. This
-   can't be fooled by a wrapper interpreter or launcher script — the historical
-   `vram_match` gap: an `asr-runner.service` unit's GPU process might be
-   `/opt/asr-runner/venv/bin/python` (the venv interpreter), so a name
-   substring like `vram_match = "parakeet"` never matches even though the unit
-   is definitely the one holding the GPU. Cgroup attribution sidesteps that
-   entirely.
-2. **`vram_match`** (fallback): a configured substring matched against the
-   process name/path, for command-driven (`*_cmd`) units and non-systemd hosts
-   — no cgroup path resolves to a configured unit name there, so this remains
-   the only channel.
-
-Neither channel reporting a match means `vram_mb` is omitted from `/status`
-entirely (never a misleading `0`).
-
-### Eviction VRAM gating
-
-The graceful-eviction wait (`stop` → poll → SIGKILL after `eviction_timeout_s`)
-gates on the **evicting unit's own attributed VRAM**, using the same
-attribution channels as above (cgroup, then `vram_match`) — not on total GPU
-VRAM. This matters during a real game launch: the game is loading its own
-VRAM onto the GPU *concurrently* with the tenant's teardown, so gating on
-total usage rarely dropped below `vram_free_threshold_mb` before the timeout
-elapsed — eviction routinely escalated to SIGKILL even when the tenant itself
-released cleanly. Falls back to the legacy total-GPU-VRAM gate when
-attribution isn't available this poll (an attribution-incapable backend —
-AMD, always — a failed compute-proc query, or a command-driven unit with no
-`vram_match`).
-
-A zero-VRAM reading is only trusted as "this unit is drained" once the
-current eviction has already observed the unit attributed with *nonzero*
-VRAM at least once — proof the attribution channel can actually see this
-unit's process. A zero seen before that proof (a typo'd `vram_match`, an
-NVIDIA tenant holding VRAM only via a graphics context the compute-proc
-query never lists, or — pre-attribution-capability-check — AMD) degrades to
-the total-VRAM fallback gate instead of an instant, possibly-wrong "freed".
-
-### Init systems other than systemd
-
-By default each tenant is driven by **systemd** (`systemctl stop|start|
-is-active|kill`) — that path is byte-for-byte unchanged. To run the daemon on a
-host without systemd (OpenRC on Gentoo/Artix/Alpine, runit on Void, or plain
-processes), set the per-unit `*_cmd` overrides. Commands are **shell-free** — an
-explicit argv, spawned directly (never `sh -c`), so a unit name or path can't
-inject. Each is a TOML string array, or a single string split on whitespace:
-
-```toml
-[[managed_units]]
-unit = "ollama"                              # label only; not a systemd unit
-vram_match = "ollama"
-stop_cmd = ["rc-service", "ollama", "stop"]
-start_cmd = ["rc-service", "ollama", "start"]
-is_active_cmd = "rc-service ollama status"   # exit 0 = active
-# kill_cmd optional; if omitted, SIGKILL escalation re-runs stop_cmd
-```
-
-When **all** `*_cmd` are absent for a unit it is systemd-driven exactly as
-before. There is no generic SIGKILL off systemd: without `kill_cmd`, the
-escalation step re-runs `stop_cmd` as a best-effort second teardown.
-
-Example — two GPU tenants that both yield to gaming:
-
-```toml
-port = 48750
-
-[[managed_units]]
-unit = "ollama.service"
-eager_restart = true
-vram_match = "ollama"
-
-[[managed_units]]
-unit = "vllm.service"
-eager_restart = true
-vram_match = "vllm"
+priority = 25                                       # yields to the LLM as well as to games
+busy_cmd  = ["curl", "-sf", "http://127.0.0.1:9000/busy"]
+yield_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/release"]
+resume_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/acquire"]
 
 [[game_patterns]]
 name = "heroic"
 match = "Heroic"
 ```
 
-## Build & deploy
+Non-systemd hosts (OpenRC, runit, plain processes) are supported through
+per-unit `stop_cmd` / `start_cmd` / `is_active_cmd` / `kill_cmd` overrides, each
+a shell-free argv. Full key reference:
+[docs/reference.md](docs/reference.md#configuration) or
+`man ./man/gpu-arbiter-config.5`.
 
-```sh
-cargo build --release                                   # native
-cargo build --release --target x86_64-unknown-linux-musl  # static (deploy target)
-```
+## HTTP surface
 
-For development setup and CI checks, see [CONTRIBUTING.md](CONTRIBUTING.md).
+Read-only endpoints on a TCP port (default `48750`); the **write** path is a
+root-owned `0600` unix socket, so there are no bearer tokens to leak.
 
-The daemon is **Linux-only at runtime** (netlink `cn_proc`, `/proc`,
-`nvidia-smi`, `systemctl`) but builds and tests on any host: Linux-only edges are
-`#[cfg(target_os = "linux")]` with non-Linux stubs, and the pure decision logic
-(classification, config parse, `nvidia-smi`/`/proc` parsing, state transitions)
-is cross-platform and unit-tested with literal inputs.
+| Method | Path | Transport |
+|---|---|---|
+| GET | `/status` | TCP — full state snapshot |
+| GET | `/metrics` | TCP — Prometheus exposition |
+| GET | `/healthz` | TCP — liveness |
+| POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket — manual override |
 
-CI publishes a static `x86_64-unknown-linux-musl` binary as a GitHub release
-artifact; your deployment tooling (e.g. Ansible) can fetch it by version (on-host
-`cargo build` is the fallback) and install it as a root systemd unit.
+`{unit}` is validated against `managed_units`, so the endpoint cannot drive
+arbitrary systemd units. `/metrics` exposes the state machine, per-unit VRAM
+attribution, local-presence detection, and eviction/reconcile counters plus a
+per-stage duration histogram.
 
-## Man pages
+`gpu_arbiter_gaming AND NOT gpu_arbiter_local_present` is the signal an
+"abandoned game left running" alert should key off — the daemon distinguishes a
+human at the desk from a remote stream by excluding the virtual input devices
+Moonlight/Sunshine inject, via sysfs parentage.
 
-Reference manuals live under [`man/`](man):
+Full payload, every metric, the CLI (`status` / `wait` / `watch`), and exit
+codes: [docs/reference.md](docs/reference.md) or `man ./man/gpu-arbiter.8`.
 
-- [`gpu-arbiter.8`](man/gpu-arbiter.8) — daemon usage, the cn_proc/eviction model,
-  the HTTP control surface (TCP + unix socket), the `status` / `wait` / `watch` /
-  `--check-config` CLI with exit codes, and signal handling
-  (SIGTERM/SIGINT/SIGHUP).
-- [`gpu-arbiter-config.5`](man/gpu-arbiter-config.5) — every config key, including
-  the per-unit `kind` / `introspect_cmd` introspection backends.
+## Design notes
 
-Render locally with `man ./man/gpu-arbiter.8` and `man ./man/gpu-arbiter-config.5`.
+A few decisions that are less obvious than they look:
+
+- **VRAM is attributed by cgroup, not by process name.** The obvious approach —
+  substring-match the GPU process name against the unit name — breaks on any
+  unit that execs a wrapper: an `asr-runner.service` whose GPU process is
+  `/opt/asr-runner/venv/bin/python` never matches. Reading
+  `/proc/<pid>/cgroup` names the owning systemd unit regardless of which binary
+  it ran, and cannot be fooled by an interpreter or launcher script.
+- **Eviction gates on the tenant's *own* VRAM.** Gating on total GPU VRAM meant
+  a game loading its textures concurrently with the teardown kept usage above
+  the threshold, so evictions escalated to `SIGKILL` even when the tenant had
+  released cleanly.
+- **A zero VRAM reading is not trusted until a nonzero one is seen first.**
+  Otherwise a typo'd `vram_match` reads as "already drained" and the daemon
+  reports a completed eviction while the tenant still holds the card.
+- **`yield_cmd` requires `busy_cmd`.** Without a probe, cooperative release is
+  unobservable — the daemon would declare success on zero evidence. It refuses
+  the stage instead of guessing.
+- **Linux-only at runtime, portable at build time.** Every Linux-only edge is
+  `#[cfg(target_os = "linux")]` with a non-Linux stub, so the decision logic —
+  classification, config parsing, `nvidia-smi` and `/proc` parsing, state
+  transitions — compiles and unit-tests on macOS and Windows too.
+
+That last point is what makes the test suite worth its weight: **283 tests
+across ~6,500 lines of test code against ~7,500 lines of implementation**,
+driven by literal captured inputs (real `nvidia-smi` output, real `/proc`
+cmdlines, the verbatim render of a real deployment template) rather than mocks.
+
+## Requirements
+
+- **Linux** — `cn_proc` netlink and `/proc` scanning are Linux-only
+- **root** (`CAP_NET_ADMIN` for the `cn_proc` multicast socket; also drives
+  `systemctl` and `nvidia-smi`)
+- **A GPU** — NVIDIA (`nvidia-smi` on `PATH`) or AMD (VRAM from
+  `/sys/class/drm/card*/device/mem_info_vram_*`); auto-detected. AMD's sysfs
+  exposes no per-process VRAM, so per-unit attribution degrades to empty there —
+  eviction itself works identically.
+- **systemd** by default; other init systems via the per-unit `*_cmd` overrides
+- **Rust 1.88+** to build from source (edition 2024)
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/reference.md](docs/reference.md) | HTTP API, metrics, CLI, exit codes, every config key |
+| [`man/gpu-arbiter.8`](man/gpu-arbiter.8) | Daemon usage, eviction model, control surface, signals |
+| [`man/gpu-arbiter-config.5`](man/gpu-arbiter-config.5) | Config file reference |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, CI checks, release process |
 
 ## License
 

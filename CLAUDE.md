@@ -75,6 +75,10 @@ The annotated example at `packaging/config.example.toml` is the authoritative re
 - `man/gpu-arbiter.8` — daemon man page
 - `man/gpu-arbiter-config.5` — config reference man page
 
+## Documentation layout
+
+`README.md` is a front door (pitch, install, how it works, design notes) and is deliberately kept short. The full HTTP/CLI/config reference lives in `docs/reference.md`, mirrored offline by the two man pages. `packaging/config.example.toml` is the authoritative annotated config reference. See CONTRIBUTING.md for which files a given change has to touch.
+
 ## Runtime requirements (Linux only)
 
 - Root / `CAP_NET_ADMIN` (for `cn_proc` netlink socket and `systemctl`)

@@ -33,7 +33,19 @@ CI runs format check → clippy → build → test on every PR; all must pass.
 
 ## Documentation
 
-Keep documentation current as part of the change, not as a follow-up — update the README and any affected docs in the same PR. A new config key should be reflected in `packaging/config.example.toml` (the authoritative config reference) and, where relevant, the man pages under `man/`.
+Keep documentation current as part of the change, not as a follow-up — update the affected docs in the same PR.
+
+The docs are split by audience, so a change usually touches more than one:
+
+| File | Audience |
+|---|---|
+| `README.md` | First-time visitor — what it does, how to install, why the design is the way it is. Keep it a front door, not a manual. |
+| `docs/reference.md` | Someone configuring or integrating — the full HTTP, CLI, and config-key reference. |
+| `packaging/config.example.toml` | Operator editing a live config. The authoritative annotated key reference. |
+| `man/gpu-arbiter.8`, `man/gpu-arbiter-config.5` | Same material as the two above, offline. Verify with `groff -man -ww -z man/<page>`. |
+| `CLAUDE.md` | Coding agents working in this repo. |
+
+A new config key needs an entry in `config.example.toml`, `docs/reference.md`, and `man/gpu-arbiter-config.5` at minimum. A new metric or endpoint needs `docs/reference.md` and `man/gpu-arbiter.8`. Confirm any config you document actually parses: `gpu-arbiter --check-config --config <file>`.
 
 ## Before you open a PR
 
