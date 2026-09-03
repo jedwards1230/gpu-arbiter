@@ -8,7 +8,7 @@
 //! truth. For the same reason a recoverable `recv` overflow (`ENOBUFS` — the
 //! kernel dropped events under a storm) is **logged-and-continued**, not fatal:
 //! the socket is still alive, so the listener keeps running and the backstop
-//! covers the gap (see [`is_enobufs`]).
+//! covers the gap (see `is_enobufs`).
 //!
 //! ## Safety of the netlink parse (this is a root daemon)
 //!

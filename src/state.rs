@@ -281,7 +281,7 @@ pub struct ArbiterState {
     pub presence: Presence,
     /// Unit names an operator has manually stopped via `POST
     /// /units/{unit}/stop`. Consulted by the ensure-running post-step (see
-    /// [`crate::reconcile::ensure_running_targets`]), which skips any unit in
+    /// `crate::reconcile::ensure_running_targets`), which skips any unit in
     /// this set even though the GPU is free — otherwise the very next reconcile
     /// pass (even the periodic backstop timer) would immediately restart a unit
     /// the operator just stopped. A hold survives gaming↔available transitions

@@ -424,7 +424,7 @@ pub struct Config {
     /// launch and restores when gaming ends — the one list the daemon drives
     /// off (see [`Config::resolved_units`]). When omitted from the config
     /// file entirely, defaults to a single Ollama entry (see
-    /// [`default_managed_units`]), so a zero-config daemon still evicts,
+    /// `default_managed_units`), so a zero-config daemon still evicts,
     /// attributes VRAM for, and introspects (`ollama ps`) Ollama.
     #[serde(default = "default_managed_units")]
     pub managed_units: Vec<ManagedUnit>,

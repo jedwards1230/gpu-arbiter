@@ -63,7 +63,7 @@ pub enum UnitError {
         /// Failure detail (trimmed stderr, or why nothing ran).
         detail: String,
     },
-    /// A process-control invocation exceeded [`SYSTEMCTL_TIMEOUT`]. A wedged
+    /// A process-control invocation exceeded `SYSTEMCTL_TIMEOUT`. A wedged
     /// init system (stuck D-Bus, hung PID 1 transaction) must never hang the
     /// single reconcile task, so every control invocation is time-boxed.
     #[error("{action} {unit} timed out after {elapsed:?}")]
@@ -401,7 +401,7 @@ pub enum EvictionStep {
 /// game's concurrent VRAM growth irrelevant to this decision.
 ///
 /// **Structurally blind attribution, and the seen-nonzero gate:**
-/// `Attributed` is only ever constructed by [`unit_vram_reading`] when the
+/// `Attributed` is only ever constructed by `unit_vram_reading` when the
 /// *backend* can attribute per-process VRAM at all
 /// ([`gpu::GpuBackend::attribution_capable`] — AMD structurally can't, since
 /// sysfs exposes no per-process interface, so it never reaches this variant)
@@ -420,7 +420,7 @@ pub enum UnitVramReading {
     /// `vram_match` (command-driven units) — see
     /// [`gpu::attribute_unit_vram`]. `0` is a legitimate, meaningful reading
     /// (the unit is fully drained, not merely "not measured") **only because**
-    /// [`unit_vram_reading`] never constructs this variant with `0` unless an
+    /// `unit_vram_reading` never constructs this variant with `0` unless an
     /// earlier poll in this eviction already proved the channel can see the
     /// unit — see the seen-nonzero note above.
     Attributed(u64),
@@ -856,7 +856,7 @@ fn resolve_unit<'c>(cfg: &'c Config, unit: &str) -> Result<&'c ManagedUnit, Unit
         })
 }
 
-/// [`start`], resolving `unit` by name against `cfg` first. See [`resolve_unit`].
+/// [`start`], resolving `unit` by name against `cfg` first. See `resolve_unit`.
 ///
 /// # Errors
 ///
@@ -866,7 +866,7 @@ pub async fn start_by_name(cfg: &Config, unit: &str) -> Result<(), UnitError> {
     start(resolve_unit(cfg, unit)?).await
 }
 
-/// [`evict`], resolving `unit` by name against `cfg` first. See [`resolve_unit`].
+/// [`evict`], resolving `unit` by name against `cfg` first. See `resolve_unit`.
 ///
 /// # Errors
 ///

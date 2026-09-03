@@ -718,7 +718,7 @@ pub enum HttpError {
 /// Split from [`serve_on`]/[`serve`] specifically so a bind failure (the port
 /// already in use, a permission error) is something the caller can await and
 /// propagate **synchronously at startup**, before anything is spawned — see
-/// [`crate::main`]'s wiring. A bind failure inside a detached `tokio::spawn`ed
+/// `main`'s startup wiring. A bind failure inside a detached `tokio::spawn`ed
 /// task would otherwise be logged and swallowed, leaving the daemon "running"
 /// with no working HTTP surface at all.
 ///
@@ -810,12 +810,12 @@ async fn socket_is_live(path: &std::path::Path) -> bool {
 ///
 /// - Creates the parent directory (mode `0700`, root-owned — see below) if
 ///   missing. The default `socket_path`
-///   ([`crate::config::default_socket_path`]) is
+///   (`crate::config::default_socket_path`) is
 ///   `/run/gpu-arbiter/gpu-arbiter.sock`, a dedicated subdirectory rather
 ///   than bare `/run`, specifically so this directory exists and is ours to
 ///   lock down; a custom `socket_path` may also name a (possibly nested)
 ///   subdirectory.
-/// - Probes for a live listener at `socket_path` ([`socket_is_live`]) and
+/// - Probes for a live listener at `socket_path` (`socket_is_live`) and
 ///   fails with [`HttpError::SocketInUse`] rather than unlinking it if one
 ///   answers — a stale-looking socket file is not always actually stale.
 /// - Only once the probe clears: removes a stale socket file left by an
@@ -1084,7 +1084,7 @@ fn guard_unit<'c>(
 }
 
 /// Whether `unit` is one the daemon manages (and may therefore be controlled via
-/// `/units/*`). Pure — unit-tested. Not on [`guard_unit`]'s hot path (`guard_unit`
+/// `/units/*`). Pure — unit-tested. Not on `guard_unit`'s hot path (`guard_unit`
 /// resolves the unit directly in one pass); kept as an independent predicate
 /// other callers can use without needing the full `&ManagedUnit`.
 #[must_use]

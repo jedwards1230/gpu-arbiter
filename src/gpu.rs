@@ -73,7 +73,7 @@ pub enum GpuError {
         stderr: String,
     },
     /// A vendor command exceeded its bound. Every shell-out is time-boxed (see
-    /// [`NVIDIA_SMI_TIMEOUT`]) so a wedged GPU/driver hang can never stall the
+    /// `NVIDIA_SMI_TIMEOUT`) so a wedged GPU/driver hang can never stall the
     /// eviction loop; this is that bound firing, distinct from a spawn/exit
     /// failure.
     #[error("{command} timed out after {elapsed:?}")]
@@ -503,7 +503,7 @@ pub fn vram_mb_matching(compute: &[GpuComputeProc], needle: &str) -> Option<u64>
 /// exactly `unit_name`. Same "`None` when nothing matched" contract as
 /// [`vram_mb_matching`] (so `/status` omits the field instead of asserting a
 /// misleading `0` for a unit nothing was ever attributed to) — see
-/// [`unit_vram_sum`] for the eviction-gating counterpart, which needs an
+/// `unit_vram_sum` for the eviction-gating counterpart, which needs an
 /// explicit `0` to mean "confirmed drained".
 #[must_use]
 pub fn vram_mb_by_cgroup(compute: &[GpuComputeProc], unit_name: &str) -> Option<u64> {
