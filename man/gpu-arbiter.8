@@ -454,10 +454,59 @@ SIGHUP logs a notice that config is not hot\-reloaded and a restart is
 required \(em it does not reload, reset, or terminate the daemon. This is
 safe: startup always reconciles against observed truth before anything can
 touch a managed unit, so a restart never "loses" state.
-.SH NOTES
-The daemon runs only on Linux. The crate still builds and unit\-tests on any host
-(including macOS) via a library/stub split; the pure decision logic is
-cross\-platform and tested with literal inputs.
+.SH PLATFORMS
+The daemon runs on
+.B Linux
+and
+.BR "Windows 11" .
+The reconciliation core is shared; only observation and unit control differ.
+.TP
+.B Detection
+Linux uses the
+.B cn_proc
+netlink connector \(em event\-driven, sub\-second, idle between launches. Windows
+has no equivalent and enumerates processes on the reconcile timer instead, so
+detection latency there is whatever
+.B reconcile_interval_s
+is set to; lower it well below the 30\-second default. Correctness is unaffected
+either way, because reconciliation is level\-triggered rather than
+delta\-maintained.
+.TP
+.B Unit control
+Linux drives systemd by default. Windows has no default supervisor \(em set the
+per\-unit
+.B *_cmd
+overrides
+.RB ( sc.exe ,
+WinSW, and so on).
+.TP
+.B VRAM
+Per\-process VRAM is unavailable under Windows' WDDM driver model
+.RB ( nvidia-smi
+reports
+.B [N/A]
+for every process), so eviction gates on service state rather than on VRAM
+draining, and per\-unit VRAM is absent from
+.IR /status .
+.TP
+.B Control socket
+The unix control socket is Linux\-only; on Windows the sole write path is the TCP
+surface, which has no peer\-credential check. Scope
+.B bind
+with a firewall rule there.
+.TP
+.B Presence detection
+Linux\-only (evdev). On Windows presence is always reported as unknown.
+.PP
+On any other platform \(em macOS, notably \(em the daemon
+.B refuses to start
+and exits non\-zero: there is no process\-enumeration backend, and an empty
+process list would read as
+.IR available ,
+so the daemon would never evict and would restart tenants into a live game. The
+crate still builds and unit\-tests there, and the client subcommands
+.RB ( status ", " wait ", " watch ", " --check-config )
+work against a daemon anywhere.
 .SH SEE ALSO
 .BR gpu-arbiter-config (5),
 .BR systemctl (1),

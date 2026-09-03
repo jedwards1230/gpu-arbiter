@@ -261,9 +261,10 @@ fn run_watch(base_url: &str, json: bool) -> i32 {
     }
 }
 
-// Linux is the only runtime target (netlink cn_proc, /proc, nvidia-smi,
-// systemctl). The crate still builds/tests on macOS via the non-Linux `main`
-// stub below and the cfg-gated/stubbed module internals.
+// Linux and Windows are the runtime targets: both have a process-enumeration
+// backend behind `reconcile::observe`, which is the one capability the daemon
+// cannot do without. The crate still builds/tests on macOS via the stub `main`
+// below and the cfg-gated module internals.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = handle_cli_or_get_daemon_config();

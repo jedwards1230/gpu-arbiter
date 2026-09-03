@@ -12,11 +12,13 @@ the GPU, and the moment you quit, it needs to come back. Doing that by hand
 means remembering to stop services before you play and restart them after; doing
 it with a timer means either stuttering games or an idle card.
 
-`gpu-arbiter` is a small Linux root daemon that does it automatically. It watches
-the kernel's process-event connector (`cn_proc`) for game launches, evicts the
-configured GPU tenants, restores them when you quit, and publishes machine
-availability over HTTP so *other* hosts can route AI work elsewhere while you
-play.
+`gpu-arbiter` is a small privileged daemon that does it automatically. It watches
+for game launches, evicts the configured GPU tenants, restores them when you
+quit, and publishes machine availability over HTTP so *other* hosts can route AI
+work elsewhere while you play.
+
+It runs on **Linux and Windows**, with real differences between them — see
+[Platform support](#platform-support).
 
 ```console
 $ gpu-arbiter status
@@ -47,9 +49,10 @@ install -Dm644 packaging/config.example.toml /etc/gpu-arbiter/config.toml
 systemctl enable --now gpu-arbiter
 ```
 
-Releases also carry `gpu-arbiter-tray-x86_64-unknown-linux-musl`, an optional
-user-session tray indicator, and a Windows build of the *client* half
-(`status`/`wait`/`watch`) — the daemon itself is Linux-only.
+Releases also carry `gpu-arbiter-tray-x86_64-unknown-linux-musl` (an optional
+user-session tray indicator) and `gpu-arbiter-x86_64-pc-windows-msvc.exe`, which
+runs the **full daemon** on Windows 11 as well as the CLI client. See
+[Platform support](#platform-support) for what differs there.
 
 **From source** — `cargo build --release`, or
 `cargo build --release --target x86_64-unknown-linux-musl` for the static build.
@@ -66,15 +69,15 @@ with `gpu-arbiter --check-config`.
 ## How it works
 
 Control is **level-triggered reconciliation** — the Kubernetes controller
-pattern. `reconcile()` observes ground truth (a `/proc` scan, optionally the
-GPU's process list), recomputes the full claim set from scratch, and drives the
-managed units to match. No state is delta-maintained, so the daemon self-heals
-across crashes, restarts, and dropped kernel events.
+pattern. `reconcile()` observes ground truth (the running process list,
+optionally the GPU's process list), recomputes the full claim set from scratch,
+and drives the managed units to match. No state is delta-maintained, so the
+daemon self-heals across crashes, restarts, and dropped events.
 
 ```
-  cn_proc netlink ─┐
-  30s backstop  ───┤
-  daemon startup ──┼──▶  reconcile()  ──▶  observe /proc + GPU
+  process events ──┐   (cn_proc netlink on Linux)
+  backstop timer ──┤
+  daemon startup ──┼──▶  reconcile()  ──▶  observe processes + GPU
   manual HTTP POST ┘          │                    │
                               │              recompute claims
                               │                    │
@@ -86,11 +89,13 @@ across crashes, restarts, and dropped kernel events.
 
 Four things fall out of that design:
 
-- **Sub-second reaction.** `cn_proc` is an event stream, not a poll — zero CPU
-  between launches.
-- **Dropped events cannot wedge it.** A ~30 s backstop timer reconciles
-  regardless, and since state is recomputed rather than patched, a missed event
-  costs latency, never correctness.
+- **Sub-second reaction on Linux.** `cn_proc` is an event stream, not a poll —
+  zero CPU between launches. Windows has no equivalent, so it reconciles on the
+  timer and detection latency is whatever `reconcile_interval_s` is set to.
+- **Dropped events cannot wedge it.** The backstop timer reconciles regardless,
+  and since state is recomputed rather than patched, a missed event costs
+  latency, never correctness. That same property is what let the Windows port
+  drop the event source entirely and still be correct.
 - **A restart never starts a tenant into a live game.** Startup reconciles
   before doing anything else.
 - **Shutdown is genuinely graceful.** `SIGTERM`/`SIGINT` let an in-flight
@@ -105,8 +110,9 @@ losing no in-flight work and paying no cold-reload cost. See
 
 ## Configure
 
-TOML at `/etc/gpu-arbiter/config.toml` (override with `--config` or
-`GPU_ARBITER_CONFIG`). Every key is optional.
+TOML at `/etc/gpu-arbiter/config.toml`, or
+`C:\ProgramData\gpu-arbiter\config.toml` on Windows (override either with
+`--config` or `GPU_ARBITER_CONFIG`). Every key is optional.
 [`packaging/config.example.toml`](packaging/config.example.toml) is the annotated
 reference; a typo'd key is a **parse error**, not a silent no-op, so
 `--check-config` is trustworthy.
@@ -137,8 +143,10 @@ a shell-free argv. Full key reference:
 
 ## HTTP surface
 
-Read-only endpoints on a TCP port (default `48750`); the **write** path is a
-root-owned `0600` unix socket, so there are no bearer tokens to leak.
+Read-only endpoints on a TCP port (default `48750`); on Linux the **write** path
+is a root-owned `0600` unix socket, so there are no bearer tokens to leak.
+Windows has no unix-socket listener, so its only write path is the TCP surface,
+which has no peer-credential check — scope `bind` with a firewall rule there.
 
 | Method | Path | Transport |
 |---|---|---|
@@ -180,26 +188,58 @@ A few decisions that are less obvious than they look:
 - **`yield_cmd` requires `busy_cmd`.** Without a probe, cooperative release is
   unobservable — the daemon would declare success on zero evidence. It refuses
   the stage instead of guessing.
-- **Linux-only at runtime, portable at build time.** Every Linux-only edge is
-  `#[cfg(target_os = "linux")]` with a non-Linux stub, so the decision logic —
-  classification, config parsing, `nvidia-smi` and `/proc` parsing, state
-  transitions — compiles and unit-tests on macOS and Windows too.
+- **Platform-specific at the edges, portable in the middle.** Every OS-specific
+  edge is `cfg`-gated with a stub, so the decision logic — classification, config
+  parsing, `nvidia-smi` and `/proc` parsing, state transitions — is one
+  implementation shared by Linux and Windows and unit-tested on all three
+  platforms including macOS. Porting the daemon to Windows changed how ground
+  truth is *observed*, not how any of it is *decided*.
+- **The daemon refuses to start where it cannot observe.** On a platform with no
+  process-enumeration backend, an empty process list would read as "no claims" →
+  `available` → restart a tenant into a live game. Exiting non-zero is the only
+  safe answer, so macOS gets the CLI client and nothing else.
 
 That last point is what makes the test suite worth its weight: **283 tests
 across ~6,500 lines of test code against ~7,500 lines of implementation**,
 driven by literal captured inputs (real `nvidia-smi` output, real `/proc`
 cmdlines, the verbatim render of a real deployment template) rather than mocks.
 
+## Platform support
+
+The daemon runs on **Linux and Windows**. The core is identical — reconciliation
+is level-triggered, so the platform only changes how ground truth is observed and
+how units are driven — but the differences are worth knowing before you deploy:
+
+| | Linux | Windows 11 |
+|---|---|---|
+| **Daemon** | ✅ | ✅ |
+| **Detection** | `cn_proc` netlink — event-driven, sub-second, zero CPU idle | process enumeration on the reconcile timer |
+| **Detection latency** | milliseconds | `reconcile_interval_s` — **lower it** (the 30 s default means a 30 s worst case) |
+| **Supervisor** | systemd by default | no default — set the per-unit `*_cmd` overrides (`sc.exe`, WinSW, …) |
+| **Per-unit VRAM** | cgroup attribution, `vram_match` fallback | unavailable — WDDM reports `[N/A]` per process, so eviction gates on service state instead |
+| **Write path** | unix socket, `0600` root-owned | **TCP only** — no peer-credential check, so scope `bind` with a firewall rule. A named-pipe listener is planned |
+| **Presence detection** | evdev input devices | unavailable — reported as unknown |
+| **Tray indicator** | ✅ | — |
+
+macOS is a **build and test target only** — the library compiles and the full
+test suite runs, and the CLI client (`status`, `wait`, `watch`,
+`--check-config`) works against a daemon anywhere, but the daemon itself refuses
+to start. That is deliberate: there is no process-enumeration backend there, and
+an empty process list would read as `available`, so the daemon would never evict
+and would happily restart a tenant into a live game.
+
 ## Requirements
 
-- **Linux** — `cn_proc` netlink and `/proc` scanning are Linux-only
-- **root** (`CAP_NET_ADMIN` for the `cn_proc` multicast socket; also drives
-  `systemctl` and `nvidia-smi`)
+- **Linux or Windows 11** to run the daemon (see the table above)
+- **root** / **Administrator** — Linux needs `CAP_NET_ADMIN` for the `cn_proc`
+  multicast socket and drives `systemctl`; both drive `nvidia-smi` and their
+  service manager
 - **A GPU** — NVIDIA (`nvidia-smi` on `PATH`) or AMD (VRAM from
   `/sys/class/drm/card*/device/mem_info_vram_*`); auto-detected. AMD's sysfs
   exposes no per-process VRAM, so per-unit attribution degrades to empty there —
   eviction itself works identically.
-- **systemd** by default; other init systems via the per-unit `*_cmd` overrides
+- **systemd** on Linux by default; other init systems (and Windows) via the
+  per-unit `*_cmd` overrides
 - **Rust 1.88+** to build from source (edition 2024)
 
 ## Documentation

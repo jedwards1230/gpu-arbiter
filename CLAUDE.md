@@ -2,7 +2,7 @@
 
 @CONTRIBUTING.md
 
-A Linux root daemon that treats a shared GPU machine as **gaming-first, AI-compute-second**. It detects game launches via the kernel `cn_proc` process-event connector, evicts configured GPU compute tenants (e.g. Ollama) from the GPU, restores them when gaming ends, and exposes an HTTP control surface: a TCP port (default `48750`, bind address configurable via `bind`) for the read-only endpoints (`/status`, `/metrics`, `/healthz`) plus deprecated loopback-gated TCP write routes, and a **unix control socket** (`socket_path`, default `/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned in a mode-`0700` parent directory) as the sanctioned write path — `POST /units/{unit}/start|stop` plus `/ollama/start|stop` back-compat aliases addressing the first managed unit. Manual overrides (either transport) are routed through the reconcile task (the sole caller of unit start/evict — no handler-vs-reconcile race); a manual `stop` **holds** the unit down (surfaced as `held` in `/status`) until a manual `start` or a daemon restart, and a manual `start` is **rejected with 409** while a game holds the GPU (state `gaming`/`evicting` — never start a tenant into a live game). CLI composition: `status [-q|--json]`, `wait [--for available|claimed]`, and `watch [--json]` poll `/status` against `--url`/`GPU_ARBITER_URL`/local-config precedence. SIGHUP logs a restart-required notice rather than hot-reloading config (an immutable `Arc<Config>` is threaded through every task).
+A privileged daemon (Linux and Windows) that treats a shared GPU machine as **gaming-first, AI-compute-second**. It detects game launches by observing running processes — via the kernel `cn_proc` process-event connector on Linux, enumeration on the reconcile timer on Windows — evicts configured GPU compute tenants (e.g. Ollama) from the GPU, restores them when gaming ends, and exposes an HTTP control surface: a TCP port (default `48750`, bind address configurable via `bind`) for the read-only endpoints (`/status`, `/metrics`, `/healthz`) plus deprecated loopback-gated TCP write routes, and a **unix control socket** (`socket_path`, default `/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned in a mode-`0700` parent directory) as the sanctioned write path — `POST /units/{unit}/start|stop` plus `/ollama/start|stop` back-compat aliases addressing the first managed unit. Manual overrides (either transport) are routed through the reconcile task (the sole caller of unit start/evict — no handler-vs-reconcile race); a manual `stop` **holds** the unit down (surfaced as `held` in `/status`) until a manual `start` or a daemon restart, and a manual `start` is **rejected with 409** while a game holds the GPU (state `gaming`/`evicting` — never start a tenant into a live game). CLI composition: `status [-q|--json]`, `wait [--for available|claimed]`, and `watch [--json]` poll `/status` against `--url`/`GPU_ARBITER_URL`/local-config precedence. SIGHUP logs a restart-required notice rather than hot-reloading config (an immutable `Arc<Config>` is threaded through every task).
 
 ## Architecture
 
@@ -22,13 +22,26 @@ The crate is structured as a library (`src/lib.rs`) plus two binaries:
 | `units.rs` | Managed-unit lifecycle (stop → poll VRAM → SIGKILL). Abstracts the init system via `Supervisor` — default is systemd (`systemctl`), but per-unit `*_cmd` overrides enable OpenRC, runit, or plain process control. Each tenant follows the identical eviction loop regardless of backend. |
 | `reconcile.rs` | Reconciliation authority: `/proc` scan → claim set → drive managed units. Responds to multiple trigger sources: `cn_proc` exec/exit events, the periodic backstop timer, daemon startup, and HTTP POST manual triggers. |
 | `http.rs` | axum HTTP: TCP server (`GET /status /metrics /healthz` + deprecated `POST /units/{unit}/start|stop`) and a unix-socket server (`write_router`/`serve_uds`) serving only the write path — the sanctioned control surface (#17) |
-| `procmon.rs` | Async event-driven `cn_proc` netlink listener — subscribes to kernel process events (exec/exit) and forwards debounced `ReconcileTrigger` messages. Not a polling loop: zero CPU between events; dropped events are covered by the timer backstop. (Linux-only; parks as a stub on macOS.) |
-| `presence.rs` | Optional physical-input-device watcher: epoll-watches `/dev/input/event*` via evdev/inotify to timestamp the last human input event. Excludes virtual Moonlight/Sunshine devices by sysfs parentage. Feeds `local_present` / `input_monitor_up` into the snapshot. (Linux-only; stub on macOS.) |
-| `cgroup.rs` | cgroup-based PID → systemd-unit attribution: parses `/proc/<pid>/cgroup` to resolve the owning unit for a GPU process, independent of the process's own name/binary. Feeds `/status` per-unit VRAM (`reconcile.rs`), per-unit eviction gating (`units.rs`), and `gpu_allowlist` unit matching (`classify.rs`). (Linux-only; stub on macOS.) |
+| `procmon.rs` | Async event-driven `cn_proc` netlink listener — subscribes to kernel process events (exec/exit) and forwards debounced `ReconcileTrigger` messages. Not a polling loop: zero CPU between events; dropped events are covered by the timer backstop. (Linux-only; parks as a stub on Windows and macOS — Windows relies on the reconcile timer instead.) |
+| `presence.rs` | Optional physical-input-device watcher: epoll-watches `/dev/input/event*` via evdev/inotify to timestamp the last human input event. Excludes virtual Moonlight/Sunshine devices by sysfs parentage. Feeds `local_present` / `input_monitor_up` into the snapshot. (Linux-only; stub elsewhere, so presence is always unknown on Windows.) |
+| `cgroup.rs` | cgroup-based PID → systemd-unit attribution: parses `/proc/<pid>/cgroup` to resolve the owning unit for a GPU process, independent of the process's own name/binary. Feeds `/status` per-unit VRAM (`reconcile.rs`), per-unit eviction gating (`units.rs`), and `gpu_allowlist` unit matching (`classify.rs`). (Linux-only; stub elsewhere — Windows has no per-process VRAM at all.) |
 
 **Reconciliation model**: level-triggered, K8s-controller style. `reconcile()` observes ground truth (`/proc` scan, optional GPU procs), recomputes the full claim set, and drives managed units. No delta state — self-heals across crashes and dropped events. Triggers: `cn_proc` exec/exit netlink events (primary, sub-second reaction), a ~30 s periodic backstop timer (`reconcile_interval_s`; default 30), startup reconciliation (a restart never starts Ollama into a live game), and `POST /units/{unit}/start|stop` manual HTTP triggers (localhost-only) — the HTTP handler enqueues a `ReconcileTrigger::ManualStart`/`ManualStop` (carrying a oneshot reply channel) and awaits the outcome; the reconcile task is the sole caller of `units::start`/`units::evict`. Graceful shutdown (SIGTERM/SIGINT) cancels the reconcile task's own trigger loop rather than `abort()`ing it, so an in-flight eviction always finishes its kill window first.
 
-**Cross-platform invariant**: the daemon is Linux-only at runtime but builds and tests on any host. Linux-only edges are `#[cfg(target_os = "linux")]` with non-Linux stubs. Pure-logic modules (classification, config parse, state transitions) are unit-tested on macOS.
+**Cross-platform invariant**: the daemon runs on **Linux and Windows** and builds/tests on any host. OS-specific edges are `cfg`-gated with stubs; pure-logic modules (classification, config parse, state transitions) are shared and unit-tested on all three platforms including macOS.
+
+The daemon **refuses to start** on any platform without a process-enumeration backend (macOS): an empty process list reads as "no claims" → `available`, so it would never evict and would restart tenants into a live game. `main` there exits non-zero after handling the client subcommands.
+
+Windows differences worth holding in mind when changing code:
+
+| Concern | Linux | Windows |
+|---|---|---|
+| Observation | `cn_proc` netlink (event-driven) | `sysinfo` enumeration on the reconcile timer — `procmon::run` parks |
+| Supervisor | systemd default | no default; needs per-unit `*_cmd` |
+| Per-unit VRAM | cgroup + `vram_match` | none (WDDM reports `[N/A]`); eviction gates on service state |
+| Write path | unix socket `0600` | TCP only — no peer-credential check; named pipe is a future phase |
+| Presence | evdev | stub; always unknown |
+| Config default | `/etc/gpu-arbiter/config.toml` | `C:\ProgramData\gpu-arbiter\config.toml` |
 
 ## Deployed artifact
 
@@ -47,14 +60,14 @@ Pinned via `rust-toolchain.toml` to an exact version (currently 1.96.1), Rust �
 
 | Workflow | Triggers | What it does |
 |----------|----------|-------------|
-| `rust.yml` | Push/PR touching `src/**`, `Cargo.*`, `rust-toolchain.toml` | fmt → clippy → build (release) → test → build (musl static) |
+| `rust.yml` | Push/PR touching `src/**`, `Cargo.*`, `rust-toolchain.toml` | fmt → clippy → build (release) → test → build (musl static), plus a Windows job that builds and smoke-tests the client's unreachable-daemon exit code |
 | `lint.yml` | Push/PR touching `.github/workflows/**` | actionlint on workflow files |
-| `release.yml` | Push to `main` (opt-in via `semver:*` PR label) | AI-generated release notes, publishes musl binary as a GitHub Release artifact |
+| `release.yml` | Push to `main` (opt-in via `semver:*` PR label) | AI-generated release notes; publishes the musl daemon + tray binaries and the Windows `.exe` (the full daemon, not just the client) as Release artifacts |
 | `claude-pr-review.yml` | Pull requests | Automated Claude Code PR review |
 
 ## Configuration
 
-Default path: `/etc/gpu-arbiter/config.toml` (override via `--config`/`-c` flag or `GPU_ARBITER_CONFIG` env var). A missing file is not an error — built-in defaults apply.
+Default path: `/etc/gpu-arbiter/config.toml`, or `C:\ProgramData\gpu-arbiter\config.toml` on Windows (override via `--config`/`-c` flag or `GPU_ARBITER_CONFIG` env var). A missing file is not an error — built-in defaults apply.
 
 The annotated example at `packaging/config.example.toml` is the authoritative reference. Every key is optional; the daemon is fully usable with zero config (evicts `ollama.service` on Steam game detection by default). Key configuration categories:
 
@@ -79,16 +92,16 @@ The annotated example at `packaging/config.example.toml` is the authoritative re
 
 `README.md` is a front door (pitch, install, how it works, design notes) and is deliberately kept short. The full HTTP/CLI/config reference lives in `docs/reference.md`, mirrored offline by the two man pages. `packaging/config.example.toml` is the authoritative annotated config reference. See CONTRIBUTING.md for which files a given change has to touch.
 
-## Runtime requirements (Linux only)
+## Runtime requirements
 
-- Root / `CAP_NET_ADMIN` (for `cn_proc` netlink socket and `systemctl`)
+- Root (Linux) / Administrator (Windows). Linux additionally needs `CAP_NET_ADMIN` for the `cn_proc` netlink socket and drives `systemctl`.
 - NVIDIA: `nvidia-smi` on `PATH`; AMD: no extra tooling (reads `/sys/class/drm/card*/device/mem_info_vram_*`). **AMD limitation**: sysfs exposes no per-process VRAM interface, so the opt-in VRAM heuristic is blind on AMD and per-unit VRAM in `/status` is always empty. Eviction still completes correctly on both vendors, but not identically: `GpuBackend::attribution_capable()` routes AMD straight to the legacy total-GPU-VRAM gate (never a per-unit `Attributed` reading — see the eviction-gating seen-nonzero note in `units.rs`), where NVIDIA gets the precise per-unit gate.
-- systemd (default); non-systemd hosts use per-unit `*_cmd` overrides
+- systemd (Linux default); non-systemd hosts **and Windows** use per-unit `*_cmd` overrides
 
 ## Conventions
 
 - All pure logic lives in the library crate (`src/lib.rs` re-exports). The daemon binary (`src/main.rs`) only wires things together. **Exception**: `src/bin/gpu-arbiter-tray.rs` is a user-session app with its own main logic — state polling loop, desktop notification rendering, and tray display (`ksni` + `notify-rust`). Tray-specific UI code belongs in that file, not the library.
-- Linux-only code is always `#[cfg(target_os = "linux")]` with a non-Linux stub in the same file.
+- Platform-specific code is always `cfg`-gated with a stub for the other targets in the same file. The daemon builds for Linux and Windows; everything else gets the library plus a `main` that refuses to start.
 - Config keys are snake_case and map 1:1 to the `Config` struct fields in `src/config.rs`.
 - HTTP paths use axum 0.8 path-param syntax (`/{p}`).
 - No external C libraries in dependencies — all deps are pure-Rust or thin libc syscall wrappers to keep the musl build clean.

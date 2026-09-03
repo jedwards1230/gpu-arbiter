@@ -17,7 +17,7 @@ repository = "https://github.com/jedwards1230/gpu-arbiter"
 homepage = "https://github.com/jedwards1230/gpu-arbiter"
 readme = "README.md"
 keywords = ["gpu", "gaming", "systemd", "ollama", "daemon"]
-categories = ["command-line-utilities", "os::linux-apis", "hardware-support"]
+categories = ["command-line-utilities", "os::linux-apis", "os::windows-apis", "hardware-support"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
