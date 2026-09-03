@@ -13,17 +13,12 @@ ExecStart=/usr/bin/gpu-arbiter
 Restart=always
 RestartSec=5
 # The unix control socket (default /run/gpu-arbiter/gpu-arbiter.sock — see
-# socket_path in gpu-arbiter-config(5)) lives in a dedicated subdirectory of
-# /run, not bare /run itself: RuntimeDirectory= has systemd create (and
-# remove around stop/start) /run/gpu-arbiter at RuntimeDirectoryMode=0700,
-# root-owned — the parent directory is itself part of the write path's auth
-# boundary (it closes the bind-then-chmod permission race the socket file's
-# own 0600 mode alone can't; see gpu-arbiter-config(5)). The daemon's own
-# startup also creates this directory (mode 0700) if RuntimeDirectory= is
-# ever removed/disabled, and its startup cleanup handles a stale socket file
-# either way. If you override socket_path to a DIFFERENT subdirectory of
-# /run, update RuntimeDirectory= to match (or drop it — the daemon creates
-# its own parent directory unconditionally).
+# socket_path in gpu-arbiter-config(5)) lives in a dedicated, root-only
+# (0700) subdirectory of /run: this parent directory is itself part of the
+# write path's auth boundary, not just the socket file's own 0600 mode. The
+# daemon creates it too if RuntimeDirectory= is ever removed. Overriding
+# socket_path to a different subdirectory of /run needs a matching
+# RuntimeDirectory= update (or drop it and let the daemon create its own).
 RuntimeDirectory=gpu-arbiter
 RuntimeDirectoryMode=0700
 # Log level is overridable without editing this unit via a drop-in, e.g.
