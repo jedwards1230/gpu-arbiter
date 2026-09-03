@@ -1010,11 +1010,20 @@ fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::R
     let to_invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
     let from = CString::new(from.as_os_str().as_bytes()).map_err(|_| to_invalid())?;
     let to = CString::new(to.as_os_str().as_bytes()).map_err(|_| to_invalid())?;
+    // musl's libc.so doesn't export a `renameat2` symbol (glibc does), so the
+    // static musl release build fails to link against `libc::renameat2`
+    // directly. The syscall itself exists on any Linux kernel new enough to
+    // support `RENAME_NOREPLACE` regardless of libc — going through
+    // `libc::syscall`/`SYS_renameat2` sidesteps the missing wrapper on both
+    // targets.
+    //
     // SAFETY: `from`/`to` are valid, NUL-terminated C strings kept alive for
     // the duration of the call. `AT_FDCWD` resolves both relative to the
-    // current working directory, matching `std::fs::rename`'s behavior.
+    // current working directory, matching `std::fs::rename`'s behavior. The
+    // five arguments match `renameat2(2)`'s signature exactly.
     let rc = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             from.as_ptr(),
             libc::AT_FDCWD,
