@@ -470,8 +470,8 @@ mod daemon {
         // block is unix-gated and `socket_path` defaults to empty there. That
         // is a real, deliberate security downgrade to name: on Windows the only
         // write path is the TCP surface, which has no peer-credential check —
-        // so `bind` must be scoped by firewall rule rather than left open. The
-        // named-pipe listener that restores parity is Phase 3.
+        // so `bind` must be scoped by firewall rule rather than left open. A
+        // named-pipe listener that restores parity is not yet implemented.
         #[cfg(unix)]
         let socket_handle = if cfg.socket_path.is_empty() {
             tracing::info!("unix control socket disabled (socket_path is empty)");
@@ -502,8 +502,8 @@ mod daemon {
 
         // 6c. SIGHUP: config is an immutable `Arc` threaded into every task
         // (procmon, presence, reconcile, http) — a real hot-reload would need
-        // ArcSwap/RwLock plumbing across all of them (#23 scope guard: not
-        // worth that blast radius for this wave). Log instead of silently
+        // ArcSwap/RwLock plumbing across all of them (#23: not worth that
+        // blast radius). Log instead of silently
         // swallowing the signal, so `systemctl kill -s HUP gpu-arbiter`
         // doesn't leave an operator wondering why nothing changed — restart
         // is the supported reload path, and it's safe by construction: step

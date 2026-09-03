@@ -26,12 +26,20 @@ jobs:
       extra_plugins: |
         rust-quality@jedwards1230-plugins
       focus: |
-        gpu-arbiter is a Rust daemon that arbitrates GPU access across clients.
-        - Concurrency: races, deadlocks, and lease/lock leaks around GPU device
-          arbitration and client lifecycle. Cleanup on client disconnect.
-        - Rust correctness: unwrap()/expect()/panic! on fallible paths in the
-          daemon loop; error propagation; unchecked Option/Result.
-        - IPC/socket input handling: unvalidated/untrusted client requests.
+        gpu-arbiter is a daemon that evicts GPU compute tenants when a game
+        launches and restores them when gaming ends. Game detection runs over
+        cn_proc netlink on Linux and process enumeration on Windows, feeding a
+        level-triggered reconcile task that is the sole owner of state and the
+        sole caller of unit start/evict. Eviction drives managed units via
+        systemd or per-unit `*_cmd` overrides, through yield -> stop -> SIGKILL
+        stages. The daemon exposes an axum HTTP read surface plus a unix
+        control socket, and calls tenant hook commands (`busy_cmd`/`yield_cmd`/
+        `resume_cmd`). Shutdown is coordinated via a CancellationToken.
+        - Concurrency: races between the reconcile task and HTTP handlers;
+          spawn_blocking misuse.
+        - Rust correctness: unwrap()/expect() on fallible paths.
+        - Shell-free argv handling of config-supplied commands.
+        - Unix-socket permission handling.
         - When the diff touches Rust, prioritize the rust-quality:rust-reviewer agent for language-specific Rust review.
         Do NOT re-flag rustfmt/clippy findings — CI lints already own those.
 

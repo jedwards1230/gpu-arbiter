@@ -514,8 +514,7 @@ pub async fn reconcile(
                 // #6: visibility only — gaming still wins the GPU unconditionally
                 // below. A wedged tenant may still hold VRAM even though `state`
                 // reports a clean `gaming`; surface that so an operator (or an
-                // alert, in a later wave) doesn't mistake "gaming" for "GPU fully
-                // reclaimed".
+                // alert) doesn't mistake "gaming" for "GPU fully reclaimed".
                 tracing::error!(
                     "reconcile: one or more managed units failed to evict; GPU handed to gaming anyway but a tenant may still hold VRAM (degraded)"
                 );

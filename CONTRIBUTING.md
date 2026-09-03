@@ -1,6 +1,6 @@
 # Contributing to gpu-arbiter
 
-gpu-arbiter is a Linux root daemon that evicts GPU compute tenants (such as Ollama) when a game launches and restores them when gaming ends. All changes go through the workflow described below.
+gpu-arbiter is a privileged daemon, on Linux and Windows, that evicts GPU compute tenants (such as Ollama) when a game launches and restores them when gaming ends. All changes go through the workflow described below.
 
 ## Prerequisites
 
@@ -66,4 +66,4 @@ Make sure all CI checks pass locally first — run the formatter, linter, and te
 
 ## Releases
 
-Releases are opt-in. Before merging, add one of `semver:patch`, `semver:minor`, or `semver:major` to the PR to cut a release on merge; with no label, merging does not release. A release publishes a single immutable `vX.Y.Z` tag with AI-generated release notes and static `x86_64-unknown-linux-musl` binaries attached as artifacts.
+Releases are opt-in. Before merging, add one of `semver:patch`, `semver:minor`, or `semver:major` to the PR to cut a release on merge; with no label, merging does not release. A release publishes a single immutable `vX.Y.Z` tag with AI-generated release notes and static binaries attached as artifacts: the `x86_64-unknown-linux-musl` daemon and tray, and an `x86_64-pc-windows-msvc` daemon `.exe`.

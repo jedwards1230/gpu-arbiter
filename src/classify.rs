@@ -207,9 +207,9 @@ mod tests {
         assert_eq!(classify("/usr/bin/firefox", &cfg), None);
     }
 
-    /// The Windows Steam config from the port plan, carrying the exclusions
-    /// Phase 0 proved are required. Every cmdline in the tests below was
-    /// captured live on a Windows RTX 5090 host on 2026-08-22, not invented.
+    /// The Windows Steam config, carrying the exclusions required to avoid
+    /// false positives. Every cmdline in the tests below was captured live on
+    /// a Windows RTX 5090 host on 2026-08-22, not invented.
     fn windows_steam_cfg() -> Config {
         // detect_steam off: the `SteamLaunch AppId=` marker comes from Steam's
         // Linux-only `reaper` shim and never appears on Windows.
@@ -239,8 +239,8 @@ mod tests {
 
     #[test]
     fn windows_steam_pattern_does_not_claim_the_redist_stage() {
-        // The false-positive class Phase 0 caught: launching any Steam title
-        // first spawns the redistributable stage, and all three of these contain
+        // A false-positive class: launching any Steam title first spawns the
+        // redistributable stage, and all three of these contain
         // `steamapps\common` while none is a game. Without the veto the arbiter
         // would evict Ollama (and any other tenant) for a .NET installer — on
         // first launch after any game or Steam update, so routinely.

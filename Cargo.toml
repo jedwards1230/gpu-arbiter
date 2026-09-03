@@ -1,14 +1,8 @@
 [package]
 name = "gpu-arbiter"
-# Kept approximately honest with the latest GitHub release (currently 0.9.0) so
-# a `cargo build` on `main` between releases reports a believable version via
-# `--version` / `/status.version` instead of the fossilized "0.1.0" every dev
-# build used to show. This is NOT the release source of truth — `release.yml`'s
-# "Bake release version into Cargo.toml" step overwrites this line (only in the
-# ephemeral tagged checkout it builds from, never pushed back to `main`) with
-# the actual computed `vX.Y.Z` before building the shipped binaries. Bump this
-# by hand alongside a release PR if it drifts noticeably behind the latest tag.
-version = "0.9.0"
+# Not the release source of truth — release.yml stamps the real tag onto the
+# ephemeral tagged checkout only. Bump this by hand alongside a release PR.
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -31,17 +25,8 @@ name = "gpu_arbiter"
 path = "src/lib.rs"
 
 [dependencies]
-# Trimmed to what's actually used (audited via `grep -rhoE 'tokio::[A-Za-z_:]+'
-# src/`), not `full`: rt-multi-thread (the daemon's own multi-thread runtime +
-# `#[tokio::main]`), macros (`#[tokio::main]`/`#[tokio::test]`/`select!`),
-# process (`tokio::process::Command` shell-outs in units.rs/gpu.rs), signal
-# (`tokio::signal::unix` in main.rs shutdown), sync (mpsc/oneshot channels),
-# time (interval/sleep/timeout), net (the axum `TcpListener` in http.rs and
-# the `UnixListener` control socket), fs (unix-socket setup in http.rs:
-# create_dir_all/remove_file/set_permissions). Other
-# deps (axum, evdev, neli's `async` feature, ksni) pull their own required
-# tokio features transitively via Cargo's feature unification regardless of
-# this list — trimming here narrows what *we* declare, not what ends up built.
+# Trimmed to what's used, not `full`: rt-multi-thread, macros, process, signal,
+# sync, time, net, fs. Other deps pull their own tokio features transitively.
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
@@ -52,9 +37,7 @@ tokio = { version = "1", default-features = false, features = [
     "net",
     "fs",
 ] }
-# CancellationToken for graceful shutdown (drives the reconcile task's own loop
-# exit instead of `abort()`ing it mid-pass). Pure-Rust, part of the tokio
-# project, no default features needed beyond the always-compiled `sync` module.
+# CancellationToken for graceful shutdown of the reconcile task's own loop.
 tokio-util = { version = "0.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 # JSON for the axum `/status` body. Pure-Rust; the serializer/deserializer also
@@ -66,69 +49,34 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
-# Pure-Rust HTTP server on hyper (server-only — no reqwest/TLS, which also keeps
-# the musl build clear of the ring/aws-lc cross-compile minefield). Note 0.8
+# Pure-Rust HTTP server on hyper (server-only, no reqwest/TLS). Note 0.8
 # path-param syntax: `/{p}`.
 axum = "0.8"
-# future::join_all — concurrently polls the per-unit is_running/loaded_models
-# queries on the /status refresh path instead of awaiting them serially.
-# Already pulled transitively (axum -> tower), declared directly since we use
-# it in our own code. Pure-Rust; no io/executor features needed, just alloc.
+# join_all concurrently polls per-unit status on the /status refresh path.
+# Pulled transitively via axum -> tower; declared directly since we use it.
 futures-util = { version = "0.3", default-features = false, features = [
     "alloc",
 ] }
 
-# ureq is the plain-HTTP *client* shared by the gpu-arbiter-tray companion (its
-# 2s /status poll — second bin: src/bin/gpu-arbiter-tray.rs) AND the daemon
-# binary's `status`/`wait`/`watch` subcommands (main.rs's `fetch_status_json`).
-# NO TLS: `default-features = false` drops the whole rustls/ring/aws-lc stack,
-# keeping both binaries pure-Rust and musl-clean (they only ever talk plain
-# http:// — localhost or a LAN daemon URL). `json` wires serde de/serialization
-# of the bodies. Cross-platform — the CLI subcommands run on the macOS dev host
-# too.
+# Plain-HTTP client shared by the tray companion and the daemon's
+# status/wait/watch subcommands. No TLS, keeping both binaries musl-clean.
 ureq = { version = "3", default-features = false, features = ["json"] }
 
-# cn_proc process-event connector lives behind a Linux-only netlink socket, so
-# neli is only pulled on Linux — macOS dev boxes never compile it. The
-# `connector` module is always available; the `async` feature (which itself
-# enables tokio + parking_lot) is what unlocks `socket::asynchronous` for the
-# async-native `recv` over the CN_IDX_PROC multicast group. (The bare `tokio`
-# feature only pulls the optional dep — it does NOT expose the async socket.)
-#
-# ksni (StatusNotifierItem tray) + notify-rust (desktop notifications) power the
-# gpu-arbiter-tray companion. Both are Linux desktop D-Bus integrations — they
-# don't build on macOS, so they're Linux-gated and the tray bin has a macOS stub
-# main. Both are pure-Rust (zbus, NOT libdbus) → musl-clean. ksni 0.3 is
-# async-native (its Handle::update is async), satisfied by the existing tokio.
+# cn_proc process detection needs a Linux-only netlink socket (neli, `async`
+# feature). ksni/notify-rust back the gpu-arbiter-tray companion (D-Bus).
 [target.'cfg(target_os = "linux")'.dependencies]
 neli = { version = "0.7", features = ["async"] }
 ksni = "0.3"
 # Default features = zbus (pure Rust). Do NOT enable `d`/`dbus` (the libdbus FFI path).
 notify-rust = "4"
-# Local-presence detection (Linux-only — evdev/inotify are Linux kernel
-# interfaces). All three are pure-Rust over raw libc syscalls (no external C lib,
-# no TLS), so they stay musl-clean like the existing libc/neli deps:
-#  - evdev: raw evdev ioctls (NOT libevdev FFI); `tokio` feature → async
-#    `into_event_stream()` for zero-CPU epoll waiting between input events.
-#  - inotify: thin libc inotify_* syscall wrapper (inotify-sys); `stream` feature
-#    → async hotplug watch on /dev/input. (libc-only FFI is fine; libdbus-style
-#    external C libs are what we avoid.)
-#  - tokio-stream: pure-Rust `StreamExt` to drive the inotify event stream.
+# Local-presence detection (evdev/inotify are Linux kernel interfaces).
+# tokio-stream drives the async inotify event stream.
 evdev = { version = "0.13", features = ["tokio"] }
 inotify = { version = "0.11", default-features = false, features = ["stream"] }
 tokio-stream = "0.1"
 
-# Windows process enumeration — the `/proc`-walk equivalent backing
-# `reconcile::observe`. Without it the non-Linux `observe` returns an empty
-# snapshot, which means an empty claim set, which resolves to `available`
-# forever: the daemon would never evict, and would restart managed units
-# straight into a live game. That stub is only safe while the daemon refuses to
-# run, which is exactly what this phase changes.
-#
-# `default-features = false` with only `system`: the default set also pulls
-# component (WMI/COM), disk, network, and user, none of which this crate touches.
-# `system` alone exposes the process list, and it is the only Win32 surface worth
-# linking into a service binary that runs as LocalSystem.
+# Windows process enumeration backing `reconcile::observe`. `system` alone
+# exposes the process list needed for a service binary running as LocalSystem.
 [target.'cfg(target_os = "windows")'.dependencies]
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
@@ -139,19 +87,8 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 lto = true
 codegen-units = 1
 strip = "symbols"
-# Consistent with the deliberate poisoned-lock-abort policy in state.rs
-# (`read_state`/`write_state`: a poisoned `ArbiterState` lock panics rather than
-# `into_inner()`-recovering unverified state, relying on systemd's
-# `Restart=always` to boot a fresh process). That policy only actually holds
-# under `panic = "abort"`: with the default unwind strategy a panic inside a
-# `tokio::spawn`ed task (reconcile_task, or an axum handler calling
-# `read_state`) unwinds *that task only* — nobody awaits `reconcile_handle`
-# during normal operation (only at shutdown), so the process would otherwise
-# keep running with the reconcile task silently dead and every `/status`
-# request panicking forever, never reaching systemd's supervisor at all.
-# `panic = "abort"` makes any panic anywhere terminate the process immediately,
-# which is what turns "crash and let systemd restart us" into an actual
-# guarantee instead of a comment. No code in this crate uses
-# `std::panic::catch_unwind` to recover from panics (grepped), and `cargo test`
-# is unaffected — it runs under the separate `dev`/`test` profile, not `release`.
+# Consistent with the poisoned-lock-abort policy in state.rs: a panic must
+# terminate the process so systemd's `Restart=always` boots a fresh one,
+# rather than leaving a tokio task silently dead while other handlers keep
+# running. `cargo test` is unaffected — it runs under the dev/test profile.
 panic = "abort"

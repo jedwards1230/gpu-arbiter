@@ -1,4 +1,4 @@
-# .github/dependabot.yml — Dependabot version updates (per repo-standards Wave 3)
+# .github/dependabot.yml — Dependabot version updates
 version: 2
 updates:
   - package-ecosystem: github-actions
