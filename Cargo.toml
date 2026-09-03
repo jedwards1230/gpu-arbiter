@@ -2,7 +2,7 @@
 name = "gpu-arbiter"
 # Not the release source of truth — release.yml stamps the real tag onto the
 # ephemeral tagged checkout only. Bump this by hand alongside a release PR.
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
