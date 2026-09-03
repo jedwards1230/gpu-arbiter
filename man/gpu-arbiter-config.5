@@ -375,13 +375,16 @@ to find the owning unit directly, so it cannot be fooled by a wrapper binary
 (a venv interpreter, a launcher script) the way this name\-substring match
 can be.
 .B vram_match
-remains the
-.B only
-attribution channel for command\-driven
+is consulted whenever cgroup resolution does not produce a match for a given
+poll. For command\-driven
 .RB ( *_cmd )
-units and non\-systemd hosts, where no cgroup path resolves to a configured
-unit name. When unset (and no cgroup match applies), no VRAM figure is
-reported for the unit (the field is omitted, not reported as 0).
+units and non\-systemd hosts, no cgroup path ever resolves to a configured
+unit name, so it is the
+.B only
+attribution channel; for a systemd\-supervised unit it can also fire on an
+occasional poll where cgroup resolution has not caught up yet. When unset
+(and no cgroup match applies), no VRAM figure is reported for the unit (the
+field is omitted, not reported as 0).
 .TP
 .B kind
 String. Default: none. Introspection backend selector for the

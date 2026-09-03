@@ -111,8 +111,11 @@
 #
 # Tenant 1 — Ollama, driven by systemd (the default supervisor). VRAM
 # attribution for a systemd unit is automatic via cgroup PID resolution — no
-# vram_match needed; it's set below only as the fallback for command-driven
-# units and non-systemd hosts, where cgroup attribution doesn't apply.
+# vram_match needed; it's set below as the fallback used whenever cgroup
+# resolution doesn't produce a match for a given poll, which is always the
+# case for command-driven units and non-systemd hosts (no cgroup ever
+# resolves to their free-form label) and can also happen occasionally for a
+# systemd unit if that poll's process listing hasn't resolved its cgroup yet.
 #[[managed_units]]
 #unit = "ollama.service"        # systemd unit the daemon exclusively owns
 #eager_restart = true           # restart this unit when gaming ends
