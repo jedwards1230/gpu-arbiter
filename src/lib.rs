@@ -40,7 +40,7 @@ pub mod state;
 pub mod gpu;
 
 // Managed-unit lifecycle: systemctl stop/start + nvidia-smi VRAM wait + SIGKILL
-// escalation, keyed off a unit name (not a single hardcoded Ollama unit).
+// escalation, keyed off a unit name.
 pub mod units;
 
 // The reconcile authority: /proc scan → claim set → drive the managed units. The
@@ -78,8 +78,7 @@ pub(crate) mod testutil {
     /// The unit-supervisor tests drive `start_cmd`/`stop_cmd`/`is_active_cmd`
     /// with `true` and `false` purely as "a program that exits 0" and "a program
     /// that exits non-zero". Those are POSIX coreutils binaries and **do not
-    /// exist on Windows**, so every such test failed to spawn there — which a
-    /// Linux-only CI matrix could never reveal.
+    /// exist on Windows**, so every such test fails to spawn there.
     ///
     /// Rewriting the fixture, rather than `#[cfg(unix)]`-gating the tests, keeps
     /// the coverage where it matters most: the command-driven supervisor path is
@@ -115,9 +114,7 @@ pub(crate) mod testutil {
     /// sequence in a TOML basic string — so a raw `C:\Users\runneradmin\...`
     /// makes the whole fixture fail to parse (`\U` is not a valid escape), and
     /// the test panics at its `.unwrap()` on `Config::from_toml` rather than
-    /// anywhere near the behavior under test. That is exactly how this
-    /// presented in CI: sixteen unrelated-looking reconcile tests all panicking
-    /// on the same line.
+    /// anywhere near the behavior under test.
     ///
     /// Doubling the backslashes is the fix; on Unix this is the identity
     /// transform, since POSIX paths contain none.

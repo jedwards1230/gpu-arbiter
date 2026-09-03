@@ -76,7 +76,7 @@ pub struct GpuComputeProc {
     pub name: String,
     /// VRAM attributed to this process (MiB).
     pub vram_mb: u64,
-    /// The systemd unit owning this process's cgroup, if resolved (#7) — e.g.
+    /// The systemd unit owning this process's cgroup, if resolved — e.g.
     /// `Some("ollama.service")`. `None` until [`crate::cgroup::attribute_units`]
     /// enriches the list (the raw `nvidia-smi` parse always leaves this
     /// `None`), or when cgroup attribution didn't apply (no `system.slice`
@@ -123,8 +123,9 @@ mod tests {
     }
 
     /// The Windows Steam config, carrying the exclusions required to avoid
-    /// false positives. Every cmdline in the tests below was captured live on
-    /// a Windows RTX 5090 host on 2026-08-22, not invented.
+    /// false positives. Every cmdline in the tests below is a real Steam
+    /// process cmdline, not a synthetic one — the redist-launch false
+    /// positive below doesn't reproduce on invented input.
     fn windows_steam_cfg() -> Config {
         // detect_steam off: the `SteamLaunch AppId=` marker comes from Steam's
         // Linux-only `reaper` shim and never appears on Windows.

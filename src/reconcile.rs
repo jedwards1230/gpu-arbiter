@@ -312,7 +312,7 @@ pub async fn reconcile(
     backend: GpuBackend,
 ) -> Result<(), ReconcileError> {
     let trigger_label = trigger.label();
-    // #14: every pass counts, regardless of what it decides to do — this is the
+    // Every pass counts, regardless of what it decides to do — this is the
     // only durable record of reconcile activity once journald's short retention
     // has rotated past it.
     write_state(state)
@@ -321,13 +321,12 @@ pub async fn reconcile(
 
     // ── Manual start/stop: a direct action on ONE named unit ──────────────────
     //
-    // The reconcile task is the sole caller of `units::start`/`units::evict`
-    // (#2): an HTTP handler no longer drives a unit directly — it enqueues a
+    // The reconcile task is the sole caller of `units::start`/`units::evict`:
+    // an HTTP handler never drives a unit directly — it enqueues a
     // `ManualStart`/`ManualStop` trigger and awaits `reply` here instead. That
-    // removes the handler-vs-reconcile-task race that existed when `http.rs`
-    // called into `units` itself: two uncoordinated writers could otherwise
-    // interleave a `systemctl start` from one request with a `systemctl stop`
-    // from a concurrent reconcile pass on the same unit.
+    // keeps every `systemctl start`/`stop` on a single writer per unit, so an
+    // HTTP request can never interleave with a concurrent reconcile pass
+    // acting on the same unit.
     //
     // Handled before the observe/decide pipeline below and unconditionally
     // followed by it (not an early return): a manual override isn't a change to
@@ -337,7 +336,7 @@ pub async fn reconcile(
     match trigger {
         ReconcileTrigger::ManualStart { unit, reply } => {
             // Never start a managed unit into a live game — the same invariant
-            // startup reconciliation enforces applies to a manual start (#61).
+            // startup reconciliation enforces applies to a manual start.
             // Eviction is edge-triggered (it fires on the available → gaming
             // TRANSITION, not on the gaming level), so a unit started here
             // mid-game would NOT be re-evicted by the next pass — it would sit
@@ -362,8 +361,8 @@ pub async fn reconcile(
                         // is bringing the unit back, so the ensure-running post-step
                         // should resume managing it. A failed start leaves any
                         // existing hold in place — nothing changed. One lock
-                        // acquisition for both mutations (#14's restart counter
-                        // rides along with the existing hold-clear).
+                        // acquisition for both mutations: the restart counter rides
+                        // along with the hold-clear.
                         {
                             let mut guard = write_state(state);
                             guard.held.remove(&unit);
@@ -379,8 +378,7 @@ pub async fn reconcile(
             }
         }
         ReconcileTrigger::ManualStop { unit, reply } => {
-            // Hold BEFORE evicting, unconditionally: the fix for the
-            // self-reverting manual stop (#1) is that *nothing* — not this same
+            // Hold BEFORE evicting, unconditionally: nothing — not this same
             // pass's ensure-running post-step, not the next backstop timer tick —
             // may restart a unit the operator just asked to stop, regardless of
             // whether the eviction itself succeeds (a failed eviction is still an
@@ -388,7 +386,7 @@ pub async fn reconcile(
             // by restarting the unit on the next pass).
             write_state(state).held.insert(unit.clone());
             let result = units::evict_by_name(cfg, backend, &unit).await;
-            // #14: record before the reply match below consumes `result` — a
+            // Record before the reply match below consumes `result` — a
             // manual stop is still an eviction event and must be counted like
             // any other (see `units::eviction_metric_outcome`'s docs on why
             // `AlreadyClear` is excluded).
@@ -464,7 +462,7 @@ pub async fn reconcile(
             // non-empty, so `effective_demand` returned at least
             // `cfg.game_priority` — and `preempted_units` therefore selected every
             // unit below that. With stock config (all units 50, game 100) that is
-            // literally every unit, identical to the pre-priorities behavior.
+            // literally every unit.
             //
             // A unit that survives here is one an operator deliberately placed at
             // or above `game_priority`, which is a supported configuration, not a
@@ -473,7 +471,7 @@ pub async fn reconcile(
             write_state(state).set_state(State::Evicting);
             let any_eviction_failed = evict_units(state, cfg, backend, &preempted).await;
             if any_eviction_failed {
-                // #6: visibility only — gaming still wins the GPU unconditionally
+                // Visibility only — gaming still wins the GPU unconditionally
                 // below. A wedged tenant may still hold VRAM even though `state`
                 // reports a clean `gaming`; surface that so an operator (or an
                 // alert) doesn't mistake "gaming" for "GPU fully reclaimed".
@@ -489,7 +487,7 @@ pub async fn reconcile(
         UnitAction::Restart => {
             // gaming → available (verified: the snapshot above was clean). Settle
             // the state; the ensure-running post-step below brings the eager units
-            // back. We no longer start units in this branch — the post-step
+            // back. Units are never started in this branch — the post-step
             // subsumes it (the edge is reached only after a clean scan, and the
             // post-step's `desired == Available` guard is the same "GPU is free"
             // condition), so both paths share one idempotent code path.
@@ -526,14 +524,14 @@ pub async fn reconcile(
     // makes "a restart never starts Ollama into a live game" hold even as we gain a
     // boot-time start path. The gate is unit-tested in `ensure_running_targets_*`.
     //
-    // Why this is needed: `unit_action` only acts on the `available↔gaming` edges,
-    // so a clean boot (Available→Available) previously took no unit action and the
-    // eager units stayed stopped until the *next* game came and went. Starting them
-    // here whenever the GPU is free makes them come up at boot and self-heal if one
-    // dies while no game is running. Idempotent: `is_running` skips units already
+    // `unit_action` only acts on the `available↔gaming` edges, so a clean boot
+    // (Available→Available) needs a separate path or eager units would stay
+    // stopped until the *next* game came and went. Starting them here whenever
+    // the GPU is free makes them come up at boot and self-heal if one dies
+    // while no game is running. Idempotent: `is_running` skips units already
     // up, so steady-state passes are no-ops (and don't spam logs).
     //
-    // MANUAL HOLD (#1): a unit an operator just stopped via `ManualStop` is also
+    // MANUAL HOLD: a unit an operator just stopped via `ManualStop` is also
     // excluded (see [`ArbiterState::held`]) — without this, the very next pass
     // (even this same one, since ensure-running always runs after the state
     // transition above) would immediately undo the operator's stop.
@@ -579,10 +577,10 @@ pub async fn reconcile(
     let eager_targets = ensure_running_targets(desired, cfg, &held, &preempted);
     if !eager_targets.is_empty() {
         // Only units NOT already running are actual start candidates
-        // (idempotence — an already-running unit is left alone). Tristate
-        // (#15): when the check itself fails, the decision default is "treat
-        // as stopped and try to start" (unsure ⇒ attempt) — kept, but logged
-        // instead of silently coerced.
+        // (idempotence — an already-running unit is left alone). Tristate:
+        // when the check itself fails, the decision default is "treat as
+        // stopped and try to start" (unsure ⇒ attempt), logged rather than
+        // silently coerced.
         let mut to_start = Vec::new();
         for u in eager_targets {
             // Undo any cooperative yield first, for EVERY eligible unit — not
@@ -611,7 +609,7 @@ pub async fn reconcile(
         }
 
         if !to_start.is_empty() {
-            // ── TOCTOU close (#5) ──────────────────────────────────────────────
+            // ── TOCTOU close ───────────────────────────────────────────────────
             //
             // `desired` was resolved from the snapshot taken at the TOP of this
             // pass (see `observe`/`claim_set` above). Everything since then —
@@ -634,7 +632,7 @@ pub async fn reconcile(
                         tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
                     } else {
                         tracing::info!(unit = %u.unit, "ensure-running: started eager unit (GPU free)");
-                        // #14: this is also the `gaming → available` restore path
+                        // This is also the `gaming → available` restore path
                         // (the post-step subsumes it — see `UnitAction::Restart`'s
                         // docs above), so one counter covers both triggers of an
                         // eager restart.
@@ -657,13 +655,13 @@ pub async fn reconcile(
 /// Evict every managed unit, in order, for an `available → gaming` transition.
 /// Gaming wins the GPU unconditionally regardless of outcome (each failure is
 /// logged here) — this only reports whether **any** unit failed, which feeds
-/// the `degraded` visibility flag (#6). Pulled out of [`reconcile`] as its own
+/// the `degraded` visibility flag. Pulled out of [`reconcile`] as its own
 /// function so the "did anything fail" decision is unit-testable without
 /// needing a real game claim to reach the `Evict` branch (macOS/CI `observe`
 /// is stubbed empty, so nothing ever resolves to `Gaming` there).
 ///
 /// Also records each unit's eviction outcome into
-/// [`crate::state::Metrics::record_eviction`] (#14) — one brief write-lock
+/// [`crate::state::Metrics::record_eviction`] — one brief write-lock
 /// acquisition per unit, interleaved with the (already sequential, already
 /// slow) per-unit `units::evict` shell-outs, so it adds no new contention
 /// pattern over what this loop already had.
@@ -805,7 +803,7 @@ pub fn preempted_units(cfg: &Config, demand: Option<u8>) -> Vec<&ManagedUnit> {
         .collect()
 }
 
-/// The #5 TOCTOU-close decision: given a **freshly** re-scanned claim set (taken
+/// The TOCTOU-close decision: given a **freshly** re-scanned claim set (taken
 /// immediately before the ensure-running post-step's first `units::start`),
 /// should the pending eager start(s) proceed? Pure — unit-tested; the impure
 /// re-scan (`observe` + `claim_set`) itself lives at the call site in
@@ -829,7 +827,7 @@ async fn refresh_substate(
     // One compute-proc query feeds every unit's VRAM attribution. Best-effort: a
     // failed/absent query leaves each `vram_mb` as None so `/status` omits it
     // rather than lying with a 0. (AMD returns an empty list, so attribution is
-    // simply omitted there — it must not error.) Cgroup-enriched (#7) so
+    // simply omitted there — it must not error.) Cgroup-enriched so
     // `vram_mb_by_cgroup` below has owning-unit data to match against.
     let compute = match backend.query_compute_procs().await {
         Ok(procs) => Some(crate::cgroup::attribute_units(procs).await),
@@ -839,8 +837,8 @@ async fn refresh_substate(
     // isn't restarting (see ArbiterState::held / ensure_running_targets).
     let held = { read_state(state).held.clone() };
 
-    // Each unit's substate is queried CONCURRENTLY (#34), not serially: a
-    // wedged is_running/loaded_models on one unit used to block every unit
+    // Each unit's substate is queried CONCURRENTLY, not serially: a serial
+    // wedged is_running/loaded_models on one unit would block every unit
     // behind it, each bound by its own timeout — three wedged units could
     // stall this whole /status refresh (and thus the reconcile task, which
     // can't react to a game-launch trigger until refresh_substate returns) for
@@ -853,7 +851,7 @@ async fn refresh_substate(
         let compute = &compute;
         let held = &held;
         async move {
-            // Tristate (#15): a failed is-active check is "couldn't tell", not
+            // Tristate: a failed is-active check is "couldn't tell", not
             // a confirmed `false` — logged here (the one place this query
             // happens on the /status refresh path) rather than silently
             // coerced to a definite answer.
@@ -873,7 +871,7 @@ async fn refresh_substate(
             } else {
                 Vec::new()
             };
-            // Attribute VRAM (#7) — likewise only when confirmed running.
+            // Attribute VRAM — likewise only when confirmed running.
             // Precedence: cgroup unit match first (can't be fooled by a
             // wrapper binary), falling back to the unit's configured
             // `vram_match` substring for command-driven/non-systemd tenants.
@@ -1123,10 +1121,10 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_substate_queries_units_concurrently() {
-        // #34: three units each with a 1s-but-successful is_active_cmd. Run
+        // Three units each with a 1s-but-successful is_active_cmd. Run
         // serially that's >=3s; run concurrently (join_all) it's bounded by the
         // SLOWEST single unit (~1s). A generous 2.5s ceiling proves the queries
-        // actually overlap rather than merely not regressing.
+        // actually overlap.
         // eager_restart = false on every unit: keeps the (serial) ensure-running
         // post-step's own is_running confirmation loop from also querying these
         // slow units and confounding the timing assertion below — this test is
@@ -1198,9 +1196,9 @@ mod tests {
         assert!(!g.presence.monitor_up);
     }
 
-    // ── manual start/stop trigger routing (#2) ────────────────────────────────
+    // ── manual start/stop trigger routing ─────────────────────────────────────
     //
-    // `ManualStart`/`ManualStop` are handled by `reconcile()` itself now — the
+    // `ManualStart`/`ManualStop` are handled by `reconcile()` itself — the
     // reconcile task is the sole caller of `units::start`/`units::evict`. These
     // drive the real seam via the `Command` supervisor's `*_cmd` overrides
     // (`marker_path`/`ensure_cfg`, defined below in the ensure-running section)
@@ -1268,7 +1266,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
-    // ── metrics recording through the real reconcile() entry point (#14) ──────
+    // ── metrics recording through the real reconcile() entry point ───────────
 
     #[tokio::test]
     async fn manual_start_records_unit_restart_metric() {
@@ -1336,7 +1334,7 @@ mod tests {
         // (re-running stop_cmd, since no kill_cmd is configured) — the same
         // shape as `units::evict_escalates_when_recheck_cannot_confirm_still_running`.
         // Real outcome is Escalated, not Freed: a manual stop is still counted
-        // like any other eviction (#14), just under the sigkill bucket here.
+        // like any other eviction, just under the sigkill bucket here.
         assert_eq!(
             read_state(&state).metrics.evictions["fake.service"].sigkill,
             1
@@ -1453,12 +1451,12 @@ mod tests {
         assert_eq!(read_state(&state).units.len(), 1);
     }
 
-    // ── manual hold (#1) ───────────────────────────────────────────────────────
+    // ── manual hold ────────────────────────────────────────────────────────────
     //
-    // The verified live bug: since the v0.9.0 ensure-running step, a manual stop
-    // was self-reverting — the very next reconcile pass (even the periodic
-    // backstop) restarted the unit because `desired == Available` and
-    // `eager_restart` is on. These exercise the fix end-to-end through the real
+    // A manually stopped unit must stay stopped across every following
+    // reconcile pass — including the periodic backstop — even though
+    // `desired == Available` and `eager_restart` is on; only an explicit
+    // start clears the hold. These exercise that end-to-end through the real
     // `reconcile()` entry point (not just the pure `ensure_running_targets`
     // gate above), using the same `Command` supervisor `*_cmd` test seam as the
     // ensure-running tests below.
@@ -1570,7 +1568,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
     }
 
-    // ── manual start vs. a live game (#61) ────────────────────────────────────
+    // ── manual start vs. a live game ──────────────────────────────────────────
 
     #[tokio::test]
     async fn manual_start_during_gaming_is_rejected_unit_not_started_hold_preserved() {
@@ -1713,12 +1711,12 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_running_starts_stopped_eager_unit_when_available() {
-        // Available steady-state with a stopped eager unit → the post-step starts
-        // it (the boot / self-heal path the bug was missing).
+        // Available steady-state with a stopped eager unit → the post-step
+        // starts it (the boot / self-heal path).
         let marker = marker_path("starts");
         let cfg = ensure_cfg(false, &marker, true);
         // Start already in Available so this is the Available→Available steady
-        // state that previously took NO unit action.
+        // state, which `unit_action` alone does not act on.
         let mut s = ArbiterState::new();
         s.state = State::Available;
         let state = shared(s);
@@ -1737,7 +1735,7 @@ mod tests {
             marker.exists(),
             "ensure-running should have started the stopped eager unit"
         );
-        // #14: the eager start is counted as a unit restart.
+        // The eager start is counted as a unit restart.
         assert_eq!(read_state(&state).metrics.unit_restarts["fake.service"], 1);
         let _ = std::fs::remove_file(&marker);
     }
@@ -2200,7 +2198,7 @@ mod tests {
 
     #[test]
     fn ensure_running_targets_excludes_held_units() {
-        // #1: a manually-held unit is excluded from the eager target set even
+        // A manually-held unit is excluded from the eager target set even
         // though the GPU is free and the unit is otherwise eager_restart = true.
         let cfg = Config::from_toml(&crate::testutil::portable_toml(
             r#"
@@ -2223,7 +2221,7 @@ mod tests {
 
     #[test]
     fn ensure_running_toctou_clear_gate() {
-        // #5: an empty fresh re-scan clears eager starts to proceed; any claim at
+        // An empty fresh re-scan clears eager starts to proceed; any claim at
         // all (a game exec'd mid-pass) blocks every eager start this pass.
         assert!(ensure_running_toctou_clear(&[]));
         assert!(!ensure_running_toctou_clear(&[Claim::Steam("440".into())]));
@@ -2232,7 +2230,7 @@ mod tests {
         )]));
     }
 
-    // ── wedged-eviction visibility (#6) ─────────────────────────────────────
+    // ── wedged-eviction visibility ────────────────────────────────────────────
 
     #[tokio::test]
     async fn evict_units_false_when_every_eviction_succeeds() {
@@ -2256,7 +2254,7 @@ mod tests {
             )
             .await
         );
-        // AlreadyClear isn't a real eviction (#14) — nothing recorded.
+        // AlreadyClear isn't a real eviction — nothing recorded.
         assert!(read_state(&state).metrics.evictions.is_empty());
     }
 
@@ -2283,7 +2281,7 @@ mod tests {
             )
             .await
         );
-        // #14: the failure is counted under the "error" bucket for that unit.
+        // The failure is counted under the "error" bucket for that unit.
         assert_eq!(
             read_state(&state).metrics.evictions["fake.service"].error,
             1

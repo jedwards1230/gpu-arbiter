@@ -56,8 +56,8 @@ pub const DEFAULT_CONFIG_PATH: &str = r"C:\ProgramData\gpu-arbiter\config.toml";
 pub const CONFIG_ENV_VAR: &str = "GPU_ARBITER_CONFIG";
 
 /// A usage error (unknown flag, missing/malformed value, invalid combination,
-/// …). A plain data type (not a smuggled-through-`Command` enum variant, per
-/// #24) carrying the message to print to stderr; `main.rs` exits 2 on it.
+/// …). A plain data type, not a smuggled-through-`Command` enum variant,
+/// carrying the message to print to stderr; `main.rs` exits 2 on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageError(pub String);
 
@@ -69,10 +69,9 @@ impl std::fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
-/// `wait --for` target. The daemon's current wire vocabulary is
-/// gaming/available (tracked for a rename in #25); [`wait_condition_met`] is
-/// the one place that mapping lives, so the rename only has to touch one
-/// function.
+/// `wait --for` target. The daemon's wire vocabulary is gaming/available;
+/// [`wait_condition_met`] is the one place that mapping lives, so a future
+/// vocabulary change only has to touch one function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitFor {
     /// Wait until the GPU is free (`state == "available"`). The default.
@@ -598,9 +597,9 @@ pub fn render_status(v: &serde_json::Value) -> String {
     let _ = writeln!(o, "State:   {state}");
     let _ = writeln!(o, "Since:   {since}");
 
-    // Degraded (#6): shown only when true — a wedged eviction, not the
-    // common case. Gaming still won the GPU; this just tells the operator a
-    // tenant may still hold VRAM.
+    // Degraded: shown only when true — a wedged eviction, not the common
+    // case. Gaming still won the GPU; this just tells the operator a tenant
+    // may still hold VRAM.
     if v.get("degraded")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
@@ -641,9 +640,9 @@ pub fn render_status(v: &serde_json::Value) -> String {
             let _ = writeln!(o, "Units:");
             for u in units {
                 let unit = u.get("unit").and_then(|s| s.as_str()).unwrap_or("?");
-                // Tristate (#15): `running` is JSON `true`/`false`/`null` (the
-                // last meaning the daemon couldn't tell) — the missing-field
-                // case (older/partial payloads) renders the same as `null`.
+                // Tristate: `running` is JSON `true`/`false`/`null` (the last
+                // meaning the daemon couldn't tell) — a missing field renders
+                // the same as `null`.
                 let run_str = match u.get("running").and_then(serde_json::Value::as_bool) {
                     Some(true) => "running",
                     Some(false) => "stopped",
@@ -751,11 +750,10 @@ mod tests {
         );
     }
 
-    /// #24: the nonstandard single-dash `-c=PATH` spelling (never documented —
-    /// only `--config=PATH`/`-c PATH`/`--config PATH` were) is dropped. It's
-    /// now parsed as an unknown flag rather than a config path.
+    /// Only `--config=PATH`, `-c PATH`, and `--config PATH` are accepted; the
+    /// nonstandard single-dash `-c=PATH` spelling parses as an unknown flag.
     #[test]
-    fn dash_c_equals_form_is_no_longer_accepted() {
+    fn dash_c_equals_form_is_rejected() {
         assert!(parse_args(["-c=/tmp/d.toml"]).is_err());
     }
 
@@ -836,7 +834,6 @@ mod tests {
                 quiet: false,
             })
         );
-        // --url and -q/--quiet (both new: #18-#22).
         assert_eq!(
             parse_args(["status", "--url", "http://host:48750", "-q"]),
             Ok(Command::Status {
@@ -1059,8 +1056,8 @@ mod tests {
         assert!(!out.contains("Degraded"), "{out}");
     }
 
-    /// #6: a degraded snapshot (a wedged eviction) surfaces a distinct line;
-    /// the common (non-degraded) case renders nothing extra.
+    /// A degraded snapshot (a wedged eviction) surfaces a distinct line; the
+    /// common (non-degraded) case renders nothing extra.
     #[test]
     fn render_status_degraded_shows_a_line() {
         let payload = serde_json::json!({
@@ -1113,7 +1110,7 @@ mod tests {
         assert!(out.contains("GPU:     0 / 0 MiB"), "{out}");
     }
 
-    /// #15: `running: null` (the daemon couldn't confirm either way) renders as
+    /// `running: null` (the daemon couldn't confirm either way) renders as
     /// "unknown", distinct from a confirmed "stopped".
     #[test]
     fn render_status_unit_running_null_is_unknown() {

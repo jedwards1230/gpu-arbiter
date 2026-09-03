@@ -13,8 +13,8 @@
 //! [`Config`], [`ManagedUnit`], and [`GamePattern`] all carry
 //! `#[serde(deny_unknown_fields)]`: a typo'd or unrecognized key is a parse
 //! error naming the offending key, not a silently-ignored no-op. This is what
-//! makes `--check-config` (see [`crate::cli::check_config`]) trustworthy — a
-//! typo like `detect_stema` used to still print `OK`.
+//! makes `--check-config` (see [`crate::cli::check_config`]) trustworthy —
+//! without it, a typo like `detect_stema` would parse clean and print `OK`.
 
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -42,9 +42,9 @@ pub struct GamePattern {
     ///
     /// This exists because a location-based `match` cannot distinguish a game
     /// from the launcher's own machinery living in the same directory tree.
-    /// Measured on a Windows RTX 5090 host (2026-08-22): launching a Steam title first spawns
-    /// the redistributable stage, and all three of these contain
-    /// `steamapps\common` while none is a game —
+    /// On Windows, launching a Steam title first spawns the redistributable
+    /// stage, and all three of these contain `steamapps\common` while none is
+    /// a game —
     ///
     /// ```text
     /// SteamService.exe /installscript "...\steamapps\common\Steamworks Shared\runasadmin.vdf" 413150
@@ -149,12 +149,11 @@ pub enum GpuBackendKind {
     Amd,
 }
 
-/// One GPU tenant the arbiter owns and evicts from the GPU when a game launches
-/// (stop → poll-VRAM-free → SIGKILL, the same loop the single Ollama unit used
-/// to get).
+/// One GPU tenant the arbiter owns and evicts from the GPU when a game
+/// launches (stop → poll-VRAM-free → SIGKILL).
 ///
 /// By default the tenant is driven by **systemd** (`systemctl stop|start|
-/// is-active|kill`), exactly as the daemon has always behaved. The optional
+/// is-active|kill`). The optional
 /// `*_cmd` fields override that with arbitrary process-control commands so the
 /// daemon can drive `OpenRC` (Gentoo/Artix/Alpine), runit (Void), or plain
 /// processes — see [`crate::units::Supervisor`]. When **all** `*_cmd` overrides
@@ -271,7 +270,7 @@ pub struct ManagedUnit {
     pub yield_timeout_s: Option<u64>,
     /// **Fallback** substring (case-insensitive) matched against `nvidia-smi`
     /// compute-proc names to attribute this unit's VRAM in `/status`. For a
-    /// systemd-supervised unit, cgroup PID resolution (#7) attributes VRAM
+    /// systemd-supervised unit, cgroup PID resolution attributes VRAM
     /// automatically with no config needed — it isn't fooled by a wrapper
     /// binary (a venv interpreter, a launcher script) the way this
     /// name-substring match can be. `vram_match` remains the only attribution
@@ -504,9 +503,9 @@ fn default_bind() -> IpAddr {
 
 /// serde default for [`Config::socket_path`]: `/run/gpu-arbiter/gpu-arbiter.sock`.
 ///
-/// A dedicated subdirectory of `/run` (not bare `/run/gpu-arbiter.sock`, the
-/// pre-#61 default) — see [`crate::http::serve_uds`]'s docs for why the
-/// parent directory itself needs to be lockable to mode `0700`.
+/// A dedicated subdirectory of `/run`, not bare `/run/gpu-arbiter.sock` —
+/// see [`crate::http::serve_uds`]'s docs for why the parent directory itself
+/// needs to be lockable to mode `0700`.
 ///
 /// Empty on Windows, which disables the unix-socket listener. `http::bind_uds`
 /// and `serve_uds_on` are `#[cfg(unix)]` with no Windows counterpart, so a
@@ -718,7 +717,7 @@ mod tests {
 
     #[test]
     fn unknown_top_level_key_is_rejected() {
-        // #4: a typo'd top-level key (e.g. `detect_stema` instead of
+        // A typo'd top-level key (e.g. `detect_stema` instead of
         // `detect_steam`) must fail parse instead of silently defaulting —
         // otherwise `--check-config` prints OK on a config that does nothing the
         // operator intended.
@@ -987,10 +986,11 @@ mod tests {
     /// deployment contract honest. Regenerate from the template, do not
     /// hand-edit.
     ///
-    /// Root scalars (`enabled` through `detect_steam`) all render **before**
-    /// both table headers — this is the corrected ordering. See
-    /// [`unknown_key_after_managed_units_table_is_rejected`] just below for what
-    /// happens (and why) when they don't.
+    /// Root scalars (`enabled` through `detect_steam`) must render **before**
+    /// both table headers: TOML has no "back to root" marker, so a bare key
+    /// after `[[managed_units]]` belongs to that table, not `Config`. See
+    /// [`unknown_key_after_managed_units_table_is_rejected`] for what happens
+    /// when they don't.
     #[test]
     fn parses_templated_config() {
         let rendered = r#"# Managed by configuration management - do not edit
@@ -1046,7 +1046,7 @@ match = "Has\"Quote\\Back"
         assert_eq!(c.reconcile_interval_s, 30);
         assert!(c.detect_steam);
 
-        // The motivating multi-unit case (#35): two managed units, evicted in
+        // Two managed units, evicted in
         // declared order, each independently carrying its own `vram_match`.
         assert_eq!(c.managed_units.len(), 2);
         let units = c.resolved_units();
@@ -1066,20 +1066,15 @@ match = "Has\"Quote\\Back"
         assert_eq!(c.game_patterns[1].match_substr, "Has\"Quote\\Back");
     }
 
-    /// Negative companion to [`parses_templated_config`]: an older version of
-    /// that template rendered the detection key (`detect_steam`) *below* the
-    /// `[[managed_units]]` tables. In TOML, a bare `key = value`
-    /// belongs to the most recently opened table — there is no "back to root"
-    /// without an explicit `[table]`/top-level marker — so that key
-    /// deserialized as a field of the *last* `[[managed_units]]` entry
-    /// (`asr-runner.service`) instead of the `Config` root. `ManagedUnit` also
-    /// carries `#[serde(deny_unknown_fields)]`, so gpu-arbiter >= 0.10.0 fails
-    /// to parse this file outright (0.9.0's absence of `deny_unknown_fields`
-    /// had silently dropped the misplaced keys instead, masking the bug
-    /// rather than fixing it). This fixture is the verbatim output of that
-    /// old template with the same values as the corrected fixture above — it
-    /// must fail, and the error must name the first misplaced key,
-    /// `detect_steam`.
+    /// Negative companion to [`parses_templated_config`]: a template that
+    /// renders the detection key (`detect_steam`) *below* the
+    /// `[[managed_units]]` tables. In TOML, a bare `key = value` belongs to
+    /// the most recently opened table — there is no "back to root" without an
+    /// explicit `[table]`/top-level marker — so that key deserializes as a
+    /// field of the *last* `[[managed_units]]` entry (`asr-runner.service`)
+    /// instead of the `Config` root. `ManagedUnit` carries
+    /// `#[serde(deny_unknown_fields)]`, so this must fail to parse, and the
+    /// error must name the first misplaced key, `detect_steam`.
     #[test]
     fn unknown_key_after_managed_units_table_is_rejected() {
         let rendered = r#"# Managed by configuration management - do not edit

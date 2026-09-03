@@ -152,7 +152,7 @@ impl ReconcileTrigger {
     }
 
     /// The coarser [`PassTrigger`] metric bucket for this trigger — feeds
-    /// `gpu_arbiter_reconcile_passes_total{trigger}` (#14). Coarser than
+    /// `gpu_arbiter_reconcile_passes_total{trigger}`. Coarser than
     /// [`Self::label`]: `ManualStart`/`ManualStop` both bucket to
     /// [`PassTrigger::Manual`] (the metric doesn't need to distinguish a manual
     /// start from a manual stop, only "an operator drove this pass").
@@ -183,7 +183,7 @@ pub struct UnitStatus {
     /// when not running / unknown).
     pub models: Vec<String>,
     /// VRAM attributed to this unit in MiB (best-effort; `None` when unknown).
-    /// Attributed primarily via cgroup PID resolution (#7; works for any
+    /// Attributed primarily via cgroup PID resolution (works for any
     /// systemd-supervised unit with no config needed), falling back to the
     /// unit's configured `vram_match` substring for command-driven tenants.
     /// `None` when neither channel found a match.
@@ -294,15 +294,15 @@ pub struct ArbiterState {
     /// `true` if the most recent eviction pass had at least one unit fail —
     /// feeds [`StatusSnapshot::degraded`].
     pub degraded: bool,
-    /// Monotonic Prometheus counters (#14) — durable history across
-    /// journald's short retention on the deployment host. See [`Metrics`].
+    /// Monotonic Prometheus counters — durable history that outlives
+    /// journald's short log retention. See [`Metrics`].
     pub metrics: Metrics,
 }
 
 /// Monotonic Prometheus counters accumulated over the daemon's process
 /// lifetime, rendered by `gpu_arbiter_evictions_total` /
 /// `gpu_arbiter_unit_restarts_total` / `gpu_arbiter_reconcile_passes_total`
-/// (#14; `gpu_arbiter_proc_events_dropped_total` is tracked separately in
+/// (`gpu_arbiter_proc_events_dropped_total` is tracked separately in
 /// [`crate::procmon`], which has no [`ArbiterState`] access).
 ///
 /// Held in [`ArbiterState`] behind its `RwLock`, exactly like every other
@@ -469,7 +469,7 @@ pub struct ReconcilePassCounts {
     pub startup: u64,
 }
 
-/// The `trigger` label bucket for `gpu_arbiter_reconcile_passes_total` (#14).
+/// The `trigger` label bucket for `gpu_arbiter_reconcile_passes_total`.
 /// Coarser than [`ReconcileTrigger`] itself — see
 /// [`ReconcileTrigger::pass_trigger`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn unit_status_running_none_serializes_as_json_null() {
-        // #15: unlike `vram_mb` (skip_serializing_if), `running: None` is NOT
+        // Unlike `vram_mb` (skip_serializing_if), `running: None` is NOT
         // omitted — it must appear as an explicit `null` so a consumer can tell
         // "unknown" apart from a missing/old field.
         let u = UnitStatus {
@@ -820,7 +820,7 @@ mod tests {
         assert!(s.since >= t0);
     }
 
-    // ── Metrics (#14) ─────────────────────────────────────────────────────────
+    // ── Metrics ──────────────────────────────────────────────────────────────
 
     #[test]
     fn record_eviction_accumulates_per_unit_per_outcome() {

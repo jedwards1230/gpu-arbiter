@@ -38,17 +38,16 @@ use tokio::sync::mpsc;
 
 use crate::state::ReconcileTrigger;
 
-/// Cumulative count of dropped-event occurrences since daemon start (#14): one
+/// Cumulative count of dropped-event occurrences since daemon start: one
 /// increment per `ENOBUFS` recv (kernel receive-buffer overflow, see
 /// [`is_enobufs`]) **plus** one per full-trigger-channel `try_send` drop (the
 /// reconcile task is still mid-pass). Both are already logged-and-continued as
 /// non-fatal (see the module docs). Note an `ENOBUFS` occurrence can itself
 /// represent more than one lost kernel event — the kernel doesn't report how
 /// many — so this counts drop *occurrences*, a lower bound on events actually
-/// missed, not an exact per-event tally. Still enough to make "you're missing
-/// events" visible in `/metrics` as `gpu_arbiter_proc_events_dropped_total`,
-/// since journald's short retention on the deployment host otherwise loses the
-/// log lines within hours.
+/// missed, not an exact per-event tally. Exposed in `/metrics` as
+/// `gpu_arbiter_proc_events_dropped_total` so "you're missing events" is
+/// visible without relying on log retention.
 ///
 /// A plain module-level atomic rather than a field on [`crate::state::ArbiterState`]:
 /// `procmon::run` has no access to `ArbiterState` (by design — it only ever holds
@@ -241,11 +240,9 @@ pub async fn run(triggers: mpsc::Sender<ReconcileTrigger>) -> Result<(), ProcMon
             // ENOBUFS is recoverable, NOT fatal: under a process-event storm the
             // kernel's socket receive buffer overflows and recv() returns ENOBUFS.
             // It means "you missed some events", not "the socket is dead" — the
-            // socket is still subscribed and usable. Treating it as fatal here is
-            // what made the listener exit and fall back to the slow backstop timer
-            // (the boot-time "cn_proc listener exited" regression). Log and keep
-            // listening; the missed events are covered by the level-triggered
-            // reconcile, which re-derives truth on the next pass / backstop tick.
+            // socket is still subscribed and usable. Log and keep listening; the
+            // missed events are covered by the level-triggered reconcile, which
+            // re-derives truth on the next pass / backstop tick.
             Err(e) if is_enobufs(&e) => {
                 tracing::warn!(
                     error = %e,

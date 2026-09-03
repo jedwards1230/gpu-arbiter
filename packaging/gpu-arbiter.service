@@ -58,8 +58,8 @@ RestrictAddressFamilies=AF_NETLINK AF_INET AF_UNIX
 LockPersonality=true
 # NOTE: MemoryDenyWriteExecute is deliberately NOT set. On musl + the tokio
 # multi-threaded runtime it can SIGSYS the process at startup on some
-# kernel/libc combinations (notably CachyOS's patched kernel); the safety win
-# doesn't justify that risk for a static binary with no JIT.
+# kernel/libc combinations; the safety win doesn't justify that risk for a
+# static binary with no JIT.
 # Logs to the journal under this identifier.
 SyslogIdentifier=gpu-arbiter
 

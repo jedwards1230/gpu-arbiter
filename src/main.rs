@@ -334,9 +334,9 @@ mod daemon {
 
         // Resolve the GPU vendor **once**, here at startup, and thread the
         // `Copy` value through every reconcile pass and the HTTP manual-stop
-        // path. Re-probing per pass (the old behavior) let `auto`-detection
-        // flip vendors mid-run; a single resolution keeps the whole daemon
-        // lifetime talking to one vendor, matching the config doc's contract.
+        // path. Re-probing per pass would let `auto`-detection flip vendors
+        // mid-run; a single resolution keeps the whole daemon lifetime
+        // talking to one vendor, matching the config doc's contract.
         let backend = GpuBackend::resolve(cfg.gpu_backend);
         tracing::info!(?backend, "resolved GPU backend");
 
@@ -432,19 +432,17 @@ mod daemon {
         });
 
         // 6. HTTP control surface: the read-only surface (`/status /metrics
-        //    /healthz`) plus the deprecated TCP write routes, bound to
-        //    `cfg.bind` (loopback by default). The sanctioned write path is
-        //    the unix socket below.
+        //    /healthz`), bound to `cfg.bind` (loopback by default). The
+        //    write path is the unix socket below.
         //
         //    Both listeners are BOUND HERE, synchronously, before either
-        //    serve loop is spawned (#61): a bind failure (the TCP port
-        //    already in use, a live unix socket already listening — see
+        //    serve loop is spawned: a bind failure (the TCP port already in
+        //    use, a live unix socket already listening — see
         //    `http::HttpError::SocketInUse` — or a permission error) fails
-        //    daemon startup via `?` instead of only surfacing inside a
-        //    detached task's `tracing::error!`, which used to leave the
-        //    process "running" with no working HTTP surface at all. A
-        //    runtime accept-loop error *after* a successful bind is still
-        //    logged-and-continue below — only the bind itself is fatal.
+        //    daemon startup via `?` rather than only surfacing inside a
+        //    detached task's `tracing::error!`. A runtime accept-loop error
+        //    *after* a successful bind is still logged-and-continue below —
+        //    only the bind itself is fatal.
         let addr = SocketAddr::new(cfg.bind, cfg.port);
         let app = AppState {
             state: state.clone(),
@@ -501,13 +499,13 @@ mod daemon {
 
         // 6c. SIGHUP: config is an immutable `Arc` threaded into every task
         // (procmon, presence, reconcile, http) — a real hot-reload would need
-        // ArcSwap/RwLock plumbing across all of them (#23: not worth that
-        // blast radius). Log instead of silently
-        // swallowing the signal, so `systemctl kill -s HUP gpu-arbiter`
-        // doesn't leave an operator wondering why nothing changed — restart
-        // is the supported reload path, and it's safe by construction: step
-        // 3 above always reconciles against observed truth before anything
-        // can touch a managed unit, so a restart never "loses" state.
+        // ArcSwap/RwLock plumbing across all of them, which isn't worth the
+        // blast radius. Log instead of silently swallowing the signal, so
+        // `systemctl kill -s HUP gpu-arbiter` doesn't leave an operator
+        // wondering why nothing changed — restart is the supported reload
+        // path, and it's safe by construction: step 3 above always
+        // reconciles against observed truth before anything can touch a
+        // managed unit, so a restart never "loses" state.
         //
         // Unix-only: Windows has no SIGHUP to acknowledge. The restart-to-reload
         // contract is identical there, just unannounced.
@@ -557,10 +555,11 @@ mod daemon {
         Ok(())
     }
 
-    /// Log-only SIGHUP handling (#23 — see the scope-guard note at the call
-    /// site). Runs for the daemon's lifetime; a failure to even register the
-    /// handler is non-fatal (the daemon still runs, it just won't react to
-    /// SIGHUP at all — same fallback as [`wait_for_shutdown`]).
+    /// Log-only SIGHUP handling — see the scope note at the call site for why
+    /// this doesn't hot-reload. Runs for the daemon's lifetime; a failure to
+    /// even register the handler is non-fatal (the daemon still runs, it
+    /// just won't react to SIGHUP at all — same fallback as
+    /// [`wait_for_shutdown`]).
     /// Unix-only: Windows has no SIGHUP. The restart-to-reload contract is the
     /// same there, it simply has no signal to acknowledge.
     #[cfg(unix)]
