@@ -9,15 +9,15 @@
 //! cheap to thread through the reconcile loop and HTTP handlers.
 //!
 //! - **NVIDIA** shells out to `nvidia-smi` (the historical, byte-for-byte path):
-//!   total VRAM via `--query-gpu`, graphics/compute proc lists via the
-//!   `--query-*-apps` CSV. The 2 s timeout and error mapping are preserved.
+//!   total VRAM via `--query-gpu`, the compute proc list via
+//!   `--query-compute-apps` CSV. The 2 s timeout and error mapping are preserved.
 //! - **AMD** reads VRAM from sysfs (`/sys/class/drm/card*/device/mem_info_vram_*`);
-//!   there is no simple per-proc VRAM via sysfs, so the proc lists degrade to an
-//!   empty `Vec` best-effort (VRAM attribution in `/status` and the opt-in
-//!   `vram_heuristic` simply report nothing rather than erroring).
+//!   there is no simple per-proc VRAM via sysfs, so the compute proc list degrades
+//!   to an empty `Vec` best-effort (VRAM attribution in `/status` simply reports
+//!   nothing rather than erroring).
 //!
 //! The split that makes this testable on macOS:
-//! - **Pure parsers** ([`parse_memory_csv`], [`parse_graphics_procs_csv`],
+//! - **Pure parsers** ([`parse_memory_csv`], [`parse_compute_procs_csv`],
 //!   [`parse_vram_sysfs`]) turn raw vendor output into typed values. Unit-tested
 //!   with literal inputs.
 //! - **The shell-outs / sysfs reads** are async; they compile everywhere and only
@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use crate::classify::GpuGraphicsProc;
+use crate::classify::GpuComputeProc;
 
 /// Hard ceiling on any `nvidia-smi` shell-out. A wedged GPU (driver/Xid hang, GPU
 /// fallen off the bus, a stuck ioctl) is a real, well-known NVIDIA failure mode in
@@ -149,23 +149,6 @@ impl GpuBackend {
         }
     }
 
-    /// The GPU *graphics* process list (feeds the opt-in VRAM heuristic). Async.
-    ///
-    /// AMD has no simple per-proc VRAM via sysfs → returns an empty `Vec`
-    /// best-effort (the heuristic degrades to seeing nothing this pass; it must
-    /// not error).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GpuError`] on NVIDIA if `nvidia-smi` can't be spawned, times
-    /// out, exits non-zero, or its output doesn't parse. Never errors on AMD.
-    pub async fn query_graphics_procs(self) -> Result<Vec<GpuGraphicsProc>, GpuError> {
-        match self {
-            GpuBackend::Nvidia => nvidia::query_graphics_procs().await,
-            GpuBackend::Amd => Ok(Vec::new()),
-        }
-    }
-
     /// The GPU *compute* process list (feeds `/status` VRAM attribution). Async.
     ///
     /// AMD has no simple per-proc VRAM via sysfs → returns an empty `Vec`
@@ -175,7 +158,7 @@ impl GpuBackend {
     ///
     /// Returns [`GpuError`] on NVIDIA if `nvidia-smi` can't be spawned, times
     /// out, exits non-zero, or its output doesn't parse. Never errors on AMD.
-    pub async fn query_compute_procs(self) -> Result<Vec<GpuGraphicsProc>, GpuError> {
+    pub async fn query_compute_procs(self) -> Result<Vec<GpuComputeProc>, GpuError> {
         match self {
             GpuBackend::Nvidia => nvidia::query_compute_procs().await,
             GpuBackend::Amd => Ok(Vec::new()),
@@ -284,14 +267,14 @@ pub fn parse_memory_csv(out: &str) -> Result<GpuMemory, GpuError> {
     })
 }
 
-/// Parse graphics-process CSV (`pid,process_name,used_gpu_memory` from
-/// `nvidia-smi --query-compute-apps` / the graphics-app equivalent,
+/// Parse compute-process CSV (`pid,process_name,used_memory` from
+/// `nvidia-smi --query-compute-apps=pid,process_name,used_memory`,
 /// `--format=csv,noheader,nounits`). Pure.
 ///
 /// Lines that don't parse are skipped (best-effort). `[N/A]` VRAM cells parse
 /// as 0.
 #[must_use]
-pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
+pub fn parse_compute_procs_csv(out: &str) -> Vec<GpuComputeProc> {
     out.lines()
         .filter_map(|line| {
             let line = line.trim();
@@ -302,7 +285,7 @@ pub fn parse_graphics_procs_csv(out: &str) -> Vec<GpuGraphicsProc> {
             let pid = cols.next()?.parse::<i32>().ok()?;
             let name = cols.next()?.to_string();
             let vram_mb = cols.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            Some(GpuGraphicsProc {
+            Some(GpuComputeProc {
                 pid,
                 name,
                 vram_mb,
@@ -352,9 +335,9 @@ fn bytes_to_mib(bytes: u64) -> u64 {
 /// the pre-pluggable free functions — only the location changed.
 mod nvidia {
     use super::{
-        GpuError, GpuMemory, NVIDIA_SMI_TIMEOUT, parse_graphics_procs_csv, parse_memory_csv,
+        GpuError, GpuMemory, NVIDIA_SMI_TIMEOUT, parse_compute_procs_csv, parse_memory_csv,
     };
-    use crate::classify::GpuGraphicsProc;
+    use crate::classify::GpuComputeProc;
 
     /// Run `nvidia-smi` with `args` and return its stdout. Async — the process is
     /// driven by tokio's reactor, so it never blocks the runtime.
@@ -398,34 +381,16 @@ mod nvidia {
         parse_memory_csv(&out)
     }
 
-    /// Shell out to `nvidia-smi` for the GPU *graphics* process list (feeds the
-    /// opt-in VRAM heuristic). Async.
-    ///
-    /// Querying **graphics** apps (not compute) is load-bearing for the heuristic's
-    /// safety-by-construction: Ollama is a *compute* GPU process, so it never
-    /// appears in this list and physically cannot be flagged.
-    pub async fn query_graphics_procs() -> Result<Vec<GpuGraphicsProc>, GpuError> {
-        let out = run_nvidia_smi(&[
-            "--query-graphics-apps=pid,process_name,used_memory",
-            "--format=csv,noheader,nounits",
-        ])
-        .await?;
-        Ok(parse_graphics_procs_csv(&out))
-    }
-
     /// Shell out to `nvidia-smi` for the GPU *compute* process list. Async.
     ///
-    /// Ollama is a **compute** GPU process, so its VRAM is reported here (not in
-    /// the graphics-apps list). Used to populate the `/status` `ollama.vram_mb`
-    /// field. Reuses [`parse_graphics_procs_csv`] (identical
-    /// `pid,name,used_memory` shape).
-    pub async fn query_compute_procs() -> Result<Vec<GpuGraphicsProc>, GpuError> {
+    /// Used to populate the `/status` per-unit `vram_mb` field.
+    pub async fn query_compute_procs() -> Result<Vec<GpuComputeProc>, GpuError> {
         let out = run_nvidia_smi(&[
             "--query-compute-apps=pid,process_name,used_memory",
             "--format=csv,noheader,nounits",
         ])
         .await?;
-        Ok(parse_graphics_procs_csv(&out))
+        Ok(parse_compute_procs_csv(&out))
     }
 }
 
@@ -528,7 +493,7 @@ mod amd {
 /// field rather than reporting a misleading `0`). On AMD the compute list is
 /// always empty, so this always returns `None` (attribution degrades cleanly).
 #[must_use]
-pub fn vram_mb_matching(compute: &[GpuGraphicsProc], needle: &str) -> Option<u64> {
+pub fn vram_mb_matching(compute: &[GpuComputeProc], needle: &str) -> Option<u64> {
     let needle = needle.to_ascii_lowercase();
     let mut matched = compute
         .iter()
@@ -544,14 +509,14 @@ pub fn vram_mb_matching(compute: &[GpuGraphicsProc], needle: &str) -> Option<u64
 /// systemd-supervised unit. Pure helper over a compute-proc list already
 /// enriched by [`crate::cgroup::attribute_units`].
 ///
-/// Sums every compute proc whose [`GpuGraphicsProc::owning_unit`] resolved to
+/// Sums every compute proc whose [`GpuComputeProc::owning_unit`] resolved to
 /// exactly `unit_name`. Same "`None` when nothing matched" contract as
 /// [`vram_mb_matching`] (so `/status` omits the field instead of asserting a
 /// misleading `0` for a unit nothing was ever attributed to) — see
 /// [`unit_vram_sum`] for the eviction-gating counterpart, which needs an
 /// explicit `0` to mean "confirmed drained".
 #[must_use]
-pub fn vram_mb_by_cgroup(compute: &[GpuGraphicsProc], unit_name: &str) -> Option<u64> {
+pub fn vram_mb_by_cgroup(compute: &[GpuComputeProc], unit_name: &str) -> Option<u64> {
     let mut matched = compute
         .iter()
         .filter(|p| p.owning_unit.as_deref() == Some(unit_name))
@@ -569,7 +534,7 @@ pub fn vram_mb_by_cgroup(compute: &[GpuGraphicsProc], unit_name: &str) -> Option
 /// want: [`attribute_unit_vram`] (eviction gating, #8) needs to distinguish
 /// "the unit's process is confirmed gone" from "we have no idea", which
 /// `Option`-collapsing zero-into-`None` would erase.
-fn unit_vram_sum(compute: &[GpuGraphicsProc], unit_name: &str) -> u64 {
+fn unit_vram_sum(compute: &[GpuComputeProc], unit_name: &str) -> u64 {
     compute
         .iter()
         .filter(|p| p.owning_unit.as_deref() == Some(unit_name))
@@ -597,7 +562,7 @@ fn unit_vram_sum(compute: &[GpuGraphicsProc], unit_name: &str) -> u64 {
 ///   falls back to the total-GPU-VRAM gate.
 #[must_use]
 pub fn attribute_unit_vram(
-    compute: Option<&[GpuGraphicsProc]>,
+    compute: Option<&[GpuComputeProc]>,
     is_systemd: bool,
     unit_name: &str,
     vram_match: Option<&str>,
@@ -633,17 +598,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_graphics_procs_skips_bad_lines() {
+    fn parse_compute_procs_skips_bad_lines() {
         let out = "12345, kwin_wayland, 512\n\nbroken line\n999, MyGame, 8000\n";
-        let procs = parse_graphics_procs_csv(out);
+        let procs = parse_compute_procs_csv(out);
         assert_eq!(procs.len(), 2);
         assert_eq!(procs[0].name, "kwin_wayland");
         assert_eq!(procs[1].vram_mb, 8000);
     }
 
     #[test]
-    fn parse_graphics_procs_na_vram_is_zero() {
-        let procs = parse_graphics_procs_csv("42, X, [N/A]\n");
+    fn parse_compute_procs_na_vram_is_zero() {
+        let procs = parse_compute_procs_csv("42, X, [N/A]\n");
         assert_eq!(procs.len(), 1);
         assert_eq!(procs[0].vram_mb, 0);
     }
@@ -661,10 +626,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_graphics_procs_realistic_path_name() {
+    fn parse_compute_procs_realistic_path_name() {
         // nvidia-smi reports the full process path as process_name.
         let out = "1234, /usr/lib/steam/game.x86_64, 8192\n";
-        let procs = parse_graphics_procs_csv(out);
+        let procs = parse_compute_procs_csv(out);
         assert_eq!(procs.len(), 1);
         assert_eq!(procs[0].pid, 1234);
         assert_eq!(procs[0].name, "/usr/lib/steam/game.x86_64");
@@ -672,9 +637,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_graphics_procs_empty_is_empty() {
-        assert!(parse_graphics_procs_csv("").is_empty());
-        assert!(parse_graphics_procs_csv("\n\n").is_empty());
+    fn parse_compute_procs_empty_is_empty() {
+        assert!(parse_compute_procs_csv("").is_empty());
+        assert!(parse_compute_procs_csv("\n\n").is_empty());
     }
 
     // ── AMD sysfs parser ────────────────────────────────────────────────────
@@ -764,7 +729,7 @@ mod tests {
     #[test]
     fn vram_matching_sums_matching_compute_procs() {
         // Real nvidia-smi reports the full path; match is by substring.
-        let procs = parse_graphics_procs_csv(
+        let procs = parse_compute_procs_csv(
             "111, /usr/local/bin/ollama, 21000\n222, /usr/bin/ollama runner, 500\n333, python3, 4000\n",
         );
         assert_eq!(vram_mb_matching(&procs, "ollama"), Some(21500));
@@ -774,13 +739,13 @@ mod tests {
 
     #[test]
     fn vram_matching_is_case_insensitive() {
-        let procs = parse_graphics_procs_csv("111, /opt/VLLM/Server, 8000\n");
+        let procs = parse_compute_procs_csv("111, /opt/VLLM/Server, 8000\n");
         assert_eq!(vram_mb_matching(&procs, "vllm"), Some(8000));
     }
 
     #[test]
     fn vram_matching_none_when_absent() {
-        let procs = parse_graphics_procs_csv("333, python3, 4000\n");
+        let procs = parse_compute_procs_csv("333, python3, 4000\n");
         assert_eq!(vram_mb_matching(&procs, "ollama"), None);
         assert_eq!(vram_mb_matching(&[], "ollama"), None);
     }
@@ -789,13 +754,8 @@ mod tests {
 
     /// A compute proc with a resolved owning unit — the shape
     /// `crate::cgroup::attribute_units` produces.
-    fn attributed(
-        pid: i32,
-        name: &str,
-        vram_mb: u64,
-        owning_unit: Option<&str>,
-    ) -> GpuGraphicsProc {
-        GpuGraphicsProc {
+    fn attributed(pid: i32, name: &str, vram_mb: u64, owning_unit: Option<&str>) -> GpuComputeProc {
+        GpuComputeProc {
             pid,
             name: name.to_string(),
             vram_mb,
@@ -862,13 +822,13 @@ mod tests {
     fn attribute_unit_vram_command_driven_falls_back_to_vram_match() {
         // A command-driven unit (is_systemd = false) has no cgroup path that
         // could resolve to it — vram_match is the only channel.
-        let procs = parse_graphics_procs_csv("1, /usr/local/bin/ollama, 21000\n");
+        let procs = parse_compute_procs_csv("1, /usr/local/bin/ollama, 21000\n");
         assert_eq!(
             attribute_unit_vram(Some(&procs), false, "ollama", Some("ollama")),
             Some(21000)
         );
         // No match this poll → confirmed drained (explicit 0, not None).
-        let empty: Vec<GpuGraphicsProc> = Vec::new();
+        let empty: Vec<GpuComputeProc> = Vec::new();
         assert_eq!(
             attribute_unit_vram(Some(&empty), false, "ollama", Some("ollama")),
             Some(0)
@@ -880,7 +840,7 @@ mod tests {
         // No cgroup channel (command-driven) AND no vram_match configured →
         // structurally no attribution this poll; caller must fall back to
         // total GPU VRAM.
-        let procs = parse_graphics_procs_csv("1, /usr/local/bin/ollama, 21000\n");
+        let procs = parse_compute_procs_csv("1, /usr/local/bin/ollama, 21000\n");
         assert_eq!(
             attribute_unit_vram(Some(&procs), false, "ollama", None),
             None
@@ -935,16 +895,9 @@ mod tests {
 
     #[tokio::test]
     async fn amd_proc_lists_are_empty_not_errors() {
-        // AMD has no per-proc VRAM via sysfs: both proc queries degrade to an empty
-        // Vec (best-effort), never an error. This is the contract /status and the
-        // heuristic rely on.
-        assert!(
-            GpuBackend::Amd
-                .query_graphics_procs()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        // AMD has no per-proc VRAM via sysfs: the compute proc query degrades
+        // to an empty Vec (best-effort), never an error. This is the contract
+        // `/status` VRAM attribution relies on.
         assert!(
             GpuBackend::Amd
                 .query_compute_procs()

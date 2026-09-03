@@ -479,17 +479,6 @@ pub struct Config {
     pub detect_steam: bool,
     /// Build-as-you-go cmdline substrings for non-Steam launchers.
     pub game_patterns: Vec<GamePattern>,
-    /// Opt-in: treat heavy, non-allowlisted *graphics* GPU procs as games.
-    pub vram_heuristic: bool,
-    /// VRAM threshold (MiB) for the opt-in heuristic.
-    pub vram_game_threshold_mb: u64,
-    /// Sanctioned GPU tenants (for the heuristic + a sanity log line). Each
-    /// entry is matched case-insensitively against a `vram_heuristic`
-    /// graphics proc's full name/path, its path basename, and (when cgroup
-    /// attribution resolved one, #7) its owning systemd unit — see
-    /// [`crate::classify::matches_allowlist`] (#13). No substring matching:
-    /// every check is an exact equality.
-    pub gpu_allowlist: Vec<String>,
 
     // ── presence ─────────────────────────────────────────────────────────────
     /// Watch physical (non-virtual) human-input devices to report whether a human
@@ -570,14 +559,6 @@ impl Default for Config {
             reconcile_interval_s: 30,
             detect_steam: true,
             game_patterns: Vec::new(),
-            vram_heuristic: false,
-            vram_game_threshold_mb: 4000,
-            gpu_allowlist: vec![
-                "ollama".to_string(),
-                "kwin_wayland".to_string(),
-                "plasmashell".to_string(),
-                "Xwayland".to_string(),
-            ],
             presence_detection: true,
             presence_idle_threshold_s: 600,
             gpu_backend: GpuBackendKind::Auto,
@@ -702,7 +683,6 @@ mod tests {
         assert_eq!(c, Config::default());
         assert_eq!(c.port, 48750);
         assert!(c.detect_steam);
-        assert!(!c.vram_heuristic);
         // Presence defaults: on, 10-minute idle threshold.
         assert!(c.presence_detection);
         assert_eq!(c.presence_idle_threshold_s, 600);
@@ -1078,7 +1058,7 @@ mod tests {
     /// deployment contract honest. Regenerate from the template, do not
     /// hand-edit.
     ///
-    /// Root scalars (`enabled` through `gpu_allowlist`) all render **before**
+    /// Root scalars (`enabled` through `detect_steam`) all render **before**
     /// both table headers — this is the corrected ordering. See
     /// [`unknown_key_after_managed_units_table_is_rejected`] just below for what
     /// happens (and why) when they don't.
@@ -1106,9 +1086,6 @@ reconcile_interval_s = 30
 
 # --- detection ---
 detect_steam = true
-vram_heuristic = false
-vram_game_threshold_mb = 4000
-gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
 
 # Multi-tenant eviction (v0.3.0+). When this list is present it TAKES PRECEDENCE
 # over the legacy ollama_unit/eager_ollama keys above. Eviction runs in order.
@@ -1144,12 +1121,6 @@ match = "Has\"Quote\\Back"
         assert_eq!(c.vram_free_threshold_mb, 2000);
         assert_eq!(c.reconcile_interval_s, 30);
         assert!(c.detect_steam);
-        assert!(!c.vram_heuristic);
-        assert_eq!(c.vram_game_threshold_mb, 4000);
-        assert_eq!(
-            c.gpu_allowlist,
-            vec!["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
-        );
 
         // The motivating multi-unit case (#35): two managed units, evicted in
         // declared order, each independently carrying its own `vram_match`.
@@ -1172,12 +1143,11 @@ match = "Has\"Quote\\Back"
     }
 
     /// Negative companion to [`parses_templated_config`]: an older version of
-    /// that template rendered the detection keys
-    /// (`detect_steam`/`vram_heuristic`/`vram_game_threshold_mb`/`gpu_allowlist`)
-    /// *below* the `[[managed_units]]` tables. In TOML, a bare `key = value`
+    /// that template rendered the detection key (`detect_steam`) *below* the
+    /// `[[managed_units]]` tables. In TOML, a bare `key = value`
     /// belongs to the most recently opened table — there is no "back to root"
-    /// without an explicit `[table]`/top-level marker — so those four keys
-    /// deserialized as fields of the *last* `[[managed_units]]` entry
+    /// without an explicit `[table]`/top-level marker — so that key
+    /// deserialized as a field of the *last* `[[managed_units]]` entry
     /// (`asr-runner.service`) instead of the `Config` root. `ManagedUnit` also
     /// carries `#[serde(deny_unknown_fields)]`, so gpu-arbiter >= 0.10.0 fails
     /// to parse this file outright (0.9.0's absence of `deny_unknown_fields`
@@ -1215,9 +1185,6 @@ vram_match = "asr-runner"
 
 # --- detection ---
 detect_steam = true
-vram_heuristic = false
-vram_game_threshold_mb = 4000
-gpu_allowlist = ["ollama", "kwin_wayland", "plasmashell", "Xwayland"]
 
 [[game_patterns]]
 name = "heroic"

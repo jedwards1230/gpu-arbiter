@@ -23,12 +23,12 @@
 //!   file contents (both cgroup v1 and v2 shapes).
 //! - [`attribute_units`] is the **Linux edge**: reads `/proc/<pid>/cgroup` for
 //!   each process's pid (off the async runtime, via `spawn_blocking`) and fills
-//!   in [`GpuGraphicsProc::owning_unit`](crate::classify::GpuGraphicsProc::owning_unit).
+//!   in [`GpuComputeProc::owning_unit`](crate::classify::GpuComputeProc::owning_unit).
 //!   Best-effort throughout — a pid that raced an exit, or a process with no
 //!   `system.slice`-rooted cgroup (a user session, a non-systemd host), simply
 //!   keeps `owning_unit: None`; it never errors or panics.
 
-use crate::classify::GpuGraphicsProc;
+use crate::classify::GpuComputeProc;
 
 /// Extract the owning systemd unit name from `/proc/<pid>/cgroup` contents.
 /// Pure — unit-tested with literal file contents.
@@ -75,7 +75,7 @@ fn unit_from_cgroup_line(line: &str) -> Option<String> {
 }
 
 /// Resolve each process's owning systemd unit (via cgroup) and fill in
-/// [`GpuGraphicsProc::owning_unit`]. Linux-only at runtime; compiles
+/// [`GpuComputeProc::owning_unit`]. Linux-only at runtime; compiles
 /// everywhere (non-Linux stub below returns `procs` unchanged — `owning_unit`
 /// stays `None`).
 ///
@@ -85,7 +85,7 @@ fn unit_from_cgroup_line(line: &str) -> Option<String> {
 /// panics: a `spawn_blocking` join failure degrades to every `owning_unit`
 /// staying `None`, same as a pid that raced an exit.
 #[cfg(target_os = "linux")]
-pub async fn attribute_units(procs: Vec<GpuGraphicsProc>) -> Vec<GpuGraphicsProc> {
+pub async fn attribute_units(procs: Vec<GpuComputeProc>) -> Vec<GpuComputeProc> {
     let pids: Vec<i32> = procs.iter().map(|p| p.pid).collect();
     let units = tokio::task::spawn_blocking(move || resolve_pid_units_blocking(&pids))
         .await
@@ -122,7 +122,7 @@ fn resolve_pid_units_blocking(pids: &[i32]) -> std::collections::HashMap<i32, St
 // platforms — the Linux impl above genuinely awaits `spawn_blocking`.
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::unused_async)]
-pub async fn attribute_units(procs: Vec<GpuGraphicsProc>) -> Vec<GpuGraphicsProc> {
+pub async fn attribute_units(procs: Vec<GpuComputeProc>) -> Vec<GpuComputeProc> {
     procs
 }
 
@@ -230,7 +230,7 @@ mod tests {
     async fn attribute_units_never_panics_without_proc() {
         // On macOS / CI there is no /proc — every owning_unit stays None, never
         // a panic, and the process list itself is preserved verbatim.
-        let procs = vec![GpuGraphicsProc {
+        let procs = vec![GpuComputeProc {
             pid: std::process::id().cast_signed(),
             name: "whatever".to_string(),
             vram_mb: 100,
