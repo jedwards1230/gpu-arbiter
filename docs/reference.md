@@ -24,6 +24,13 @@ local-root-only, no bearer tokens — and, **deprecated**, on the same TCP port
 transports validate `{unit}` against `managed_units` before touching
 `systemctl`.
 
+> **Windows:** there is no unix-socket listener — `http::bind_uds` and
+> `serve_uds_on` are `cfg(unix)` with no counterpart, and `socket_path` is
+> ignored (with a warning, so a `socket_path` copied from a Linux config isn't
+> silently dropped). The **only** write path there is the TCP surface, which has
+> no peer-credential check, so `bind` must be scoped by firewall rule rather
+> than left open. A named-pipe listener that restores parity is planned.
+
 | Method | Path | Transport | Purpose |
 |---|---|---|---|
 | GET | `/status` | TCP (LAN) | Full state snapshot (below) |
@@ -118,7 +125,9 @@ mouse / gamepad) and tracks input recency. Virtual devices injected by
 Moonlight/Sunshine streaming are excluded by sysfs parentage (they live under
 `/sys/devices/virtual/`), so "someone at the desk" is distinguishable from a
 remote stream. `input_monitor_up = false` means presence is **unknown** (fail-safe
-— don't suppress an "abandoned game" alert on a down monitor).
+— don't suppress an "abandoned game" alert on a down monitor). Presence
+detection is **Linux-only** (it reads evdev input devices); on Windows the
+monitor never comes up, so presence is always reported as unknown.
 
 ### Metrics
 
@@ -165,7 +174,7 @@ across a restart:
 ## Command-line usage
 
 ```text
-gpu-arbiter [--config <PATH>] [--check-config]              Run the daemon (Linux), or validate config
+gpu-arbiter [--config <PATH>] [--check-config]              Run the daemon (Linux/Windows), or validate config
 gpu-arbiter status [--config <PATH>] [--url <URL>] [--json | -q]
 gpu-arbiter wait [--for available|claimed] [--timeout <SECS>] [--url <URL>]
 gpu-arbiter watch [--json] [--url <URL>]
