@@ -46,6 +46,21 @@
 # (cn_proc); this only covers dropped netlink events.
 #reconcile_interval_s = 30
 
+# Default budget (seconds) for a COOPERATIVE release, used by units that set
+# yield_cmd but no per-unit yield_timeout_s. Deliberately shorter than
+# eviction_timeout_s: this is the FIRST of two eviction stages and its budget is
+# spent before the stop path even begins, so a generous value here directly
+# delays a game getting the GPU. Tune it from the
+# gpu_arbiter_eviction_duration_seconds{stage="yield"} histogram, not by guessing.
+#yield_timeout_s = 3
+
+# The priority a detected GAME claims at. Higher wins. The default sits above
+# every unit's default priority (50), which is what makes gaming preempt
+# everything. Lowering it below a tenant's priority would let that tenant
+# survive a game launch — a real option (a tenant you never want interrupted),
+# but a deliberate one.
+#game_priority = 100
+
 # GPU vendor backend: "auto" (nvidia-smi if present, else amdgpu sysfs, else
 # nvidia), "nvidia", or "amd".
 #gpu_backend = "auto"
@@ -129,6 +144,55 @@
 #eager_restart = true
 #vram_match = "vllm"
 #introspect_cmd = "vllm-cli list-models"
+
+# --- the priority ladder & cooperative eviction -------------------------------
+#
+# Gaming-beats-everything is the floor, not the whole model. Tenants also rank
+# against EACH OTHER, and a tenant that supports it can be asked to let go of
+# the GPU without being killed.
+#
+# `priority` (default 50) is the tier. A demand at priority P preempts every
+# unit with priority < P and leaves everything at >= P alone. The comparison is
+# strict, so equal tiers coexist rather than fight — which is why a config that
+# never mentions priorities behaves exactly as it did before the ladder existed.
+#
+# A unit only PREEMPTS a lower tier when its `busy_cmd` exits 0 ("I have work
+# right now"). With no busy_cmd a unit is a preemption target only, never a
+# source — the right default, since a merely-running server holding an idle
+# model should not evict anything. The probe runs on EVERY reconcile pass, so it
+# must be cheap and non-blocking; one that fails to spawn, times out, or exits
+# non-zero reads as NOT busy, so a broken probe can't evict on a false pretext.
+#
+# `yield_cmd` adds a cooperative stage before the stop path: ask the tenant to
+# drop the GPU while staying alive (for a PyTorch service, typically
+# `model.cpu()` + `torch.cuda.empty_cache()`), then poll `busy_cmd` until it
+# reports not busy. Exit 0 from yield_cmd means "request accepted", NOT "the GPU
+# is free" — which is why release is confirmed by polling rather than trusted.
+# On success the unit is never stopped: no in-flight work lost, no cold model
+# reload after. On timeout or failure it falls through to the ordinary
+# stop → poll-VRAM → SIGKILL path, so a tenant that ignores the request can
+# never hold the GPU against a higher tier.
+#
+# !! yield_cmd WITHOUT busy_cmd DOES NOTHING. Release would be unobservable, so
+# !! the daemon logs a warning, skips the yield stage entirely, and stops the
+# !! unit. Always configure the two together.
+#
+# `resume_cmd` is the undo, run on the restore path before any start. It MUST be
+# idempotent: the daemon deliberately does not track whether a unit was yielded
+# or stopped (that state would have to survive a daemon restart to be
+# trustworthy), so it runs resume unconditionally.
+#
+# Tune both budgets from the gpu_arbiter_eviction_duration_seconds{stage=...}
+# histogram — the yield/stop split is what shows whether the cooperative stage
+# is paying for itself or just adding latency ahead of an inevitable stop.
+#[[managed_units]]
+#unit = "asr.service"
+#priority = 25                                  # below the default 50: yields to other tenants
+#eager_restart = true
+#busy_cmd = ["curl", "-sf", "http://127.0.0.1:9000/busy"]   # exit 0 = has work
+#yield_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/release"]
+#resume_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/acquire"]
+#yield_timeout_s = 10                           # overrides the top-level default
 
 # Non-systemd supervisor overrides (OpenRC / runit / plain processes).
 # When ALL four *_cmd overrides are absent, the tenant is driven byte-for-byte by
