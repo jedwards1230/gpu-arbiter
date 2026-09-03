@@ -39,7 +39,7 @@ Windows differences worth holding in mind when changing code:
 | Observation | `cn_proc` netlink (event-driven) | `sysinfo` enumeration on the reconcile timer — `procmon::run` parks |
 | Supervisor | systemd default | no default; needs per-unit `*_cmd` |
 | Per-unit VRAM | cgroup + `vram_match` | none (WDDM reports `[N/A]`); eviction gates on service state |
-| Write path | unix socket `0600` | TCP only — no peer-credential check; named pipe is a future phase |
+| Write path | unix socket `0600` | TCP only — no peer-credential check; named pipe not yet implemented |
 | Presence | evdev | stub; always unknown |
 | Config default | `/etc/gpu-arbiter/config.toml` | `C:\ProgramData\gpu-arbiter\config.toml` |
 

@@ -3,9 +3,8 @@
 
 _pkgname=gpu-arbiter
 pkgname=gpu-arbiter-bin
-# pkgver is the version this PR's merge will cut. The release automation
-# reconciles pkgver to the published git tag (vX.Y.Z) at publish time.
-pkgver=0.8.0
+# Reconciled to the published git tag (vX.Y.Z) at publish time.
+pkgver=0.11.0
 pkgrel=1
 pkgdesc="Gaming-first GPU arbiter daemon: evicts GPU compute tenants (e.g. Ollama) when a game launches (prebuilt static musl binary)"
 arch=('x86_64')
@@ -22,9 +21,8 @@ backup=('etc/gpu-arbiter/config.toml')
 # musl asset, fetched separately.
 source=("$_pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "$_pkgname-bin-$pkgver::$url/releases/download/v$pkgver/gpu-arbiter-x86_64-unknown-linux-musl")
-# sha256sums are SKIP because the v0.8.0 release assets do not exist until this
-# PR merges and the release Action publishes them. Real sums are filled in at
-# publish time by `updpkgsums` (or the release Action) before the AUR push.
+# sha256sums are SKIP placeholders. Run `updpkgsums` before publishing to fill
+# in real sums for the tagged release assets.
 sha256sums=('SKIP'
             'SKIP')
 

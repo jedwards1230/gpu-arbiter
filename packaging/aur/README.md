@@ -36,15 +36,15 @@ the first time:
    (see maintenance below), then:
    ```sh
    git add PKGBUILD .SRCINFO
-   git commit -m "Initial import: gpu-arbiter-bin 0.8.0"
+   git commit -m "Initial import: gpu-arbiter-bin <version>"
    git push
    ```
 
 Repeat for `gpu-arbiter` (source package).
 
-> The `.SRCINFO` committed here uses `SKIP` checksums because the v0.8.0 release
-> assets don't exist until this PR merges and releases. **Before the first AUR
-> push, run `updpkgsums` to pin real `sha256sums`, then regenerate `.SRCINFO`.**
+> The `.SRCINFO` committed here uses `SKIP` checksums as a placeholder. Run
+> `updpkgsums` before publishing to pin real `sha256sums`, then regenerate
+> `.SRCINFO`.
 
 ## Per-release maintenance
 

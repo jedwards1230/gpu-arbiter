@@ -2041,7 +2041,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
 
     #[tokio::test]
     async fn yield_without_a_busy_probe_does_not_claim_release() {
-        // Regression guard for a real bug caught in review on this PR.
+        // Regression guard for a real bug.
         //
         // `is_busy` reports `false` for a unit with no `busy_cmd`, so the yield
         // poll's `!is_busy(u)` read "not busy" on its very first iteration and

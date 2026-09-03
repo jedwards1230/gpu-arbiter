@@ -70,9 +70,9 @@ impl std::fmt::Display for UsageError {
 impl std::error::Error for UsageError {}
 
 /// `wait --for` target. The daemon's current wire vocabulary is
-/// gaming/available (a later 1.0 wave renames it — hardening plan #25);
-/// [`wait_condition_met`] is the one place that mapping lives, so the rename
-/// only has to touch one function.
+/// gaming/available (tracked for a rename in #25); [`wait_condition_met`] is
+/// the one place that mapping lives, so the rename only has to touch one
+/// function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitFor {
     /// Wait until the GPU is free (`state == "available"`). The default.
