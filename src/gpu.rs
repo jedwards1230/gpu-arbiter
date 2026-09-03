@@ -259,8 +259,9 @@ pub fn parse_memory_csv(out: &str) -> Result<GpuMemory, GpuError> {
     })
 }
 
-/// Parse compute-process CSV (`pid,process_name,used_gpu_memory` from
-/// `nvidia-smi --query-compute-apps`, `--format=csv,noheader,nounits`). Pure.
+/// Parse compute-process CSV (`pid,process_name,used_memory` from
+/// `nvidia-smi --query-compute-apps=pid,process_name,used_memory`,
+/// `--format=csv,noheader,nounits`). Pure.
 ///
 /// Lines that don't parse are skipped (best-effort). `[N/A]` VRAM cells parse
 /// as 0.
