@@ -110,11 +110,9 @@ pub fn flatten_cmdline(raw: &[u8]) -> String {
 /// Returns [`ReconcileError`] if the blocking `/proc` scan panics (a
 /// `spawn_blocking` join failure) or itself errors (e.g. `/proc` unreadable).
 #[cfg(target_os = "linux")]
-pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
+pub async fn observe() -> Result<ProcSnapshot, ReconcileError> {
     // Blocking /proc walk off the runtime threads.
     let procs = tokio::task::spawn_blocking(scan_proc).await??;
-    let _ = (cfg, backend);
-
     Ok(ProcSnapshot { procs })
 }
 
@@ -225,13 +223,11 @@ fn scan_processes() -> Vec<ProcInfo> {
 /// Returns [`ReconcileError`] only if the blocking scan task panics or is
 /// cancelled.
 #[cfg(target_os = "windows")]
-pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
+pub async fn observe() -> Result<ProcSnapshot, ReconcileError> {
     // Blocking enumeration off the runtime threads, exactly as the Linux path
     // does for its `/proc` walk — `refresh_processes` is a synchronous syscall
     // storm, not something to run on an executor thread.
     let procs = tokio::task::spawn_blocking(scan_processes).await?;
-    let _ = (cfg, backend);
-
     Ok(ProcSnapshot { procs })
 }
 
@@ -251,7 +247,7 @@ pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, 
 // platforms — the Linux impl above genuinely awaits `spawn_blocking`.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[allow(clippy::unused_async)]
-pub async fn observe(_cfg: &Config, _backend: GpuBackend) -> Result<ProcSnapshot, ReconcileError> {
+pub async fn observe() -> Result<ProcSnapshot, ReconcileError> {
     Ok(ProcSnapshot::default())
 }
 
@@ -409,8 +405,8 @@ pub async fn reconcile(
         ReconcileTrigger::ProcEvent | ReconcileTrigger::Timer | ReconcileTrigger::Startup => {}
     }
 
-    // Slow, off-lock: scan /proc (+ optional GPU procs).
-    let snap = observe(cfg, backend).await?;
+    // Slow, off-lock: scan /proc.
+    let snap = observe().await?;
     let claims = claim_set(&snap, cfg);
 
     // Which tenants currently have work. A busy tenant demands the GPU at its
@@ -627,7 +623,7 @@ pub async fn reconcile(
             // timer) retries and self-heals either way. `scan_proc` is a cheap
             // `/proc` walk, so this is only paid when there's actually
             // something to start.
-            let fresh = observe(cfg, backend).await?;
+            let fresh = observe().await?;
             if ensure_running_toctou_clear(&claim_set(&fresh, cfg)) {
                 for u in to_start {
                     if let Err(e) = units::start(u).await {
