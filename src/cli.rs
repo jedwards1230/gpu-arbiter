@@ -36,7 +36,7 @@ use std::time::Duration;
 use crate::config::{Config, ConfigError};
 
 /// The default config path the daemon reads when neither `--config` nor
-/// `GPU_ARBITER_CONFIG` is set. This is where deployment tooling (Ansible)
+/// `GPU_ARBITER_CONFIG` is set. This is where configuration management
 /// renders the file; a missing file falls back to built-in defaults.
 ///
 /// Windows has no `/etc`, so it uses the `%ProgramData%` convention instead —
@@ -423,9 +423,8 @@ pub fn check_config(path: &str) -> Result<String, ConfigError> {
     // A `yield_cmd` with no `busy_cmd` parses fine but is inert: release is
     // unobservable, so the daemon skips the cooperative stage and stops the unit
     // instead. That is safe, but it silently isn't the behavior the operator
-    // asked for — surfacing it here means the mistake is caught by the Ansible
-    // role's validate step at deploy time rather than discovered later from an
-    // eviction that never yields.
+    // asked for — surfacing it here means the mistake is caught at deploy
+    // time rather than discovered later from an eviction that never yields.
     let inert: Vec<&str> = cfg
         .resolved_units()
         .iter()

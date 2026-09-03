@@ -331,9 +331,8 @@ jobs:
           sha_t=$(sha256sum "$t" | awk '{print $1}')
           sha_w=$(sha256sum "$w" | awk '{print $1}')
 
-          # Prepend an install snippet: how to fetch the binaries and point your
-          # deployment tooling (e.g. Ansible) at this exact release (version +
-          # checksum the role verifies on download).
+          # Prepend an install snippet: how to fetch the binaries for this
+          # exact release (version + checksum).
           {
             echo "## Install"
             echo ""
@@ -343,18 +342,6 @@ jobs:
             echo "curl -fsSL -o gpu-arbiter https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/gpu-arbiter-x86_64-unknown-linux-musl"
             echo "curl -fsSL -o gpu-arbiter-tray https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/gpu-arbiter-tray-x86_64-unknown-linux-musl"
             echo '```'
-            echo ""
-            echo "### Ansible (example)"
-            echo ""
-            echo "Point your deployment tooling at this release:"
-            echo ""
-            echo '```yaml'
-            echo "gpu_arbiter_install_method: fetch"
-            echo "gpu_arbiter_version: ${VERSION}"
-            echo "gpu_arbiter_binary_sha256: ${sha_d}"
-            echo "gpu_arbiter_tray_binary_sha256: ${sha_t}"
-            echo '```'
-            echo ""
             echo ""
             echo "### Windows"
             echo ""

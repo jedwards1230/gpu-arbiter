@@ -342,9 +342,9 @@ mod daemon {
 
         // Honor the master `enabled` switch: a manual `enabled = false` in the
         // config (a quick disable without touching systemd) exits cleanly instead
-        // of being silently ignored. (The Ansible role *also* gates the unit on
-        // this, so normally the daemon never even starts when disabled — this is
-        // the belt-and-suspenders runtime check.)
+        // of being silently ignored. Configuration management may also gate
+        // the unit on this flag, so normally the daemon never even starts
+        // when disabled — this is the belt-and-suspenders runtime check.
         if !cfg.enabled {
             tracing::info!("gpu-arbiter is disabled in config (enabled = false); exiting");
             return Ok(());
@@ -433,8 +433,8 @@ mod daemon {
 
         // 6. HTTP control surface: the read-only surface (`/status /metrics
         //    /healthz`) plus the deprecated TCP write routes, bound to
-        //    `cfg.bind` (default 0.0.0.0, unchanged historical behavior —
-        //    #22). The sanctioned write path is the unix socket below (#17).
+        //    `cfg.bind` (loopback by default). The sanctioned write path is
+        //    the unix socket below.
         //
         //    Both listeners are BOUND HERE, synchronously, before either
         //    serve loop is spawned (#61): a bind failure (the TCP port
@@ -459,19 +459,20 @@ mod daemon {
             }
         });
 
-        // 6b. Unix control socket (#17): the sanctioned write path — local
-        // root only, file-permission-gated (mode 0600 file, mode 0700 parent
-        // directory — #61), no bearer tokens. Serves ONLY `/units/*` +
-        // `/ollama/*`; the read-only surface above stays TCP/LAN.
+        // 6b. Unix control socket: the sanctioned write path — local root
+        // only, file-permission-gated (mode 0600 file, mode 0700 parent
+        // directory), no bearer tokens. Serves ONLY `/units/*` +
+        // `/ollama/*`; the read-only surface above stays TCP.
         // `socket_path = ""` opts out entirely.
         //
         // Windows has no unix-socket listener at all (`http::bind_uds` and
         // `serve_uds_on` are `#[cfg(unix)]` with no counterpart), so the whole
         // block is unix-gated and `socket_path` defaults to empty there. That
-        // is a real, deliberate security downgrade to name: on Windows the only
-        // write path is the TCP surface, which has no peer-credential check —
-        // so `bind` must be scoped by firewall rule rather than left open. A
-        // named-pipe listener that restores parity is not yet implemented.
+        // is a real, deliberate security downgrade to name: on Windows the
+        // only write path is the TCP surface, which has no peer-credential
+        // check — the loopback default on `bind` is what mitigates that, so
+        // don't widen it on Windows without a named-pipe listener to replace
+        // this socket.
         #[cfg(unix)]
         let socket_handle = if cfg.socket_path.is_empty() {
             tracing::info!("unix control socket disabled (socket_path is empty)");
