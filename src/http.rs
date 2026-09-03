@@ -7,7 +7,8 @@
 //! | GET | `/status` | TCP | Full [`StatusSnapshot`] for remote machines + dashboards |
 //! | GET | `/metrics` | TCP | Prometheus text-format exposition of the current state |
 //! | GET | `/healthz` | TCP | Liveness |
-//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | unix socket | Manual override — the only write path |
+//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | unix socket (Linux) | Manual override — the write path there |
+//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | TCP, loopback peers only (Windows) | Manual override — the write path there |
 //!
 //! State is fully **auto** — derived from observed reality (no manual override).
 //!
@@ -15,21 +16,26 @@
 //! single TCP port (default `48750`, bind address configurable — see
 //! [`crate::config::Config::bind`], which defaults to loopback only). Widen
 //! `bind` to a LAN address to let other hosts read it, and firewall the port
-//! yourself if you do. The **write** path (`/units/*`) is a **unix domain
-//! socket only** ([`crate::config::Config::socket_path`], default
-//! `/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned, inside a
-//! mode-`0700` root-owned parent directory). The socket file's permissions
-//! (and its parent directory's — see [`serve_uds`]'s docs) ARE the auth
-//! boundary (local root only, no bearer tokens); see [`write_router`] /
-//! [`serve_uds`]. There is no TCP write path, and no platform where this
-//! socket is unavailable has any other write path (see
-//! [`crate::config::Config::socket_path`] for the Windows consequence).
+//! yourself if you do. The **write** path (`/units/*`) is platform-specific:
+//!
+//! - **Linux**: a **unix domain socket only**
+//!   ([`crate::config::Config::socket_path`], default
+//!   `/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned, inside a
+//!   mode-`0700` root-owned parent directory). The socket file's permissions
+//!   (and its parent directory's — see [`serve_uds`]'s docs) ARE the auth
+//!   boundary (local root only, no bearer tokens); see [`write_router`] /
+//!   [`serve_uds`]. There is no TCP write path on Linux.
+//! - **Windows**: there is no unix-socket listener, so the write routes are
+//!   served on the same TCP port as the read-only surface, gated to loopback
+//!   peers only via [`ConnectInfo`] — see [`unit_start`]/[`unit_stop`].
 //!
 //! The write path validates `{unit}` against the configured managed-unit list
 //! before any `systemctl` runs, so a caller can't drive arbitrary units.
 //!
 //! Note axum 0.8 path-param syntax is `/{p}` (not `/:p`).
 
+#[cfg(windows)]
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 // Only the `#[cfg(unix)]` stale-socket probe timeout uses the bare name; the
@@ -38,6 +44,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Json;
+#[cfg(windows)]
+use axum::extract::ConnectInfo;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::routing::{get, post};
@@ -73,22 +81,28 @@ pub struct AppState {
 }
 
 /// Build the axum [`Router`] for the **TCP** control surface: the read-only
-/// surface only (`/status`/`/metrics`/`/healthz`). Pulled out of [`serve`] so
-/// it can be exercised without binding a socket. The write path is
-/// unix-socket only — see [`write_router`].
+/// surface (`/status`/`/metrics`/`/healthz`) on every platform, plus — on
+/// Windows only, where there is no unix-socket listener — the loopback-gated
+/// write routes (see [`unit_start`]/[`unit_stop`]). Pulled out of [`serve`]
+/// so it can be exercised without binding a socket. On Linux the write path
+/// is unix-socket only — see [`write_router`].
 pub fn router(app: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/status", get(status))
         .route("/metrics", get(metrics))
-        .route("/healthz", get(healthz))
-        .with_state(app)
+        .route("/healthz", get(healthz));
+    #[cfg(windows)]
+    let router = router
+        .route("/units/{unit}/start", post(unit_start))
+        .route("/units/{unit}/stop", post(unit_stop));
+    router.with_state(app)
 }
 
-/// Build the axum [`Router`] for the **unix control socket**: the write path
-/// (`/status`/`/metrics`/`/healthz` stay TCP-only — this router carries no
-/// read routes). No `SocketAddr` to gate on for a unix-socket peer — the
-/// socket file's permissions (mode `0600`, root-owned; see [`serve_uds`]) are
-/// the entire auth boundary for this transport.
+/// Build the axum [`Router`] for the **unix control socket** (Linux): the
+/// write path (`/status`/`/metrics`/`/healthz` stay TCP-only — this router
+/// carries no read routes). No `SocketAddr` to gate on for a unix-socket
+/// peer — the socket file's permissions (mode `0600`, root-owned; see
+/// [`serve_uds`]) are the entire auth boundary for this transport.
 pub fn write_router(app: AppState) -> Router {
     Router::new()
         .route("/units/{unit}/start", post(unit_start_uds))
@@ -737,13 +751,22 @@ pub async fn bind(addr: SocketAddr) -> Result<tokio::net::TcpListener, HttpError
 /// Serve the axum HTTP control surface on an already-[`bind`]-ed `listener`
 /// until the process exits. Cross-platform.
 ///
+/// Binds the service with `ConnectInfo<SocketAddr>` wired in so the Windows
+/// write handlers ([`unit_start`]/[`unit_stop`]) can read the peer address
+/// and reject non-loopback callers; unused on Linux, where the TCP router
+/// carries no write routes to consume it.
+///
 /// # Errors
 ///
 /// Returns [`HttpError`] if the serve loop itself fails — a runtime
 /// accept-loop error, not a bind failure (the listener is already bound by
 /// the time this is called; see [`bind`]).
 pub async fn serve_on(listener: tokio::net::TcpListener, app: AppState) -> Result<(), HttpError> {
-    axum::serve(listener, router(app).into_make_service()).await?;
+    axum::serve(
+        listener,
+        router(app).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -937,16 +960,18 @@ pub async fn healthz() -> &'static str {
 }
 
 /// `POST /units/{unit}/start` on the **unix control socket** (#17) — the
-/// only write path. A direct override: starts the unit now — **unless a game
-/// holds the GPU**. While the state is `gaming`/`evicting` the reconcile task
-/// rejects the start with `409 Conflict` (any manual hold stays in place)
-/// rather than starting a tenant into a live game: eviction is
-/// edge-triggered (it fires on the available → gaming *transition*), so a
-/// unit started mid-game would NOT be re-evicted by the next pass — it would
-/// sit on the GPU alongside the game. This endpoint cannot override gaming.
-/// No peer/loopback check: a unix-socket peer carries no `SocketAddr`, and
-/// the socket file's permissions (mode `0600`, root-owned; see
-/// [`serve_uds`]) are the entire auth boundary for this transport.
+/// write path on Linux, where there is no TCP counterpart (see
+/// [`unit_start`] for the Windows equivalent). A direct override: starts the
+/// unit now — **unless a game holds the GPU**. While the state is
+/// `gaming`/`evicting` the reconcile task rejects the start with `409
+/// Conflict` (any manual hold stays in place) rather than starting a tenant
+/// into a live game: eviction is edge-triggered (it fires on the available →
+/// gaming *transition*), so a unit started mid-game would NOT be re-evicted
+/// by the next pass — it would sit on the GPU alongside the game. This
+/// endpoint cannot override gaming. No peer/loopback check: a unix-socket
+/// peer carries no `SocketAddr`, and the socket file's permissions (mode
+/// `0600`, root-owned; see [`serve_uds`]) are the entire auth boundary for
+/// this transport.
 pub async fn unit_start_uds(
     Path(unit): Path<String>,
     State(app): State<AppState>,
@@ -962,8 +987,53 @@ pub async fn unit_stop_uds(
     do_stop_uds(&app, &unit).await
 }
 
-/// Unix-socket start logic: managed-unit gate only (no peer/loopback check —
-/// see the module doc) → [`start_validated`].
+/// `POST /units/{unit}/start` on the **TCP** port, Windows only — the write
+/// path there, since Windows has no unix-socket listener (see
+/// [`unit_start_uds`] for the Linux equivalent and the shared start/reject
+/// semantics). Rejects any peer that isn't loopback, enforced in-process via
+/// [`ConnectInfo`] so it holds even if `bind` is widened to a LAN address.
+#[cfg(windows)]
+pub async fn unit_start(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(unit): Path<String>,
+    State(app): State<AppState>,
+) -> impl IntoResponse {
+    do_start(&app, peer.ip(), &unit).await
+}
+
+/// `POST /units/{unit}/stop` on the TCP port, Windows only. See [`unit_start`].
+#[cfg(windows)]
+pub async fn unit_stop(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(unit): Path<String>,
+    State(app): State<AppState>,
+) -> impl IntoResponse {
+    do_stop(&app, peer.ip(), &unit).await
+}
+
+/// TCP start logic (Windows only): loopback gate → managed-unit gate →
+/// [`start_validated`].
+#[cfg(windows)]
+async fn do_start(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
+    if let Err(deny) = guard_loopback(peer) {
+        return deny;
+    }
+    do_start_uds(app, unit).await
+}
+
+/// TCP stop logic (Windows only): loopback gate → managed-unit gate →
+/// [`stop_validated`].
+#[cfg(windows)]
+async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
+    if let Err(deny) = guard_loopback(peer) {
+        return deny;
+    }
+    do_stop_uds(app, unit).await
+}
+
+/// Managed-unit gate → [`start_validated`]. The name is a holdover from when
+/// this was unix-socket-only; on Windows [`do_start`] calls this too, after
+/// its own loopback gate.
 async fn do_start_uds(app: &AppState, unit: &str) -> (StatusCode, String) {
     let managed = match guard_unit(&app.cfg, unit) {
         Ok(managed) => managed,
@@ -972,7 +1042,7 @@ async fn do_start_uds(app: &AppState, unit: &str) -> (StatusCode, String) {
     start_validated(app, managed.unit.clone()).await
 }
 
-/// Unix-socket stop logic: managed-unit gate only → [`stop_validated`].
+/// Managed-unit gate → [`stop_validated`]. See [`do_start_uds`] on the name.
 async fn do_stop_uds(app: &AppState, unit: &str) -> (StatusCode, String) {
     let managed = match guard_unit(&app.cfg, unit) {
         Ok(managed) => managed,
@@ -1100,6 +1170,30 @@ pub fn is_managed(cfg: &Config, unit: &str) -> bool {
     cfg.resolved_units().iter().any(|u| u.unit == unit)
 }
 
+/// The loopback gate for the Windows TCP write routes — a unix socket peer
+/// has no `SocketAddr` to check, so [`do_start_uds`]/[`do_stop_uds`] never
+/// call this on Linux (see the module doc: the socket file's permissions are
+/// that transport's auth boundary). Pure — unit-tested via [`is_localhost`].
+#[cfg(windows)]
+fn guard_loopback(peer: IpAddr) -> Result<(), (StatusCode, String)> {
+    if is_localhost(peer) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "unit controls are localhost-only".to_string(),
+        ))
+    }
+}
+
+/// Whether a peer IP is permitted to call the Windows `/units/*` handlers
+/// (loopback only). Pure — unit-tested.
+#[cfg(windows)]
+#[must_use]
+pub fn is_localhost(peer: std::net::IpAddr) -> bool {
+    peer.is_loopback()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,6 +1232,101 @@ mod tests {
         // A managed unit → allowed through, resolving that unit.
         let managed = guard_unit(&cfg, "ollama.service").expect("ollama.service is managed");
         assert_eq!(managed.unit, "ollama.service");
+    }
+
+    fn test_app_state() -> AppState {
+        AppState {
+            state: Arc::new(RwLock::new(ArbiterState::new())),
+            triggers: mpsc::channel(1).0,
+            cfg: Arc::new(Config::default()),
+        }
+    }
+
+    /// Linux: the TCP router must carry no write routes at all — the unix
+    /// socket is the only write path there. A POST to `/units/{unit}/start`
+    /// on TCP has nothing to match, so it 404s exactly like any other
+    /// unregistered path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tcp_router_serves_no_write_routes_on_unix() {
+        use tower::ServiceExt as _;
+
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/units/ollama.service/start")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router(test_app_state()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loopback_is_localhost() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        assert!(is_localhost(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_localhost(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lan_peer_is_not_localhost() {
+        assert!(!is_localhost(IpAddr::V4(std::net::Ipv4Addr::new(
+            192, 168, 1, 100
+        ))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn guard_loopback_rejects_lan_allows_loopback() {
+        let lan = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 5));
+        assert_eq!(
+            guard_loopback(lan).map_err(|(s, _)| s),
+            Err(StatusCode::FORBIDDEN)
+        );
+        let lo = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(guard_loopback(lo), Ok(()));
+    }
+
+    /// Windows: the TCP write route rejects a non-loopback peer before ever
+    /// looking at the unit — the same loopback gate [`guard_loopback`] tests
+    /// in isolation, exercised here through the actual router so the
+    /// `ConnectInfo` wiring is covered too.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn tcp_write_route_rejects_non_loopback_peer() {
+        use tower::ServiceExt as _;
+
+        let mut request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/units/ollama.service/start")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 5], 12345))));
+        let response = router(test_app_state()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Windows: a loopback peer clears the loopback gate but still hits the
+    /// managed-unit gate — an unknown unit 404s exactly like the unix-socket
+    /// write path does.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn tcp_write_route_rejects_unmanaged_unit_from_loopback() {
+        use tower::ServiceExt as _;
+
+        let mut request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/units/sshd.service/start")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))));
+        let response = router(test_app_state()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     use crate::state::{State, StatusSnapshot, UnitStatus};

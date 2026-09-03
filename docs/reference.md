@@ -16,24 +16,27 @@ The read-only surface (`/status`, `/metrics`, `/healthz`) is a single TCP port
 LAN address to let other hosts read it, and firewall the port yourself if you
 do.
 
-The **write** path (`POST /units/{unit}/start|stop`) is a **unix control
-socket only** (`socket_path`, default `/run/gpu-arbiter/gpu-arbiter.sock`,
-mode `0600` root-owned, inside a mode-`0700` root-owned parent directory) —
-local-root-only, no bearer tokens. It validates `{unit}` against
-`managed_units` before touching `systemctl`.
+The **write** path (`POST /units/{unit}/start|stop`) is platform-specific.
+On Linux it's a **unix control socket only** (`socket_path`, default
+`/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned, inside a
+mode-`0700` root-owned parent directory) — local-root-only, no bearer
+tokens. It validates `{unit}` against `managed_units` before touching
+`systemctl`.
 
 > **Windows:** there is no unix-socket listener — `http::bind_uds` and
 > `serve_uds_on` are `cfg(unix)` with no counterpart, and `socket_path` is
 > ignored (with a warning, so a `socket_path` copied from a Linux config isn't
-> silently dropped). That leaves **no write path at all** on Windows — manual
-> start/stop overrides are Linux-only until a named-pipe listener lands.
+> silently dropped). The write routes are served on the TCP port instead,
+> gated to loopback peers only via `ConnectInfo`, so it holds even if `bind`
+> is widened to a LAN address.
 
 | Method | Path | Transport | Purpose |
 |---|---|---|---|
 | GET | `/status` | TCP | Full state snapshot (below) |
 | GET | `/metrics` | TCP | Prometheus text-format exposition (below) |
 | GET | `/healthz` | TCP | Liveness |
-| POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket | Manual override — the only write path |
+| POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket (Linux) | Manual override — the write path there |
+| POST | `/units/{unit}/start`, `/units/{unit}/stop` | TCP, loopback peers only (Windows) | Manual override — the write path there |
 
 State is fully **auto** — derived from observed reality; there is no manual
 override of `state` itself. The `{unit}` must be one of the configured
@@ -247,8 +250,8 @@ yields the defaults below.
 |---|---|---|
 | `enabled` | `true` | Master enable |
 | `port` | `48750` | HTTP listen port |
-| `bind` | `"127.0.0.1"` | TCP bind address for the read-only surface; loopback by default — set to a LAN address (and firewall it yourself) to allow remote reads |
-| `socket_path` | `"/run/gpu-arbiter/gpu-arbiter.sock"` | Unix control socket path for the write path (mode `0600`, root-owned, inside a mode-`0700` root-owned parent directory); empty string disables it |
+| `bind` | `"127.0.0.1"` | TCP bind address for the read-only surface (and, on Windows, the loopback-gated write routes); loopback by default — set to a LAN address (and firewall it yourself) to allow remote reads |
+| `socket_path` | `"/run/gpu-arbiter/gpu-arbiter.sock"` | Unix control socket path for the write path on Linux (mode `0600`, root-owned, inside a mode-`0700` root-owned parent directory); empty string disables it. Ignored on Windows |
 | `managed_units` | one Ollama entry | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
 | `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation |
 | `yield_timeout_s` | `3` | Default cooperative-release budget, for units that set `yield_cmd` but no per-unit `yield_timeout_s` (see [Priority ladder](#priority-ladder-and-cooperative-eviction)) |

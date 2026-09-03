@@ -481,18 +481,19 @@ pub struct Config {
 
     // ── control socket ───────────────────────────────────────────────────────
     /// Path to the unix control socket that serves the write path (`POST
-    /// /units/{unit}/start|stop`) — the only control surface (local-only, no
-    /// bearer tokens). Bound mode `0600`, root-owned, inside a mode-`0700`
-    /// root-owned parent directory (see [`crate::http::serve_uds`] — the
-    /// parent directory closes a bind-then-chmod permission race and is
-    /// itself part of the auth boundary, not just the socket file's own
-    /// mode). Default `/run/gpu-arbiter/gpu-arbiter.sock` — a dedicated
-    /// subdirectory of `/run`, not bare `/run` itself, specifically so the
-    /// daemon (or systemd's `RuntimeDirectory=`, see
-    /// `packaging/gpu-arbiter.service`) has a directory of its own to lock
-    /// down to `0700` rather than relying solely on the socket file's mode.
-    /// An **empty string** disables the unix socket entirely, leaving the
-    /// daemon with no write path at all.
+    /// /units/{unit}/start|stop`) on Linux — local-only, no bearer tokens.
+    /// Bound mode `0600`, root-owned, inside a mode-`0700` root-owned parent
+    /// directory (see [`crate::http::serve_uds`] — the parent directory
+    /// closes a bind-then-chmod permission race and is itself part of the
+    /// auth boundary, not just the socket file's own mode). Default
+    /// `/run/gpu-arbiter/gpu-arbiter.sock` — a dedicated subdirectory of
+    /// `/run`, not bare `/run` itself, specifically so the daemon (or
+    /// systemd's `RuntimeDirectory=`, see `packaging/gpu-arbiter.service`)
+    /// has a directory of its own to lock down to `0700` rather than relying
+    /// solely on the socket file's mode. An **empty string** disables the
+    /// unix socket entirely, leaving Linux with no write path at all — it
+    /// has no effect on Windows, whose write path is the TCP port (see
+    /// [`default_socket_path`]).
     #[serde(default = "default_socket_path")]
     pub socket_path: String,
 }
@@ -511,8 +512,8 @@ fn default_bind() -> IpAddr {
 /// Empty on Windows, which disables the unix-socket listener. `http::bind_uds`
 /// and `serve_uds_on` are `#[cfg(unix)]` with no Windows counterpart, so a
 /// non-empty default here would name a socket that can never be bound.
-/// Windows therefore has **no write path at all** until a named-pipe listener
-/// lands — manual start/stop overrides are Linux-only in the meantime.
+/// Windows drives manual start/stop through the loopback-gated TCP write
+/// routes instead — see [`crate::http`]'s module docs.
 fn default_socket_path() -> String {
     if cfg!(windows) {
         String::new()

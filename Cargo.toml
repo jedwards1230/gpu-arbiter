@@ -80,6 +80,11 @@ tokio-stream = "0.1"
 [target.'cfg(target_os = "windows")'.dependencies]
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
+[dev-dependencies]
+# `ServiceExt::oneshot` drives an axum `Router` directly against a built
+# `Request` in http.rs's tests, without binding a real socket.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+
 # The `release` profile is what actually ships (the static musl binary built by
 # rust.yml / release.yml) — optimize it for a small, standalone daemon binary
 # over incremental-rebuild speed:
