@@ -1,6 +1,6 @@
 //! HTTP control surface. Cross-platform (tokio/axum only) — the unix socket
-//! server compiles on any unix host (macOS included), so no `cfg` split was
-//! needed to keep the crate building on the macOS dev host.
+//! server compiles on any unix host (macOS included), so no `cfg` split is
+//! needed for it.
 //!
 //! | Method | Path | Transport | Purpose |
 //! |---|---|---|---|
@@ -114,17 +114,17 @@ pub fn write_router(app: AppState) -> Router {
 ///
 /// LAN-exposed exactly like `/status` (no secrets — state, claim tokens, VRAM
 /// counts), so no loopback gate. The body is produced by the pure
-/// [`render_metrics`] so it unit-tests on the macOS dev host.
+/// [`render_metrics`] so it unit-tests without a live GPU or socket.
 pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
     let guard = read_state(&app.state);
     let snap = guard.snapshot();
-    // Cheap clone of the counters (#14) — small HashMaps, one entry per managed
+    // Cheap clone of the counters — small HashMaps, one entry per managed
     // unit — so the render itself stays lock-free like `snap`.
     let arbiter_metrics = guard.metrics.clone();
     // Read the state-entered instant straight off live state as whole unix
     // seconds — avoids round-tripping the `/status` RFC-3339 string back to a
-    // timestamp. Pre-epoch (never produced) clamps to 0. `i64` (#37), the same
-    // sign convention `now_unix`/every other timestamp in the crate already uses.
+    // timestamp. Pre-epoch (never produced) clamps to 0. `i64`, the same sign
+    // convention `now_unix`/every other timestamp in the crate uses.
     let since_unix = guard
         .since
         .duration_since(std::time::UNIX_EPOCH)
@@ -136,9 +136,9 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs().cast_signed());
     let threshold_s = app.cfg.presence_idle_threshold_s.cast_signed();
-    // procmon's dropped-event counter lives outside ArbiterState (#14's
-    // module docs explain why) — read it here, at the same impure edge as
-    // `now_unix`, and pass it in like every other clock/counter read.
+    // procmon's dropped-event counter lives outside ArbiterState — read it
+    // here, at the same impure edge as `now_unix`, and pass it in like every
+    // other clock/counter read.
     let proc_events_dropped = crate::procmon::proc_events_dropped();
     (
         [(
@@ -195,14 +195,14 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
 ///   devices (virtual streamed devices excluded).
 /// - `gpu_arbiter_input_monitor_up` — `1` if presence detection is healthy.
 ///
-/// ## Counters (#14 — durable history a gauge can't provide)
+/// ## Counters — durable history a gauge can't provide
 ///
-/// journald on the deployment host rotates in hours, so these are the only
-/// record of eviction/restart/reconcile activity that survives longer than
-/// that. **Monotonic for the life of the process; a daemon restart resets
-/// every one of them to 0** — use `rate()`/`increase()` in Prometheus, never
-/// compare raw values across a restart (each metric's `# HELP` text repeats
-/// this).
+/// journald's default retention is measured in hours, not enough for durable
+/// history, so these are the only record of eviction/restart/reconcile
+/// activity that survives that long. **Monotonic for the life of the
+/// process; a daemon restart resets every one of them to 0** — use
+/// `rate()`/`increase()` in Prometheus, never compare raw values across a
+/// restart (each metric's `# HELP` text repeats this).
 ///
 /// - `gpu_arbiter_evictions_total{unit,outcome}` — cumulative eviction
 ///   attempts, `outcome` ∈ `yielded`/`graceful`/`sigkill`/`error`. A no-op
@@ -352,10 +352,9 @@ pub fn render_metrics(
         "1 if a managed unit is active.",
     );
     for u in &snap.units {
-        // `running` is a tristate (#15); a gauge has no "unknown" value, so an
-        // unconfirmed unit renders 0 here — same numeric behavior scrapers saw
-        // before the tristate. `/status` (StatusSnapshot JSON) and the CLI/tray
-        // renderers are where "unknown" actually surfaces distinctly.
+        // `running` is a tristate; a gauge has no "unknown" value, so an
+        // unconfirmed unit renders 0 here. `/status` (StatusSnapshot JSON)
+        // and the CLI/tray renderers are where "unknown" surfaces distinctly.
         sample(
             &mut o,
             "gpu_arbiter_unit_running",
@@ -429,7 +428,7 @@ pub fn render_metrics(
         u8::from(snap.input_monitor_up),
     );
 
-    // ── counters (#14): durable history journald's short retention can't give ──
+    // ── counters: durable history journald's short retention can't give ──────
 
     metric_header(
         &mut o,
@@ -472,11 +471,11 @@ pub fn render_metrics(
         );
     }
 
-    // Tenant-hook failures (gpu-arbiter#57). Without this, a hook that fails on
-    // every invocation is invisible to Prometheus: `resume`/`busy` failures are
+    // Tenant-hook failures. Without this counter, a hook that fails on every
+    // invocation is invisible to Prometheus: `resume`/`busy` failures are
     // swallowed by design (best-effort / fail-toward-not-busy) and reach the
-    // journal only as WARN lines, which is not something an alert can be built
-    // on. `up` stays 1 and `degraded` stays false throughout such an outage.
+    // journal only as WARN lines, which no alert can be built on. `up` stays
+    // 1 and `degraded` stays false throughout such an outage.
     metric_header(
         &mut o,
         "counter",
@@ -636,7 +635,7 @@ fn gauge(
 
 /// Emit a single-sample counter: the `# HELP`/`# TYPE counter` preamble plus one
 /// `name{labels} value` line (used by `gpu_arbiter_proc_events_dropped_total`,
-/// #14's only counter with no labels). Every other counter has a per-unit or
+/// the only counter with no labels). Every other counter has a per-unit or
 /// per-trigger label set — those call [`metric_header`] once and [`sample`] per
 /// line instead, exactly like [`gauge`]'s multi-sample metrics.
 fn counter(
@@ -651,10 +650,8 @@ fn counter(
 }
 
 /// The two-line `# HELP <name> <help>` / `# TYPE <name> <kind>` preamble every
-/// Prometheus metric needs, emitted **exactly once** per metric name — the
-/// duplication [`gauge`]/[`counter`]/[`sample`] replace (previously each of
-/// HELP/TYPE/sample was a separate hand-rolled `writeln!`, so a metric's name
-/// string appeared three times over).
+/// Prometheus metric needs, emitted **exactly once** per metric name so a
+/// metric's name string doesn't have to be repeated at every call site.
 fn metric_header(o: &mut String, kind: &str, name: &str, help: &str) {
     use std::fmt::Write as _;
     let _ = writeln!(o, "# HELP {name} {help}");
@@ -716,7 +713,7 @@ pub enum HttpError {
     /// directory, or the serve loop itself, failed with an IO error.
     #[error("HTTP server: {0}")]
     Io(#[from] std::io::Error),
-    /// The unix control socket at `path` answered a live-probe connect (#61)
+    /// The unix control socket at `path` answered a live-probe connect
     /// before bind — another process (almost certainly a second gpu-arbiter
     /// instance) is already listening there. Fatal by design: stealing a
     /// live process's control socket would let two daemons race the same
@@ -735,9 +732,9 @@ pub enum HttpError {
 /// Split from [`serve_on`]/[`serve`] specifically so a bind failure (the port
 /// already in use, a permission error) is something the caller can await and
 /// propagate **synchronously at startup**, before anything is spawned — see
-/// [`crate::main`]'s wiring (#61: previously the failure only surfaced inside
-/// a detached `tokio::spawn`ed task, logged and swallowed, leaving the daemon
-/// "running" with no working HTTP surface at all).
+/// `main`'s startup wiring. A bind failure inside a detached `tokio::spawn`ed
+/// task would otherwise be logged and swallowed, leaving the daemon "running"
+/// with no working HTTP surface at all.
 ///
 /// # Errors
 ///
@@ -795,7 +792,7 @@ pub async fn serve(addr: SocketAddr, app: AppState) -> Result<(), HttpError> {
 const STALE_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Whether another process is actively listening on the unix socket at
-/// `path`, probed via a short connect attempt (#61) — the check [`bind_uds`]
+/// `path`, probed via a short connect attempt — the check [`bind_uds`]
 /// runs **before** ever unlinking what might be a stale leftover file from
 /// an unclean prior shutdown, so a live second gpu-arbiter instance's socket
 /// is never stolen out from under it.
@@ -832,16 +829,16 @@ async fn socket_is_live(path: &std::path::Path) -> bool {
 
 /// Bind the unix control socket at `socket_path`, without starting the serve
 /// loop — see [`bind`]'s docs for why the daemon's own startup calls bind and
-/// serve as separate, synchronously-awaited steps (#61).
+/// serve as separate, synchronously-awaited steps.
 ///
 /// - Creates the parent directory (mode `0700`, root-owned — see below) if
 ///   missing. The default `socket_path`
-///   ([`crate::config::default_socket_path`]) is
+///   (`crate::config::default_socket_path`) is
 ///   `/run/gpu-arbiter/gpu-arbiter.sock`, a dedicated subdirectory rather
 ///   than bare `/run`, specifically so this directory exists and is ours to
 ///   lock down; a custom `socket_path` may also name a (possibly nested)
 ///   subdirectory.
-/// - Probes for a live listener at `socket_path` ([`socket_is_live`]) and
+/// - Probes for a live listener at `socket_path` (`socket_is_live`) and
 ///   fails with [`HttpError::SocketInUse`] rather than unlinking it if one
 ///   answers — a stale-looking socket file is not always actually stale.
 /// - Only once the probe clears: removes a stale socket file left by an
@@ -854,24 +851,20 @@ async fn socket_is_live(path: &std::path::Path) -> bool {
 ///   whole of it (see the parent-directory note below).
 ///
 /// **The parent directory is part of the auth boundary, not just the
-/// post-bind `0600` file mode (#61):** between `UnixListener::bind()`
-/// creating the socket file (with an umask-derived, potentially
-/// world-connectable mode under a permissive umask) and the `set_permissions`
-/// call above pinning it to `0600`, the listener is already accepting
-/// connections — a window during which another local user could connect
-/// before the mode is locked down. Creating the parent directory at mode
-/// `0700` (root-only traversal) closes that window structurally: no other
-/// user can even resolve the socket path to attempt a connection during it,
-/// regardless of the file's own mode at any instant. The post-bind chmod
-/// above is kept as belt-and-braces (defense in depth for a `socket_path`
-/// pointed at a pre-existing, more permissive directory), not the sole
-/// defense.
+/// post-bind `0600` file mode:** between `UnixListener::bind()` creating the
+/// socket file (with an umask-derived, potentially world-connectable mode)
+/// and the `set_permissions` call above pinning it to `0600`, the listener
+/// is already accepting connections. Creating the parent directory at mode
+/// `0700` (root-only traversal) closes that window structurally — no other
+/// user can resolve the socket path to attempt a connection during it,
+/// regardless of the file's own mode at any instant. The post-bind chmod is
+/// defense in depth for a `socket_path` pointed at a pre-existing, more
+/// permissive directory, not the sole defense.
 ///
 /// `#[cfg(unix)]`: `tokio::net::UnixListener`/`UnixStream`,
 /// `tokio::fs::DirBuilder::mode`, and the `0600`-mode step all need a unix
 /// target. The daemon only ever runs on Linux, but this compiles equally on
-/// the macOS dev host (macOS is unix too), so no non-unix stub is needed —
-/// the crate has never targeted a non-unix host.
+/// any unix host, so no non-unix stub exists.
 ///
 /// # Errors
 ///
@@ -918,7 +911,7 @@ pub async fn bind_uds(socket_path: &str) -> Result<tokio::net::UnixListener, Htt
     Ok(listener)
 }
 
-/// Serve [`write_router`] (the manual start/stop write path — #17) on an
+/// Serve [`write_router`] (the manual start/stop write path) on an
 /// already-[`bind_uds`]-ed `listener` until the process exits.
 ///
 /// # Errors
@@ -959,19 +952,18 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
-/// `POST /units/{unit}/start` on the **unix control socket** (#17) — the
-/// write path on Linux, where there is no TCP counterpart (see
-/// [`unit_start`] for the Windows equivalent). A direct override: starts the
-/// unit now — **unless a game holds the GPU**. While the state is
-/// `gaming`/`evicting` the reconcile task rejects the start with `409
-/// Conflict` (any manual hold stays in place) rather than starting a tenant
-/// into a live game: eviction is edge-triggered (it fires on the available →
-/// gaming *transition*), so a unit started mid-game would NOT be re-evicted
-/// by the next pass — it would sit on the GPU alongside the game. This
-/// endpoint cannot override gaming. No peer/loopback check: a unix-socket
-/// peer carries no `SocketAddr`, and the socket file's permissions (mode
-/// `0600`, root-owned; see [`serve_uds`]) are the entire auth boundary for
-/// this transport.
+/// `POST /units/{unit}/start` on the **unix control socket** — the write
+/// path on Linux, where there is no TCP counterpart (see [`unit_start`] for
+/// the Windows equivalent). A direct override: starts the unit now —
+/// **unless a game holds the GPU**. While the state is `gaming`/`evicting`
+/// the reconcile task rejects the start with `409 Conflict` (any manual hold
+/// stays in place) rather than starting a tenant into a live game: eviction
+/// is edge-triggered (it fires on the available → gaming *transition*), so a
+/// unit started mid-game would NOT be re-evicted by the next pass — it would
+/// sit on the GPU alongside the game. This endpoint cannot override gaming.
+/// No peer/loopback check: a unix-socket peer carries no `SocketAddr`, and
+/// the socket file's permissions (mode `0600`, root-owned; see
+/// [`serve_uds`]) are the entire auth boundary for this transport.
 pub async fn unit_start_uds(
     Path(unit): Path<String>,
     State(app): State<AppState>,
@@ -1055,9 +1047,8 @@ async fn do_stop_uds(app: &AppState, unit: &str) -> (StatusCode, String) {
 /// and await its outcome.
 ///
 /// The actual `units::start` call happens on the reconcile task (see
-/// [`crate::reconcile::reconcile`]) — this never drives the unit itself,
-/// removing the handler-vs-reconcile-task race that existed when it called
-/// `units::start` directly.
+/// [`crate::reconcile::reconcile`]) — this never drives the unit itself, so
+/// there is no handler-vs-reconcile-task race over who drives it.
 async fn start_validated(app: &AppState, unit: String) -> (StatusCode, String) {
     enqueue_and_await(
         app,
@@ -1162,7 +1153,7 @@ fn guard_unit<'c>(
 }
 
 /// Whether `unit` is one the daemon manages (and may therefore be controlled via
-/// `/units/*`). Pure — unit-tested. Not on [`guard_unit`]'s hot path (`guard_unit`
+/// `/units/*`). Pure — unit-tested. Not on `guard_unit`'s hot path (`guard_unit`
 /// resolves the unit directly in one pass); kept as an independent predicate
 /// other callers can use without needing the full `&ManagedUnit`.
 #[must_use]
@@ -1538,7 +1529,7 @@ mod tests {
             input_monitor_up: true,
             degraded: false,
         };
-        // A populated Metrics (#14) + a nonzero drop count so the well-formedness
+        // A populated Metrics + a nonzero drop count so the well-formedness
         // sweep below also exercises every counter line, not just the gauges.
         let mut metrics = Metrics::default();
         metrics.record_eviction(
@@ -1566,8 +1557,8 @@ mod tests {
         ));
     }
 
-    /// gpu-arbiter#57: a hook that fails must produce a real, well-formed
-    /// `gpu_arbiter_hook_failures_total` series — the whole point is that this is
+    /// A hook that fails must produce a real, well-formed
+    /// `gpu_arbiter_hook_failures_total` series — the whole point is that it's
     /// alertable, which it is not if the line never renders.
     #[test]
     fn render_metrics_exposes_hook_failures() {
@@ -1618,7 +1609,7 @@ mod tests {
         assert_eq!(esc(r#"a"b\c"#), r#"a\"b\\c"#);
     }
 
-    // ── counter rendering (#14) ─────────────────────────────────────────────
+    // ── counter rendering ────────────────────────────────────────────────────
 
     fn empty_snapshot() -> StatusSnapshot {
         StatusSnapshot {
@@ -1791,7 +1782,7 @@ mod tests {
         );
     }
 
-    // ── unix control socket parent-directory hardening (#61) ───────────────
+    // ── unix control socket parent-directory hardening ──────────────────────
 
     /// A short-as-possible unique temp directory path for a `UnixListener`
     /// bind test. Deliberately NOT `std::env::temp_dir()` (as the rest of the
@@ -1869,12 +1860,11 @@ mod tests {
         };
 
         // The parent directory: mode 0700 (root-only traversal), created by
-        // serve_uds itself — the auth-boundary-closing fix (#61).
+        // serve_uds itself.
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "parent directory must be mode 0700");
 
-        // The socket file itself: still pinned to 0600 (belt-and-braces,
-        // unchanged from before #61).
+        // The socket file itself: still pinned to 0600 (belt-and-braces).
         assert_eq!(socket_mode, 0o600, "socket file must be mode 0600");
 
         handle.abort();
@@ -1927,7 +1917,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── stale-socket live-probe (#61) ───────────────────────────────────────
+    // ── stale-socket live-probe ──────────────────────────────────────────────
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1997,8 +1987,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bind_uds_refuses_to_steal_a_live_socket() {
-        // The headline #61 fix: bind_uds must never unlink-and-rebind over a
-        // socket a live process is actually listening on.
+        // bind_uds must never unlink-and-rebind over a socket a live process
+        // is actually listening on.
         let dir = short_unique_socket_dir("steal");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2022,8 +2012,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bind_uds_removes_a_genuinely_stale_socket_and_binds_fresh() {
-        // The non-regression half: a stale (probe-false) socket file must
-        // still be cleaned up and bound over, exactly like before #61.
+        // A stale (probe-false) socket file must still be cleaned up and
+        // bound over.
         let dir = short_unique_socket_dir("stale-rebind");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

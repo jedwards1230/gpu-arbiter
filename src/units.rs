@@ -9,7 +9,7 @@
 //!
 //! - [`Supervisor::Systemd`] (the **default** — used whenever no `*_cmd`
 //!   override is configured) runs `systemctl stop|start|is-active|kill`
-//!   verbatim, byte-for-byte the daemon's historical behavior.
+//!   verbatim.
 //! - [`Supervisor::Command`] runs explicit, **shell-free** argv (`OpenRC`, runit,
 //!   plain processes). `is_active` exit 0 = running. When no `kill` argv is
 //!   given, SIGKILL escalation falls back to re-running `stop` (there's no
@@ -63,7 +63,7 @@ pub enum UnitError {
         /// Failure detail (trimmed stderr, or why nothing ran).
         detail: String,
     },
-    /// A process-control invocation exceeded [`SYSTEMCTL_TIMEOUT`]. A wedged
+    /// A process-control invocation exceeded `SYSTEMCTL_TIMEOUT`. A wedged
     /// init system (stuck D-Bus, hung PID 1 transaction) must never hang the
     /// single reconcile task, so every control invocation is time-boxed.
     #[error("{action} {unit} timed out after {elapsed:?}")]
@@ -155,11 +155,10 @@ pub enum EvictionOutcome {
     AlreadyClear,
 }
 
-/// The `outcome` label bucket for `gpu_arbiter_evictions_total{unit,outcome}`
-/// (#14). A durable counter, unlike the all-gauge metrics that came before it —
-/// journald on the deployment host rotates in hours, so this is the only record
-/// of whether an eviction was graceful or had to be force-killed once that log
-/// window has passed.
+/// The `outcome` label bucket for `gpu_arbiter_evictions_total{unit,outcome}`.
+/// A durable counter: journald's retention is short, so this is the only
+/// lasting record of whether an eviction was graceful or had to be
+/// force-killed once the log window has passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionMetricOutcome {
     /// [`EvictionOutcome::Yielded`] — the tenant released the GPU cooperatively
@@ -246,7 +245,7 @@ impl Hook {
 /// and rejected the request (a config/credential/logic fault inside the script),
 /// while `unrunnable` means the daemon never got an exit status at all (missing
 /// interpreter, bad path, or a timeout). They have completely different fixes,
-/// and collapsing them was part of why gpu-arbiter#56 took 31 hours to spot.
+/// and collapsing them would hide that distinction from an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HookFailure {
     /// Spawned and exited with a non-zero status.
@@ -276,7 +275,7 @@ type HookFailureCounts = std::collections::BTreeMap<HookFailureKey, u64>;
 
 /// Cumulative tenant-hook failures since daemon start, keyed by
 /// `(unit, hook, outcome)` and rendered as
-/// `gpu_arbiter_hook_failures_total{unit,hook,outcome}` (gpu-arbiter#57).
+/// `gpu_arbiter_hook_failures_total{unit,hook,outcome}`.
 ///
 /// A module-global rather than a field on [`crate::state::ArbiterState`],
 /// following [`crate::procmon`]'s dropped-event counter: these hooks are invoked
@@ -351,8 +350,8 @@ fn stderr_excerpt(stderr: &[u8]) -> String {
 /// Ollama). Healthy `systemctl` calls return in milliseconds, so this never
 /// trips in normal operation.
 ///
-/// Deliberately left at 10s (not tightened alongside [`INTROSPECTION_TIMEOUT`]
-/// — #34): `start`/`stop`/`kill`/`is-active` are all in the eviction/ensure-
+/// Deliberately left at 10s, not tightened alongside [`INTROSPECTION_TIMEOUT`]:
+/// `start`/`stop`/`kill`/`is-active` are all in the eviction/ensure-
 /// running decision path, where correctness matters more than the `/status`
 /// refresh path's "must be fast" requirement, and 10s already bounds them well
 /// below any reasonable systemd transaction timeout.
@@ -360,7 +359,7 @@ const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Hard ceiling on the `/status` refresh path's model-introspection shell-outs
 /// (`ollama ps` / a configured `introspect_cmd`) — tighter than
-/// [`SYSTEMCTL_TIMEOUT`] (#34). These run on every reconcile pass's
+/// [`SYSTEMCTL_TIMEOUT`]. These run on every reconcile pass's
 /// `refresh_substate`, which the reconcile task must return from promptly to
 /// react to the next trigger (a game launch); the doc on
 /// [`loaded_models`] already commits to "fast on the /status refresh path", and
@@ -391,18 +390,18 @@ pub enum EvictionStep {
     KeepWaiting,
 }
 
-/// A per-poll VRAM reading for the unit under eviction (#8).
+/// A per-poll VRAM reading for the unit under eviction.
 ///
-/// The pre-#8 gate watched *total* GPU VRAM, which is unreliable exactly when
-/// it matters most: during a game launch the game is loading its own VRAM
-/// onto the GPU **while** a tenant is tearing down, so total usage rarely
-/// drops below the free threshold before `eviction_timeout_s` elapses — the
-/// eviction routinely escalates to SIGKILL even though the tenant itself
-/// released cleanly. Gating on the tenant's own attributed VRAM instead makes
-/// the game's concurrent VRAM growth irrelevant to this decision.
+/// Gating on *total* GPU VRAM is unreliable exactly when it matters most:
+/// during a game launch the game is loading its own VRAM onto the GPU
+/// **while** a tenant is tearing down, so total usage rarely drops below the
+/// free threshold before `eviction_timeout_s` elapses — the eviction would
+/// routinely escalate to SIGKILL even though the tenant itself released
+/// cleanly. Gating on the tenant's own attributed VRAM instead makes the
+/// game's concurrent VRAM growth irrelevant to this decision.
 ///
-/// **Structurally blind attribution, and the seen-nonzero gate (#61):**
-/// `Attributed` is only ever constructed by [`unit_vram_reading`] when the
+/// **Structurally blind attribution, and the seen-nonzero gate:**
+/// `Attributed` is only ever constructed by `unit_vram_reading` when the
 /// *backend* can attribute per-process VRAM at all
 /// ([`gpu::GpuBackend::attribution_capable`] — AMD structurally can't, since
 /// sysfs exposes no per-process interface, so it never reaches this variant)
@@ -421,7 +420,7 @@ pub enum UnitVramReading {
     /// `vram_match` (command-driven units) — see
     /// [`gpu::attribute_unit_vram`]. `0` is a legitimate, meaningful reading
     /// (the unit is fully drained, not merely "not measured") **only because**
-    /// [`unit_vram_reading`] never constructs this variant with `0` unless an
+    /// `unit_vram_reading` never constructs this variant with `0` unless an
     /// earlier poll in this eviction already proved the channel can see the
     /// unit — see the seen-nonzero note above.
     Attributed(u64),
@@ -429,7 +428,7 @@ pub enum UnitVramReading {
     /// attribution-incapable backend (AMD), a failed compute-proc query, a
     /// command-driven unit with no `vram_match` configured, or an
     /// as-yet-unproven `Attributed(0)` (see the seen-nonzero note above) —
-    /// falls back to the legacy total-GPU-VRAM gate. `None` when even the
+    /// falls back to the total-GPU-VRAM gate. `None` when even the
     /// total-VRAM read itself failed ("unknown-memory").
     Fallback(Option<GpuMemory>),
     /// VRAM cannot gate this eviction **at all** on this platform, so the
@@ -440,18 +439,17 @@ pub enum UnitVramReading {
     /// `Fallback(None)`. NVIDIA reports `NVML_VALUE_NOT_AVAILABLE` for
     /// per-process VRAM on **every** WDDM system, unconditionally, and a
     /// display-attached `GeForce` card cannot leave WDDM (no `GeForce` product
-    /// supports TCC, and TCC is deprecated regardless). Measured on a Windows host
-    /// (RTX 5090, driver 610.88): every process — the game itself and
-    /// `llama-server.exe` included — reports `[N/A]`.
+    /// supports TCC, and TCC is deprecated regardless). Every process — the
+    /// game itself and `llama-server.exe` included — reports `[N/A]`.
     ///
     /// The total-VRAM `Fallback` is *also* wrong here, and more subtly so.
-    /// Device-level `memory.used` does vary meaningfully on WDDM (877 MiB idle
-    /// → 12 502 MiB with an 8.4 GB model resident, same measurement run), so it
-    /// is good enough to *report* on the dashboard — but it is the whole
-    /// device, including the game that just launched. Gating eviction on it
-    /// would mean waiting for total VRAM to fall below a threshold that the
-    /// incoming game is simultaneously pushing up, so the gate would never open
-    /// and every eviction would run to timeout and SIGKILL.
+    /// Device-level `memory.used` does vary meaningfully on WDDM as models load
+    /// and unload, so it is good enough to *report* on the dashboard — but
+    /// it is the whole device, including the game that just launched. Gating
+    /// eviction on it would mean waiting for total VRAM to fall below a
+    /// threshold that the incoming game is simultaneously pushing up, so the
+    /// gate would never open and every eviction would run to timeout and
+    /// SIGKILL.
     ///
     /// Gating on service state is not a workaround, it is *more* correct here:
     /// a Windows service that reaches `SERVICE_STOPPED` has had its process
@@ -466,7 +464,7 @@ pub enum UnitVramReading {
 ///   threshold semantics [`vram_is_free`] applies to the total-VRAM gate,
 ///   just scoped to this one unit. `0` always reads as freed.
 /// - `Fallback(Some(mem))`: freed iff [`vram_is_free`] holds for the total GPU
-///   reading — the pre-#8 behavior, used when per-unit attribution isn't
+///   reading — used when per-unit attribution isn't
 ///   available this poll.
 /// - `Fallback(None)`: unknown — never treated as freed. A flaky/absent
 ///   reading degrades to `KeepWaiting`/`Escalate` exactly like a confirmed
@@ -739,11 +737,11 @@ pub async fn is_busy(u: &ManagedUnit) -> bool {
     match run_argv("busy", &u.unit, &cmd.0, "").await {
         Ok(out) if out.status.success() => true,
         // The probe ran and said "not busy" only if it exited 0 above. Any other
-        // status means it *broke* — a distinct condition that used to return a
-        // bare `false` with no log line at all, making a permanently-broken probe
-        // indistinguishable from a permanently-idle tenant (gpu-arbiter#56). The
-        // fail-toward-not-busy return is unchanged and still deliberate; what
-        // changes is that it is now observable.
+        // status means it *broke* — a distinct condition from a genuine
+        // not-busy reply, and it must be observable rather than silently
+        // indistinguishable from a permanently-idle tenant. The
+        // fail-toward-not-busy return stays deliberate; the failure is now
+        // logged and counted.
         Ok(out) => {
             record_hook_failure(&u.unit, Hook::Busy, HookFailure::NonZero);
             tracing::warn!(
@@ -772,8 +770,8 @@ pub async fn is_busy(u: &ManagedUnit) -> bool {
 /// - [`Introspection::Command`] → run the configured `introspect_cmd` as a
 ///   shell-free argv and turn each non-empty trimmed stdout line into a name.
 /// - [`Introspection::Ollama`] → run `ollama ps` and parse it with
-///   [`parse_ollama_ps`] (the original Ollama behavior, preserved as the default
-///   for an `ollama`-kinded or `ollama`-named unit).
+///   [`parse_ollama_ps`] — the default for an `ollama`-kinded or
+///   `ollama`-named unit.
 /// - [`Introspection::None`] → empty vec (no model reporting for this unit).
 ///
 /// Best-effort + bounded throughout: a missing binary, failed/empty query,
@@ -792,7 +790,7 @@ pub async fn loaded_models(unit: &ManagedUnit) -> Vec<String> {
 /// run **shell-free** (no shell, no quoting, no expansion) — the first token is
 /// the program, the rest are arguments. Best-effort + bounded: a blank command, a
 /// spawn failure, or a non-zero exit all yield an empty vec. The call is bounded
-/// to [`INTROSPECTION_TIMEOUT`] (2s, #34) — a custom introspection command that
+/// to [`INTROSPECTION_TIMEOUT`] (2s) — a custom introspection command that
 /// runs longer is killed and silently yields an empty vec, so it must be fast
 /// (it runs on the `/status` refresh path under the reconcile task).
 async fn run_introspect_cmd(cmd: &str) -> Vec<String> {
@@ -826,7 +824,7 @@ pub fn parse_model_lines(out: &str) -> Vec<String> {
 /// introspection backend.
 async fn ollama_loaded_models() -> Vec<String> {
     let fut = tokio::process::Command::new("ollama").arg("ps").output();
-    // Best-effort + bounded (#34): a hung `ollama ps` must not stall the
+    // Best-effort + bounded: a hung `ollama ps` must not stall the
     // reconcile — 2s, tighter than the control-verb SYSTEMCTL_TIMEOUT.
     match tokio::time::timeout(INTROSPECTION_TIMEOUT, fut).await {
         Ok(Ok(out)) if out.status.success() => {
@@ -858,7 +856,7 @@ fn resolve_unit<'c>(cfg: &'c Config, unit: &str) -> Result<&'c ManagedUnit, Unit
         })
 }
 
-/// [`start`], resolving `unit` by name against `cfg` first. See [`resolve_unit`].
+/// [`start`], resolving `unit` by name against `cfg` first. See `resolve_unit`.
 ///
 /// # Errors
 ///
@@ -868,7 +866,7 @@ pub async fn start_by_name(cfg: &Config, unit: &str) -> Result<(), UnitError> {
     start(resolve_unit(cfg, unit)?).await
 }
 
-/// [`evict`], resolving `unit` by name against `cfg` first. See [`resolve_unit`].
+/// [`evict`], resolving `unit` by name against `cfg` first. See `resolve_unit`.
 ///
 /// # Errors
 ///
@@ -906,7 +904,7 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
 }
 
 /// Evict `unit` from the GPU: `systemctl stop`, then poll until the unit's own
-/// VRAM drains below `vram_free_threshold_mb` (graceful, #8) or
+/// VRAM drains below `vram_free_threshold_mb` (graceful) or
 /// `eviction_timeout_s` elapses. On timeout, re-check the unit: if it's
 /// already inactive the process is gone and its VRAM released (VRAM free *or
 /// PID gone* gate) — that's a graceful [`EvictionOutcome::Freed`]. Only a unit
@@ -918,24 +916,24 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
 /// (the same gates apply to every managed unit, whether the reading is
 /// per-unit or the total-GPU fallback — see [`UnitVramReading`]).
 ///
-/// **Per-unit gating (#8):** each poll attributes `u`'s own VRAM via
+/// **Per-unit gating:** each poll attributes `u`'s own VRAM via
 /// [`gpu::attribute_unit_vram`] (cgroup for a systemd unit, `vram_match` for a
 /// command-driven one) and gates on *that*, not total GPU VRAM. This matters
 /// during a real game launch: the game is loading its own VRAM onto the GPU
 /// concurrently with this teardown, so the old total-VRAM gate rarely dropped
 /// below threshold before the timeout — eviction routinely escalated to
 /// SIGKILL even when the tenant itself released cleanly. Falls back to the
-/// legacy total-GPU-VRAM gate when attribution isn't available or, per the
+/// total-GPU-VRAM gate when attribution isn't available or, per the
 /// seen-nonzero gate below, not yet trustworthy this poll.
 ///
-/// **Attribution capability and the seen-nonzero gate (#61):** per-unit
+/// **Attribution capability and the seen-nonzero gate:** per-unit
 /// attribution requires BOTH the unit to have a structural channel
 /// (`attribution_capable` — is it a systemd unit, or does it have a
 /// configured `vram_match`?) AND the *backend* to be able to answer it
 /// ([`gpu::GpuBackend::attribution_capable`] — AMD structurally can't; its
-/// `query_compute_procs` always returns `Ok(vec![])`, which used to be
-/// misread as "queried successfully, unit confirmed drained" and skipped the
-/// drain wait on the very first poll). Even on a capable backend, a
+/// `query_compute_procs` always returns `Ok(vec![])`, which is not the same
+/// as "queried successfully, unit confirmed drained" — treating it as such
+/// would skip the drain wait on the very first poll). Even on a capable backend, a
 /// zero-VRAM reading is trusted as "drained" only once THIS eviction has
 /// already observed the unit attributed with nonzero VRAM at least once
 /// (tracked via `seen_nonzero` through the poll loop below) — a zero seen
@@ -1020,9 +1018,9 @@ async fn evict_inner(
     // succeeds; a command-driven unit needs an explicit `vram_match`. This is
     // the *unit*-side half of attribution capability — [`unit_vram_reading`]
     // additionally gates on the *backend*-side half
-    // ([`gpu::GpuBackend::attribution_capable`]) before trusting a reading
-    // (#61: AMD structurally can't attribute per-process VRAM at all, and
-    // `is_systemd` alone used to be read as "yes it can").
+    // ([`gpu::GpuBackend::attribution_capable`]) before trusting a reading:
+    // AMD structurally can't attribute per-process VRAM at all, so
+    // `is_systemd` alone is not sufficient.
     let attribution_capable = is_systemd || u.vram_match.is_some();
 
     // Nothing to do if the unit isn't running.
@@ -1034,8 +1032,7 @@ async fn evict_inner(
     //
     // Ask the tenant to drop the GPU while staying alive. Strictly better than a
     // stop when it works: no in-flight work is lost and there is no cold model
-    // reload afterwards. Skipped entirely for a unit with no `yield_cmd`, which
-    // is every unit that existed before this.
+    // reload afterwards. Skipped entirely for a unit with no `yield_cmd`.
     //
     // The tenant cannot hold the GPU against a higher tier by ignoring this —
     // failure to release within the budget falls through to the stop path below,
@@ -1082,7 +1079,7 @@ async fn evict_inner(
     // Poll until this unit's own VRAM drops below the free threshold (or the
     // total-GPU fallback does) or we time out.
     //
-    // `seen_nonzero` (#61) tracks, across polls IN THIS SINGLE EVICTION,
+    // `seen_nonzero` tracks, across polls IN THIS SINGLE EVICTION,
     // whether attribution has ever actually observed `u` holding nonzero
     // VRAM — proof the attribution channel can see this unit's process at
     // all. Until that's proven, a zero reading is not trusted as "drained"
@@ -1128,7 +1125,7 @@ async fn evict_inner(
                 // is already inactive, the process is gone and its CUDA context
                 // (hence VRAM) released — SIGKILL would hit nothing. Treat that as
                 // a graceful release instead of a misleading `Escalated`.
-                // Tristate (#15): when the recheck itself fails, the decision
+                // Tristate: when the recheck itself fails, the decision
                 // default is "assume still running" (unsure ⇒ don't block the
                 // SIGKILL escalation on an unconfirmed "it's already gone") —
                 // kept, but logged instead of silently coerced.
@@ -1155,7 +1152,7 @@ async fn evict_inner(
     }
 }
 
-/// Build one eviction poll's [`UnitVramReading`] (#8, #61) — the only
+/// Build one eviction poll's [`UnitVramReading`] — the only
 /// side-effecting (shell-out / `/proc` read) half of the eviction-gating
 /// decision; [`eviction_step`], [`gpu::attribute_unit_vram`], and
 /// [`attribution_is_trustworthy`] are the pure halves.
@@ -1164,7 +1161,7 @@ async fn evict_inner(
 /// only when `attribution_capable` (the unit-side channel — is it a systemd
 /// unit, or does it have a configured `vram_match`?) AND
 /// `backend.attribution_capable()` (the backend-side channel — can this
-/// vendor's compute-proc query attribute per-process VRAM at all? #61: AMD's
+/// vendor's compute-proc query attribute per-process VRAM at all? AMD's
 /// always returns `Ok(vec![])`, which is NOT the same thing as "queried
 /// successfully, found nothing" for gating purposes) — a unit/backend
 /// combination that structurally can't answer has no possible attribution
@@ -1172,7 +1169,7 @@ async fn evict_inner(
 ///
 /// [`attribution_is_trustworthy`] then decides whether the resulting
 /// attribution (if any) is trusted as `Attributed`, or degraded to the
-/// total-VRAM `Fallback` because it's an as-yet-unproven zero (#61
+/// total-VRAM `Fallback` because it's an as-yet-unproven zero (the
 /// seen-nonzero gate — see [`UnitVramReading`]'s docs). The fallback query
 /// only runs when actually needed (attribution unavailable, or an unproven
 /// zero), not on every poll — avoids doubling the shell-out cost in the
@@ -1229,7 +1226,7 @@ async fn unit_vram_reading(
 /// [`gpu::attribute_unit_vram`], or `None` if attribution wasn't even
 /// attempted/available this poll) should be trusted as this poll's
 /// [`UnitVramReading::Attributed`] reading, or degraded to the total-VRAM
-/// [`UnitVramReading::Fallback`] instead (#61). Pure — the testable core of
+/// [`UnitVramReading::Fallback`] instead. Pure — the testable core of
 /// the seen-nonzero gate; see [`UnitVramReading`]'s docs for the full policy
 /// this implements.
 ///
@@ -1337,7 +1334,7 @@ mod tests {
 
     #[test]
     fn hook_and_failure_labels_are_stable() {
-        // These strings are a public metric contract (gpu-arbiter#57). If this
+        // These strings are a public metric contract. If this
         // test is changed, every alert built on the metric breaks.
         assert_eq!(Hook::Busy.label(), "busy");
         assert_eq!(Hook::Yield.label(), "yield");
@@ -1406,13 +1403,12 @@ mod tests {
         }
     }
 
-    /// Shorthand for the `Fallback(Some(mem(used)))` reading — the pre-#8
-    /// total-GPU-VRAM gate.
+    /// Shorthand for the `Fallback(Some(mem(used)))` total-GPU-VRAM reading.
     fn fallback(used: u64) -> UnitVramReading {
         UnitVramReading::Fallback(Some(mem(used)))
     }
 
-    // ── fallback-total (attribution unavailable; the pre-#8 gate) ──────────
+    // ── fallback-total (attribution unavailable; total-VRAM gate) ──────────
 
     #[test]
     fn eviction_step_fallback_keeps_waiting_under_threshold_and_timeout() {
@@ -1522,11 +1518,11 @@ mod tests {
         }
     }
 
-    // ── attributed (#8: per-unit VRAM gating) ───────────────────────────────
+    // ── attributed (per-unit VRAM gating) ───────────────────────────────────
 
     #[test]
     fn eviction_step_attributed_freed_when_unit_vram_is_zero() {
-        // The headline #8 fix: the unit's OWN vram is drained to 0 even though
+        // The unit's OWN vram is drained to 0 even though
         // (unmodeled here) a game could simultaneously be loading VRAM
         // elsewhere on the GPU — that's irrelevant to this unit's gate.
         let cfg = Config::default();
@@ -1579,7 +1575,7 @@ mod tests {
         );
     }
 
-    // ── seen-nonzero attribution gate (#61) ─────────────────────────────────
+    // ── seen-nonzero attribution gate ───────────────────────────────────────
     //
     // These test `attribution_is_trustworthy` (the pure decision) combined
     // with `eviction_step` (the pure gate the resulting reading feeds) so the
@@ -1588,7 +1584,7 @@ mod tests {
 
     #[test]
     fn amd_backend_structurally_falls_back_never_attributed() {
-        // The AMD half of #61: `GpuBackend::attribution_capable()` is the
+        // The AMD case: `GpuBackend::attribution_capable()` is the
         // structural gate `unit_vram_reading` checks before ever calling
         // `attribute_unit_vram` — AMD must never reach `Attributed` at all,
         // regardless of `is_systemd`/`vram_match`. (The backend-capability
@@ -1613,10 +1609,10 @@ mod tests {
 
     #[test]
     fn never_seen_nonzero_zero_attribution_is_not_trustworthy() {
-        // The core #61 fix: an Attributed(0) with no prior nonzero
-        // observation this eviction is NOT trusted — this is exactly the
-        // shape a typo'd `vram_match`, a graphics-context-only NVIDIA
-        // tenant, or (pre-backend-gate) AMD would all produce on poll one.
+        // An Attributed(0) with no prior nonzero observation this eviction is
+        // NOT trusted — this is exactly the shape a typo'd `vram_match`, a
+        // graphics-context-only NVIDIA tenant, or an attribution-incapable
+        // backend would all produce on poll one.
         assert!(!attribution_is_trustworthy(Some(0), false));
         // The caller degrades this to Fallback(total) — asserted at the
         // `unit_vram_reading`/`evict` integration level is out of pure-test
@@ -1672,7 +1668,7 @@ mod tests {
         assert!(!attribution_is_trustworthy(None, true));
     }
 
-    // ── eviction outcome → metric bucket mapping (#14) ──────────────────────
+    // ── eviction outcome → metric bucket mapping ─────────────────────────────
 
     #[test]
     fn eviction_metric_outcome_maps_freed_and_escalated() {
@@ -1900,7 +1896,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
 
     #[test]
     fn resolve_no_overrides_is_systemd() {
-        // The byte-for-byte default contract: a unit with zero `*_cmd` keys is
+        // The default contract: a unit with zero `*_cmd` keys is
         // systemd-driven.
         assert_eq!(
             Supervisor::resolve(&systemd_unit("ollama.service")),
@@ -2129,7 +2125,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         assert_eq!(outcome, EvictionOutcome::AlreadyClear);
     }
 
-    // ── tristate is_running: the recheck-can't-confirm decision (#15) ───────
+    // ── tristate is_running: the recheck-can't-confirm decision ─────────────
 
     // Unix-only in premise, not just in the chmod: the fixture is a `#!/bin/sh`
     // script whose self-disarming depends on shebang execution and on the
@@ -2147,7 +2143,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         // not just a non-zero "inactive" exit. (A metadata-only chmod, not an
         // unlink-while-executing, to avoid the ETXTBSY races self-deletion can
         // hit on overlay filesystems in some CI sandboxes.) The decision default
-        // (#15: unsure ⇒ assume still running, don't skip the SIGKILL
+        // (unsure ⇒ assume still running, don't skip the SIGKILL
         // escalation) must still let eviction complete cleanly rather than hang
         // or panic.
         let script = std::env::temp_dir().join(format!(

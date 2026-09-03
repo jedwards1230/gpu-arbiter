@@ -14,9 +14,7 @@
 //! `/sys/devices/virtual/…` in sysfs, while a real USB keyboard/mouse resolves
 //! under `…/usbN/…`. Canonicalizing `/sys/class/input/eventX` and rejecting the
 //! `/sys/devices/virtual/` prefix excludes the streamed pads/kb/mouse
-//! **deterministically**, independent of what they claim to be. (Verified live:
-//! a real USB keyboard/mouse resolves under a `usb` path; Sunshine
-//! "Mouse/Keyboard passthrough" nodes resolve under `/sys/devices/virtual/input/`.)
+//! **deterministically**, independent of what they claim to be.
 //!
 //! ## Why also filter by capability
 //!
@@ -68,7 +66,7 @@ pub struct PresenceMonitor {
     /// unknown (fail-safe: callers must not suppress alerts on unknown presence).
     healthy: Arc<AtomicBool>,
     /// Count of physical human-input devices currently watched. `AtomicU32`
-    /// directly (#37) — a device count is never negative, so there's no
+    /// directly — a device count is never negative, so there's no
     /// `i64`-then-`max(0) as u32` clamp/cast dance to carry around.
     device_count: Arc<AtomicU32>,
 }

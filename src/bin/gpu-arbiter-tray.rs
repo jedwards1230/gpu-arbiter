@@ -146,10 +146,10 @@ mod linux {
                         s.gpu_vram_used_mb,
                         s.gpu_vram_total_mb,
                         unit.map_or("Unit", |u| u.unit.as_str()),
-                        // Tristate (#15): `running: None` means the daemon
-                        // couldn't confirm either way — render that distinctly
-                        // from a confirmed "stopped" rather than defaulting to
-                        // one or the other.
+                        // Tristate: `running: None` means the daemon couldn't
+                        // confirm either way — render that distinctly from a
+                        // confirmed "stopped" rather than defaulting to one or
+                        // the other.
                         match unit.and_then(|u| u.running) {
                             Some(true) => "running",
                             Some(false) => "stopped",

@@ -1,12 +1,12 @@
-//! cgroup-based PID → systemd-unit attribution (#7).
+//! cgroup-based PID → systemd-unit attribution.
 //!
 //! ## Why not process name
 //!
-//! The pre-existing `vram_match` config key attributes a managed unit's VRAM by
-//! matching a substring against the GPU compute process's *name* — but
-//! `nvidia-smi` reports the actual binary, which is frequently **not** the
-//! configured unit name. Verified live: an `asr-runner.service` unit's GPU
-//! process is `/opt/asr-runner/venv/bin/python` (the venv interpreter), so
+//! The `vram_match` config key attributes a managed unit's VRAM by matching a
+//! substring against the GPU compute process's *name* — but `nvidia-smi`
+//! reports the actual binary, which is frequently **not** the configured unit
+//! name. For example, an `asr-runner.service` unit's GPU process may be
+//! `/opt/asr-runner/venv/bin/python` (the venv interpreter), so
 //! `vram_match = "parakeet"` never matches and `/status` silently reports no
 //! VRAM for that unit — even though it's the one actually holding the GPU.
 //!

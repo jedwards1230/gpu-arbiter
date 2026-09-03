@@ -8,9 +8,8 @@
 //! dependency-free — no `async-trait`, no `Box<dyn Trait>` — and the value is
 //! cheap to thread through the reconcile loop and HTTP handlers.
 //!
-//! - **NVIDIA** shells out to `nvidia-smi` (the historical, byte-for-byte path):
-//!   total VRAM via `--query-gpu`, the compute proc list via
-//!   `--query-compute-apps` CSV. The 2 s timeout and error mapping are preserved.
+//! - **NVIDIA** shells out to `nvidia-smi`: total VRAM via `--query-gpu`, the
+//!   compute proc list via `--query-compute-apps` CSV, bounded by a 2 s timeout.
 //! - **AMD** reads VRAM from sysfs (`/sys/class/drm/card*/device/mem_info_vram_*`);
 //!   there is no simple per-proc VRAM via sysfs, so the compute proc list degrades
 //!   to an empty `Vec` best-effort (VRAM attribution in `/status` simply reports
@@ -74,7 +73,7 @@ pub enum GpuError {
         stderr: String,
     },
     /// A vendor command exceeded its bound. Every shell-out is time-boxed (see
-    /// [`NVIDIA_SMI_TIMEOUT`]) so a wedged GPU/driver hang can never stall the
+    /// `NVIDIA_SMI_TIMEOUT`) so a wedged GPU/driver hang can never stall the
     /// eviction loop; this is that bound firing, distinct from a spawn/exit
     /// failure.
     #[error("{command} timed out after {elapsed:?}")]
@@ -102,7 +101,7 @@ pub enum GpuError {
 /// `"amd"`); the variant's async methods are the one entry point callers use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GpuBackend {
-    /// `nvidia-smi` shell-out (the historical default; unchanged behavior).
+    /// `nvidia-smi` shell-out. The default backend.
     #[default]
     Nvidia,
     /// sysfs VRAM probe (`/sys/class/drm/card*/device/mem_info_vram_*`).
@@ -112,12 +111,11 @@ pub enum GpuBackend {
 impl GpuBackend {
     /// Resolve the backend from the configured [`crate::config::GpuBackendKind`].
     ///
-    /// `Auto` probes the host: if `nvidia-smi` is on `PATH` → [`GpuBackend::Nvidia`]
-    /// (preserves existing behavior on the dev host and on an RTX box); else if an
-    /// `amdgpu` DRM card is present → [`GpuBackend::Amd`]; else default to
-    /// [`GpuBackend::Nvidia`] (the historical default, so nothing changes where
-    /// detection can't see a GPU — e.g. macOS). Detection is best-effort and must
-    /// never panic.
+    /// `Auto` probes the host: if `nvidia-smi` is on `PATH` → [`GpuBackend::Nvidia`];
+    /// else if an `amdgpu` DRM card is present → [`GpuBackend::Amd`]; else default
+    /// to [`GpuBackend::Nvidia`] (so a host where neither probe finds anything,
+    /// e.g. macOS, still resolves to a valid backend). Detection is best-effort
+    /// and must never panic.
     #[must_use]
     pub fn resolve(kind: crate::config::GpuBackendKind) -> Self {
         use crate::config::GpuBackendKind;
@@ -165,21 +163,16 @@ impl GpuBackend {
         }
     }
 
-    /// Whether this backend can attribute **per-process** VRAM at all (#61).
+    /// Whether this backend can attribute **per-process** VRAM at all.
     ///
     /// `false` on AMD is a *structural* fact about the backend, distinct from
     /// [`query_compute_procs`](Self::query_compute_procs) returning
     /// `Ok(vec![])` on AMD — that empty `Ok` is indistinguishable, at the call
     /// site, from "queried successfully and genuinely found nothing", which is
     /// exactly the shape a real "this unit is fully drained" reading takes.
-    /// Before this method existed, eviction gating
-    /// ([`crate::units::unit_vram_reading`]) trusted that empty-`Ok` as
-    /// `Attributed(0)` — "drained" — on the very first poll, silently skipping
-    /// the drain wait on every AMD host, because it never queried this at all;
-    /// it inferred capability from whether the *unit* has an attribution
-    /// channel (`is_systemd`/`vram_match`), not whether the *backend* can
-    /// answer that channel's query in the first place. Callers that need "can
-    /// this poll possibly attribute VRAM to a unit" must check both.
+    /// Callers that need "can this poll possibly attribute VRAM to a unit"
+    /// must check both this and the unit's own attribution channel
+    /// (`is_systemd`/`vram_match`) — neither alone is sufficient.
     #[must_use]
     pub fn attribution_capable(self) -> bool {
         matches!(self, GpuBackend::Nvidia)
@@ -189,10 +182,9 @@ impl GpuBackend {
 /// Best-effort PATH probe for `nvidia-smi` (drives `auto` detection). Pure-ish
 /// (reads `PATH` + stats files); never panics.
 fn nvidia_smi_on_path() -> bool {
-    // Windows needs the `.exe` suffix: the binary ships as `nvidia-smi.exe`
-    // (verified on a Windows RTX 5090 host at `C:\Windows\System32\nvidia-smi.exe`), so
-    // probing the bare stem finds nothing and `auto` detection silently
-    // concludes there is no NVIDIA GPU on a machine holding an RTX 5090.
+    // On Windows the binary ships as `nvidia-smi.exe`; probing the bare stem
+    // finds nothing and `auto` detection silently concludes there is no
+    // NVIDIA GPU present.
     const NAMES: &[&str] = if cfg!(windows) {
         &["nvidia-smi.exe"]
     } else {
@@ -289,7 +281,7 @@ pub fn parse_compute_procs_csv(out: &str) -> Vec<GpuComputeProc> {
                 pid,
                 name,
                 vram_mb,
-                // Cgroup attribution (#7) is a separate enrichment pass
+                // Cgroup attribution is a separate enrichment pass
                 // (`crate::cgroup::attribute_units`) — the raw CSV parse never
                 // knows about it.
                 owning_unit: None,
@@ -331,8 +323,7 @@ fn bytes_to_mib(bytes: u64) -> u64 {
     bytes / 1024 / 1024
 }
 
-/// NVIDIA backend: `nvidia-smi` shell-outs. Behavior is byte-for-byte identical to
-/// the pre-pluggable free functions — only the location changed.
+/// NVIDIA backend: `nvidia-smi` shell-outs.
 mod nvidia {
     use super::{
         GpuError, GpuMemory, NVIDIA_SMI_TIMEOUT, parse_compute_procs_csv, parse_memory_csv,
@@ -482,7 +473,7 @@ mod amd {
 /// matches. Pure helper over an observed compute-proc list, driven by each unit's
 /// configured `vram_match`.
 ///
-/// **Fallback path (#7):** cgroup attribution ([`vram_mb_by_cgroup`]) is the
+/// **Fallback path:** cgroup attribution ([`vram_mb_by_cgroup`]) is the
 /// primary attribution channel for a systemd-supervised unit — it can't be
 /// fooled by a wrapper binary (a venv interpreter, a launcher script) the way
 /// this name-substring match can. This function remains the only channel for
@@ -505,7 +496,7 @@ pub fn vram_mb_matching(compute: &[GpuComputeProc], needle: &str) -> Option<u64>
 }
 
 /// Best-effort VRAM (MiB) attributed to a managed unit via cgroup PID
-/// resolution (#7) — the primary `/status` attribution channel for a
+/// resolution — the primary `/status` attribution channel for a
 /// systemd-supervised unit. Pure helper over a compute-proc list already
 /// enriched by [`crate::cgroup::attribute_units`].
 ///
@@ -513,7 +504,7 @@ pub fn vram_mb_matching(compute: &[GpuComputeProc], needle: &str) -> Option<u64>
 /// exactly `unit_name`. Same "`None` when nothing matched" contract as
 /// [`vram_mb_matching`] (so `/status` omits the field instead of asserting a
 /// misleading `0` for a unit nothing was ever attributed to) — see
-/// [`unit_vram_sum`] for the eviction-gating counterpart, which needs an
+/// `unit_vram_sum` for the eviction-gating counterpart, which needs an
 /// explicit `0` to mean "confirmed drained".
 #[must_use]
 pub fn vram_mb_by_cgroup(compute: &[GpuComputeProc], unit_name: &str) -> Option<u64> {
@@ -531,7 +522,7 @@ pub fn vram_mb_by_cgroup(compute: &[GpuComputeProc], unit_name: &str) -> Option<
 /// but nothing currently maps to the unit. Pure.
 ///
 /// Unlike [`vram_mb_by_cgroup`], a genuine zero here *is* the signal callers
-/// want: [`attribute_unit_vram`] (eviction gating, #8) needs to distinguish
+/// want: [`attribute_unit_vram`] (eviction gating) needs to distinguish
 /// "the unit's process is confirmed gone" from "we have no idea", which
 /// `Option`-collapsing zero-into-`None` would erase.
 fn unit_vram_sum(compute: &[GpuComputeProc], unit_name: &str) -> u64 {
@@ -542,8 +533,8 @@ fn unit_vram_sum(compute: &[GpuComputeProc], unit_name: &str) -> u64 {
         .sum()
 }
 
-/// Attribute one managed unit's own VRAM (MiB) for an eviction-gating poll
-/// (#8). Pure — the decision core [`crate::units::eviction_step`] builds its
+/// Attribute one managed unit's own VRAM (MiB) for an eviction-gating poll.
+/// Pure — the decision core [`crate::units::eviction_step`] builds its
 /// [`crate::units::UnitVramReading`] from.
 ///
 /// Precedence:
@@ -690,7 +681,7 @@ mod tests {
         assert_eq!(GpuBackend::resolve(GpuBackendKind::Amd), GpuBackend::Amd);
     }
 
-    // ── per-process attribution capability (#61) ────────────────────────────
+    // ── per-process attribution capability ────────────────────────────────
 
     #[test]
     fn nvidia_is_attribution_capable_amd_is_not() {
@@ -702,19 +693,13 @@ mod tests {
         assert!(!GpuBackend::Amd.attribution_capable());
     }
 
-    // Smoke test, not a strict assertion: on a host that actually has GPU
-    // tooling (unlike macOS/CI), `resolve(Auto)` legitimately returns either
-    // variant depending on what's installed — the one universal contract this
-    // can assert is "never panics", with the specific-default assertion only
-    // firing when neither probe finds anything (the dev-host/CI case).
+    // Not a strict assertion: with GPU tooling present, `resolve(Auto)`
+    // legitimately returns either variant depending on what's installed, so
+    // only "never panics" is universal. Without any tooling (no nvidia-smi,
+    // no /sys/class/drm) the fallback is specifically Nvidia.
     #[test]
     fn smoke_resolve_auto_never_panics_and_defaults_sanely() {
-        // On macOS / CI there's no nvidia-smi and no /sys/class/drm → auto must
-        // fall back to the historical Nvidia default (not panic).
         let b = GpuBackend::resolve(GpuBackendKind::Auto);
-        // On a host with a GPU this could be either; the contract under test is
-        // "resolves to a valid variant without panicking". On the dev host (no
-        // GPU tooling) it's specifically Nvidia.
         if !nvidia_smi_on_path() && !amdgpu_card_present() {
             assert_eq!(b, GpuBackend::Nvidia);
         }
@@ -750,7 +735,7 @@ mod tests {
         assert_eq!(vram_mb_matching(&[], "ollama"), None);
     }
 
-    // ── cgroup attribution (#7) ─────────────────────────────────────────────
+    // ── cgroup attribution ──────────────────────────────────────────────────
 
     /// A compute proc with a resolved owning unit — the shape
     /// `crate::cgroup::attribute_units` produces.
@@ -765,8 +750,8 @@ mod tests {
 
     #[test]
     fn vram_by_cgroup_sums_matching_unit_ignores_name() {
-        // The motivating live bug: the process name never contains "asr" or
-        // "parakeet", but cgroup attribution finds it anyway.
+        // Cgroup attribution matches by owning unit, not by process name —
+        // it finds the process even though its path contains neither.
         let procs = vec![
             attributed(
                 1,
@@ -788,7 +773,7 @@ mod tests {
         assert_eq!(vram_mb_by_cgroup(&[], "asr-runner.service"), None);
     }
 
-    // ── eviction-gating attribution (#8) ────────────────────────────────────
+    // ── eviction-gating attribution ─────────────────────────────────────────
 
     #[test]
     fn attribute_unit_vram_systemd_trusts_cgroup_even_at_zero() {
