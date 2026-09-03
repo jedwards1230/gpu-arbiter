@@ -22,6 +22,10 @@ They `provides=('gpu-arbiter')` and conflict with each other, so a user installs
 exactly one. After install, enable the daemon with
 `systemctl enable --now gpu-arbiter`.
 
+**Status:** not yet published to the AUR (tracked in
+[#20](https://github.com/jedwards1230/gpu-arbiter/issues/20)). Build either
+package locally with `makepkg -si` until then.
+
 ## One-time publish (per package)
 
 The AUR is a set of bare git repos, one per package name. To publish a package

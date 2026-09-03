@@ -43,7 +43,7 @@ override of `state` itself. The `{unit}` must be one of the configured
 `managed_units`; an unknown unit is rejected with `404`, so the endpoint can't
 drive arbitrary systemd units. A manual start/stop is handled by the same
 reconcile task that drives automatic eviction/restart (never a directly-racing
-HTTP handler), and `POST /units/{unit}/stop` now **holds** the unit down —
+HTTP handler), and `POST /units/{unit}/stop` **holds** the unit down —
 see [Manual start/stop and holds](#manual-startstop-and-holds) below.
 
 Talk to the unix socket with any HTTP client that supports one, e.g.:
@@ -88,7 +88,7 @@ holding VRAM.
 
 ### Manual start/stop and holds
 
-`POST /units/{unit}/stop` now **holds** the unit down: without a hold, the
+`POST /units/{unit}/stop` **holds** the unit down: without a hold, the
 ensure-running self-heal step would restart the unit on the very next
 reconcile pass (even the periodic backstop timer), making a manual stop a
 self-reverting no-op. A held unit stays down across game launches/exits until
@@ -281,7 +281,7 @@ gaming ends. Each entry:
 | `yield_cmd` | _(none)_ | Cooperative release: ask the tenant to drop the GPU while staying alive, tried before any stop. **Ignored unless `busy_cmd` is also set** |
 | `resume_cmd` | _(none)_ | Undo for `yield_cmd`, run on the restore path before any start. Must be idempotent |
 | `yield_timeout_s` | _(none)_ | Per-unit cooperative-release budget before escalating to the stop path; falls back to the top-level `yield_timeout_s` |
-| `vram_match` | _(none)_ | **Fallback** substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution. A systemd-supervised unit is attributed automatically via cgroup PID resolution with no config needed; `vram_match` is only consulted for command-driven (`*_cmd`) units and non-systemd hosts (see [VRAM attribution](#vram-attribution)) |
+| `vram_match` | _(none)_ | **Fallback** substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution. A systemd-supervised unit is attributed automatically via cgroup PID resolution with no config needed; `vram_match` is consulted whenever cgroup resolution doesn't produce a match for that poll — always the case for command-driven (`*_cmd`) units and non-systemd hosts, and occasionally for a systemd unit too (see [VRAM attribution](#vram-attribution)) |
 | `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (runs `ollama ps`); any other value reports no models and suppresses the name heuristic |
 | `introspect_cmd` | _(none)_ | Explicit command (shell-free argv) whose stdout lists loaded model/process names, one per line. Takes precedence over `kind` and the name heuristic |
 | `stop_cmd` | _(none)_ | Override: command to stop/evict the tenant (`None` → `systemctl stop`) |
@@ -385,16 +385,18 @@ gating](#eviction-vram-gating)) is attributed via two channels, tried in order:
 1. **cgroup PID resolution** (primary, systemd units only, no config needed):
    every GPU compute process's `/proc/<pid>/cgroup` names the systemd unit
    that spawned it, regardless of what binary the unit actually execs. This
-   can't be fooled by a wrapper interpreter or launcher script — the historical
-   `vram_match` gap: an `asr-runner.service` unit's GPU process might be
+   can't be fooled by a wrapper interpreter or launcher script, unlike
+   `vram_match`: an `asr-runner.service` unit's GPU process might be
    `/opt/asr-runner/venv/bin/python` (the venv interpreter), so a name
    substring like `vram_match = "parakeet"` never matches even though the unit
    is definitely the one holding the GPU. Cgroup attribution sidesteps that
    entirely.
 2. **`vram_match`** (fallback): a configured substring matched against the
-   process name/path, for command-driven (`*_cmd`) units and non-systemd hosts
-   — no cgroup path resolves to a configured unit name there, so this remains
-   the only channel.
+   process name/path, used whenever channel 1 doesn't produce a match for
+   that poll. For command-driven (`*_cmd`) units and non-systemd hosts, no
+   cgroup path ever resolves to a configured unit name, so this is the only
+   channel that applies; for a systemd unit it can also fire on an occasional
+   poll where cgroup resolution hasn't caught up yet.
 
 Neither channel reporting a match means `vram_mb` is omitted from `/status`
 entirely (never a misleading `0`).
@@ -408,7 +410,7 @@ VRAM. This matters during a real game launch: the game is loading its own
 VRAM onto the GPU *concurrently* with the tenant's teardown, so gating on
 total usage rarely dropped below `vram_free_threshold_mb` before the timeout
 elapsed — eviction routinely escalated to SIGKILL even when the tenant itself
-released cleanly. Falls back to the legacy total-GPU-VRAM gate when
+released cleanly. Falls back to the total-GPU-VRAM gate when
 attribution isn't available this poll (an attribution-incapable backend —
 AMD, always — a failed compute-proc query, or a command-driven unit with no
 `vram_match`).
