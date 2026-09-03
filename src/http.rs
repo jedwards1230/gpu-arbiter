@@ -7,10 +7,7 @@
 //! | GET | `/status` | TCP | Full [`StatusSnapshot`] for remote machines + dashboards |
 //! | GET | `/metrics` | TCP | Prometheus text-format exposition of the current state |
 //! | GET | `/healthz` | TCP | Liveness |
-//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | unix socket | Manual override (the sanctioned write path) |
-//! | POST | `/ollama/start`,`/ollama/stop` | unix socket | Back-compat alias for the first managed unit |
-//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | TCP (localhost-only) | **Deprecated** — same alias, kept working for the tray/existing scripts |
-//! | POST | `/ollama/start`,`/ollama/stop` | TCP (localhost-only) | **Deprecated** alias |
+//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | unix socket | Manual override — the only write path |
 //!
 //! State is fully **auto** — derived from observed reality (no manual override).
 //!
@@ -18,28 +15,22 @@
 //! single TCP port (default `48750`, bind address configurable — see
 //! [`crate::config::Config::bind`], which defaults to loopback only). Widen
 //! `bind` to a LAN address to let other hosts read it, and firewall the port
-//! yourself if you do. The **write** path (`/units/*`, `/ollama/*`) is served
-//! twice:
+//! yourself if you do. The **write** path (`/units/*`) is a **unix domain
+//! socket only** ([`crate::config::Config::socket_path`], default
+//! `/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned, inside a
+//! mode-`0700` root-owned parent directory). The socket file's permissions
+//! (and its parent directory's — see [`serve_uds`]'s docs) ARE the auth
+//! boundary (local root only, no bearer tokens); see [`write_router`] /
+//! [`serve_uds`]. There is no TCP write path, and no platform where this
+//! socket is unavailable has any other write path (see
+//! [`crate::config::Config::socket_path`] for the Windows consequence).
 //!
-//! - a **unix domain socket** ([`crate::config::Config::socket_path`],
-//!   default `/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned,
-//!   inside a mode-`0700` root-owned parent directory) — the sanctioned
-//!   control surface. The socket file's permissions (and its parent
-//!   directory's — see [`serve_uds`]'s docs) ARE the auth boundary (local
-//!   root only, no bearer tokens, no `SocketAddr` to gate on for a unix
-//!   peer); see [`write_router`] / [`serve_uds`].
-//! - the **TCP** port, kept working for back-compat (the tray and existing
-//!   scripts) but **deprecated** — it additionally rejects any client whose
-//!   peer address is not loopback, enforced in-process via [`ConnectInfo`] so
-//!   it holds even if `bind` is later widened to a LAN address.
-//!
-//! Both paths validate `{unit}` against the configured managed-unit list
-//! before any `systemctl` runs, so a caller can't drive arbitrary units
-//! through either surface.
+//! The write path validates `{unit}` against the configured managed-unit list
+//! before any `systemctl` runs, so a caller can't drive arbitrary units.
 //!
 //! Note axum 0.8 path-param syntax is `/{p}` (not `/:p`).
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 // Only the `#[cfg(unix)]` stale-socket probe timeout uses the bare name; the
 // tests below spell out `std::time::Duration` in full.
@@ -47,7 +38,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Router, response::IntoResponse};
@@ -81,36 +72,27 @@ pub struct AppState {
     pub cfg: Arc<Config>,
 }
 
-/// Build the axum [`Router`] for the **TCP** control surface: the full
-/// read-only surface plus the deprecated TCP write routes (loopback-gated).
-/// Pulled out of [`serve`] so it can be exercised without binding a socket.
+/// Build the axum [`Router`] for the **TCP** control surface: the read-only
+/// surface only (`/status`/`/metrics`/`/healthz`). Pulled out of [`serve`] so
+/// it can be exercised without binding a socket. The write path is
+/// unix-socket only — see [`write_router`].
 pub fn router(app: AppState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
-        // Deprecated (#17): the unix socket (see `write_router`) is the
-        // sanctioned write path. Kept working — loopback-gated — for the
-        // tray and any existing scripts.
-        .route("/units/{unit}/start", post(unit_start))
-        .route("/units/{unit}/stop", post(unit_stop))
-        // Back-compat aliases — address the first managed unit (historically Ollama).
-        .route("/ollama/start", post(ollama_start))
-        .route("/ollama/stop", post(ollama_stop))
         .with_state(app)
 }
 
 /// Build the axum [`Router`] for the **unix control socket**: the write path
-/// only (`/status`/`/metrics`/`/healthz` stay TCP-only — this router carries
-/// no read routes). No loopback/`ConnectInfo` gate — a unix-socket peer has no
-/// `SocketAddr`, and the socket file's permissions (mode `0600`, root-owned;
-/// see [`serve_uds`]) are the entire auth boundary for this transport.
+/// (`/status`/`/metrics`/`/healthz` stay TCP-only — this router carries no
+/// read routes). No `SocketAddr` to gate on for a unix-socket peer — the
+/// socket file's permissions (mode `0600`, root-owned; see [`serve_uds`]) are
+/// the entire auth boundary for this transport.
 pub fn write_router(app: AppState) -> Router {
     Router::new()
         .route("/units/{unit}/start", post(unit_start_uds))
         .route("/units/{unit}/stop", post(unit_stop_uds))
-        .route("/ollama/start", post(ollama_start_uds))
-        .route("/ollama/stop", post(ollama_stop_uds))
         .with_state(app)
 }
 
@@ -755,21 +737,13 @@ pub async fn bind(addr: SocketAddr) -> Result<tokio::net::TcpListener, HttpError
 /// Serve the axum HTTP control surface on an already-[`bind`]-ed `listener`
 /// until the process exits. Cross-platform.
 ///
-/// Binds the service with `ConnectInfo<SocketAddr>` wired in so the
-/// `/ollama/*` handlers can read the peer address and reject non-loopback
-/// callers.
-///
 /// # Errors
 ///
 /// Returns [`HttpError`] if the serve loop itself fails — a runtime
 /// accept-loop error, not a bind failure (the listener is already bound by
 /// the time this is called; see [`bind`]).
 pub async fn serve_on(listener: tokio::net::TcpListener, app: AppState) -> Result<(), HttpError> {
-    axum::serve(
-        listener,
-        router(app).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    axum::serve(listener, router(app).into_make_service()).await?;
     Ok(())
 }
 
@@ -962,59 +936,17 @@ pub async fn healthz() -> &'static str {
     "ok"
 }
 
-/// `POST /units/{unit}/start` — **deprecated** TCP alias for the manual-start
-/// write path (see [`unit_start_uds`] for the sanctioned unix-socket route).
-/// Rejects non-loopback peers and unknown units.
-///
-/// A direct override: starts the unit now — **unless a game holds the GPU**.
-/// While the state is `gaming`/`evicting` the reconcile task rejects the
-/// start with `409 Conflict` (any manual hold stays in place) rather than
-/// starting a tenant into a live game: eviction is edge-triggered (it fires
-/// on the available → gaming *transition*), so a unit started mid-game would
-/// NOT be re-evicted by the next pass — it would sit on the GPU alongside
-/// the game. This endpoint cannot override gaming.
-pub async fn unit_start(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Path(unit): Path<String>,
-    State(app): State<AppState>,
-) -> impl IntoResponse {
-    do_start(&app, peer.ip(), &unit).await
-}
-
-/// `POST /units/{unit}/stop` — **deprecated** TCP alias; see [`unit_stop_uds`].
-/// Rejects non-loopback peers and unknown units.
-pub async fn unit_stop(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Path(unit): Path<String>,
-    State(app): State<AppState>,
-) -> impl IntoResponse {
-    do_stop(&app, peer.ip(), &unit).await
-}
-
-/// `POST /ollama/start` — **deprecated** TCP back-compat alias addressing the
-/// first managed unit; see [`ollama_start_uds`].
-pub async fn ollama_start(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(app): State<AppState>,
-) -> impl IntoResponse {
-    let unit = first_managed_unit(&app.cfg);
-    do_start(&app, peer.ip(), &unit).await
-}
-
-/// `POST /ollama/stop` — **deprecated** TCP back-compat alias addressing the
-/// first managed unit; see [`ollama_stop_uds`].
-pub async fn ollama_stop(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(app): State<AppState>,
-) -> impl IntoResponse {
-    let unit = first_managed_unit(&app.cfg);
-    do_stop(&app, peer.ip(), &unit).await
-}
-
 /// `POST /units/{unit}/start` on the **unix control socket** (#17) — the
-/// sanctioned write path. No loopback gate: a unix-socket peer carries no
-/// `SocketAddr`, and the socket file's permissions (mode `0600`, root-owned;
-/// see [`serve_uds`]) are the entire auth boundary for this transport.
+/// only write path. A direct override: starts the unit now — **unless a game
+/// holds the GPU**. While the state is `gaming`/`evicting` the reconcile task
+/// rejects the start with `409 Conflict` (any manual hold stays in place)
+/// rather than starting a tenant into a live game: eviction is
+/// edge-triggered (it fires on the available → gaming *transition*), so a
+/// unit started mid-game would NOT be re-evicted by the next pass — it would
+/// sit on the GPU alongside the game. This endpoint cannot override gaming.
+/// No peer/loopback check: a unix-socket peer carries no `SocketAddr`, and
+/// the socket file's permissions (mode `0600`, root-owned; see
+/// [`serve_uds`]) are the entire auth boundary for this transport.
 pub async fn unit_start_uds(
     Path(unit): Path<String>,
     State(app): State<AppState>,
@@ -1028,36 +960,6 @@ pub async fn unit_stop_uds(
     State(app): State<AppState>,
 ) -> impl IntoResponse {
     do_stop_uds(&app, &unit).await
-}
-
-/// `POST /ollama/start` on the unix control socket — back-compat alias
-/// addressing the first managed unit.
-pub async fn ollama_start_uds(State(app): State<AppState>) -> impl IntoResponse {
-    let unit = first_managed_unit(&app.cfg);
-    do_start_uds(&app, &unit).await
-}
-
-/// `POST /ollama/stop` on the unix control socket — back-compat alias
-/// addressing the first managed unit.
-pub async fn ollama_stop_uds(State(app): State<AppState>) -> impl IntoResponse {
-    let unit = first_managed_unit(&app.cfg);
-    do_stop_uds(&app, &unit).await
-}
-
-/// TCP start logic: loopback gate → managed-unit gate → [`start_validated`].
-async fn do_start(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
-    if let Err(deny) = guard_loopback(peer) {
-        return deny;
-    }
-    do_start_uds(app, unit).await
-}
-
-/// TCP stop logic: loopback gate → managed-unit gate → [`stop_validated`].
-async fn do_stop(app: &AppState, peer: IpAddr, unit: &str) -> (StatusCode, String) {
-    if let Err(deny) = guard_loopback(peer) {
-        return deny;
-    }
-    do_stop_uds(app, unit).await
 }
 
 /// Unix-socket start logic: managed-unit gate only (no peer/loopback check —
@@ -1168,28 +1070,12 @@ async fn enqueue_and_await(
     }
 }
 
-/// The loopback gate for the **deprecated TCP** write routes only — a unix
-/// socket peer has no `SocketAddr` to check, so [`do_start_uds`]/[`do_stop_uds`]
-/// never call this (see the module doc: the socket file's permissions are
-/// that transport's auth boundary). Pure — unit-tested via [`is_localhost`].
-fn guard_loopback(peer: IpAddr) -> Result<(), (StatusCode, String)> {
-    if is_localhost(peer) {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::FORBIDDEN,
-            "unit controls are localhost-only".to_string(),
-        ))
-    }
-}
-
-/// The gate shared by **every** write-path handler (TCP and unix socket
-/// alike): the unit must be one the daemon actually manages. Returns the
-/// resolved [`crate::config::ManagedUnit`] (carrying any command-override
-/// fields) on success — a single lookup into `cfg.resolved_units()`, so
-/// callers never re-resolve the unit after the gate passes. Returns the
-/// rejection response to send verbatim on failure. Pure over `(cfg, unit)` —
-/// unit-tested via [`is_managed`].
+/// The gate shared by every write-path handler: the unit must be one the
+/// daemon actually manages. Returns the resolved [`crate::config::ManagedUnit`]
+/// (carrying any command-override fields) on success — a single lookup into
+/// `cfg.resolved_units()`, so callers never re-resolve the unit after the
+/// gate passes. Returns the rejection response to send verbatim on failure.
+/// Pure over `(cfg, unit)` — unit-tested via [`is_managed`].
 fn guard_unit<'c>(
     cfg: &'c Config,
     unit: &str,
@@ -1205,52 +1091,22 @@ fn guard_unit<'c>(
         })
 }
 
-/// The first managed unit's name (what the legacy `/ollama/*` aliases address).
-/// `resolved_units` always yields at least one entry, so the fallback is
-/// defensive only.
-fn first_managed_unit(cfg: &Config) -> String {
-    cfg.resolved_units()
-        .first()
-        .map(|u| u.unit.clone())
-        .unwrap_or_default()
-}
-
 /// Whether `unit` is one the daemon manages (and may therefore be controlled via
-/// `/units/*`). Pure — unit-tested. Not on [`guard`]'s hot path (`guard` resolves
-/// the unit directly in one pass); kept as an independent predicate other callers
-/// can use without needing the full `&ManagedUnit`.
+/// `/units/*`). Pure — unit-tested. Not on [`guard_unit`]'s hot path (`guard_unit`
+/// resolves the unit directly in one pass); kept as an independent predicate
+/// other callers can use without needing the full `&ManagedUnit`.
 #[must_use]
 pub fn is_managed(cfg: &Config, unit: &str) -> bool {
     cfg.resolved_units().iter().any(|u| u.unit == unit)
 }
 
-/// Whether a peer IP is permitted to call the `/units/*` handlers (loopback
-/// only). Pure — unit-tested.
-#[must_use]
-pub fn is_localhost(peer: std::net::IpAddr) -> bool {
-    peer.is_loopback()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    #[test]
-    fn loopback_is_localhost() {
-        assert!(is_localhost(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(is_localhost(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-    }
-
-    #[test]
-    fn lan_peer_is_not_localhost() {
-        // A generic RFC 1918 LAN address — the `/units/*` handlers must reject it.
-        assert!(!is_localhost(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))));
-    }
 
     #[test]
     fn is_managed_matches_resolved_units() {
-        // Legacy fallback: only the synthesized Ollama unit is managed.
+        // Default: only the synthesized Ollama unit is managed.
         let cfg = Config::default();
         assert!(is_managed(&cfg, "ollama.service"));
         assert!(!is_managed(&cfg, "vllm.service"));
@@ -1272,32 +1128,6 @@ mod tests {
     }
 
     #[test]
-    fn first_managed_unit_is_eviction_order_head() {
-        let cfg = Config::from_toml(
-            r#"
-            [[managed_units]]
-            unit = "ollama.service"
-            [[managed_units]]
-            unit = "vllm.service"
-            "#,
-        )
-        .unwrap();
-        // The /ollama/* aliases address this unit.
-        assert_eq!(first_managed_unit(&cfg), "ollama.service");
-    }
-
-    #[test]
-    fn guard_loopback_rejects_lan_allows_loopback() {
-        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5));
-        assert_eq!(
-            guard_loopback(lan).map_err(|(s, _)| s),
-            Err(StatusCode::FORBIDDEN)
-        );
-        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert_eq!(guard_loopback(lo), Ok(()));
-    }
-
-    #[test]
     fn guard_unit_rejects_unmanaged_unit() {
         let cfg = Config::default();
         // An unmanaged unit → 404 (can't drive arbitrary units).
@@ -1305,8 +1135,7 @@ mod tests {
             guard_unit(&cfg, "sshd.service").map_err(|(s, _)| s),
             Err(StatusCode::NOT_FOUND)
         );
-        // A managed unit → allowed through, resolving that unit. This gate
-        // applies identically on the TCP and unix-socket write paths.
+        // A managed unit → allowed through, resolving that unit.
         let managed = guard_unit(&cfg, "ollama.service").expect("ollama.service is managed");
         assert_eq!(managed.unit, "ollama.service");
     }
@@ -1329,7 +1158,6 @@ mod tests {
                 vram_mb: None,
                 held: false,
             }],
-            ollama: UnitStatus::default(),
             gpu_vram_used_mb: 21500,
             gpu_vram_total_mb: 32768,
             since: "2023-11-14T22:13:20Z".into(),
@@ -1385,7 +1213,6 @@ mod tests {
                 vram_mb: Some(21000),
                 held: false,
             }],
-            ollama: UnitStatus::default(),
             gpu_vram_used_mb: 21000,
             gpu_vram_total_mb: 32768,
             since: "2023-11-14T22:13:20Z".into(),
@@ -1429,7 +1256,6 @@ mod tests {
             state: State::Available,
             claims: vec![],
             units: vec![],
-            ollama: UnitStatus::default(),
             gpu_vram_used_mb: 0,
             gpu_vram_total_mb: 0,
             since: "2023-11-14T22:13:20Z".into(),
@@ -1477,7 +1303,6 @@ mod tests {
                     held: false,
                 },
             ],
-            ollama: UnitStatus::default(),
             gpu_vram_used_mb: 0,
             gpu_vram_total_mb: 0,
             since: "1970-01-01T00:00:00Z".into(),
@@ -1516,7 +1341,6 @@ mod tests {
             state: State::Evicting,
             claims: vec!["pattern:heroic".into()],
             units: vec![],
-            ollama: UnitStatus::default(),
             gpu_vram_used_mb: 0,
             gpu_vram_total_mb: 0,
             since: "1970-01-01T00:00:00Z".into(),
@@ -1571,7 +1395,6 @@ mod tests {
             state: State::Available,
             claims: vec![],
             units: vec![],
-            ollama: UnitStatus::default(),
             gpu_vram_used_mb: 0,
             gpu_vram_total_mb: 0,
             since: "1970-01-01T00:00:00Z".into(),
@@ -1614,7 +1437,6 @@ mod tests {
             state: State::Available,
             claims: vec![],
             units: vec![],
-            ollama: UnitStatus::default(),
             gpu_vram_used_mb: 0,
             gpu_vram_total_mb: 0,
             since: "1970-01-01T00:00:00Z".into(),

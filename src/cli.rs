@@ -1040,7 +1040,6 @@ mod tests {
                 { "unit": "ollama.service", "running": false, "models": [], "vram_mb": 0 },
                 { "unit": "vllm.service", "running": false, "models": [] }
             ],
-            "ollama": { "unit": "ollama.service", "running": false, "models": [] },
             "gpu_vram_used_mb": 21500,
             "gpu_vram_total_mb": 32768,
             "since": "2026-06-07T20:00:00Z"
@@ -1069,7 +1068,6 @@ mod tests {
             "state": "gaming",
             "claims": ["steam:440"],
             "units": [],
-            "ollama": { "unit": "ollama.service", "running": false, "models": [] },
             "gpu_vram_used_mb": 21500,
             "gpu_vram_total_mb": 32768,
             "since": "2026-06-07T20:00:00Z",
@@ -1090,7 +1088,6 @@ mod tests {
             "units": [
                 { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 }
             ],
-            "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
             "gpu_vram_used_mb": 21000,
             "gpu_vram_total_mb": 32768,
             "since": "2026-06-07T20:00:00Z"

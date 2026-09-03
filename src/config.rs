@@ -416,35 +416,20 @@ pub struct Config {
     /// HTTP listen port (bound to `bind`).
     pub port: u16,
     /// TCP bind address for the HTTP control surface (`GET /status /metrics
-    /// /healthz` plus the deprecated `POST /units/*` / `/ollama/*` write
-    /// routes — see [`Config::socket_path`] for the sanctioned write path).
-    /// Defaults to loopback only. Set this to a LAN address to let other
-    /// hosts read `/status`/`/metrics`, and firewall the port yourself if
-    /// you do.
+    /// /healthz` — see [`Config::socket_path`] for the write path). Defaults
+    /// to loopback only. Set this to a LAN address to let other hosts read
+    /// `/status`/`/metrics`, and firewall the port yourself if you do.
     #[serde(default = "default_bind")]
     pub bind: IpAddr,
-    /// **Legacy** single managed unit. Superseded by `managed_units`; still
-    /// accepted and, when `managed_units` is unset, synthesized into a
-    /// one-element list (see [`Config::resolved_units`]).
-    pub ollama_unit: String,
-    /// **Legacy** eager-restart toggle for the single Ollama unit. Superseded by
-    /// each `managed_units` entry's `eager_restart`; see [`Config::resolved_units`].
-    pub eager_ollama: bool,
-    /// Ordered list of systemd units the arbiter evicts from the GPU on a game
-    /// launch and restores when gaming ends. When empty, the legacy
-    /// `ollama_unit` / `eager_ollama` fields synthesize a single entry — see
-    /// [`Config::resolved_units`], the one accessor the daemon drives off.
+    /// Ordered list of GPU tenants the arbiter evicts from the GPU on a game
+    /// launch and restores when gaming ends — the one list the daemon drives
+    /// off (see [`Config::resolved_units`]). When omitted from the config
+    /// file entirely, defaults to a single Ollama entry (see
+    /// [`default_managed_units`]), so a zero-config daemon still evicts,
+    /// attributes VRAM for, and introspects (`ollama ps`) Ollama.
+    #[serde(default = "default_managed_units")]
     pub managed_units: Vec<ManagedUnit>,
-    /// The normalized, ordered list the daemon actually drives — `managed_units`
-    /// verbatim, or the legacy-synthesized single entry when it's empty. Computed
-    /// **once**, when the config is loaded/defaulted (see [`Config::from_toml`] /
-    /// [`Default for Config`](#impl-Default-for-Config)), not re-synthesized on
-    /// every [`Config::resolved_units`] call — a single reconcile pass and HTTP
-    /// request each call it multiple times. Not a TOML key: never read from the
-    /// config file, always derived.
-    #[serde(skip)]
-    pub units: Vec<ManagedUnit>,
-    /// Seconds to wait for a graceful Ollama teardown before SIGKILL escalation.
+    /// Seconds to wait for a graceful teardown before SIGKILL escalation.
     pub eviction_timeout_s: u64,
     /// VRAM-used threshold (MiB) under which the GPU is considered "freed" after
     /// eviction.
@@ -496,20 +481,18 @@ pub struct Config {
 
     // ── control socket ───────────────────────────────────────────────────────
     /// Path to the unix control socket that serves the write path (`POST
-    /// /units/{unit}/start|stop`, `/ollama/start|stop`) — the sanctioned
-    /// control surface (local-only, no bearer tokens). Bound mode `0600`,
-    /// root-owned, inside a mode-`0700` root-owned parent directory (see
-    /// [`crate::http::serve_uds`] — the parent directory closes a
-    /// bind-then-chmod permission race and is itself part of the auth
-    /// boundary, not just the socket file's own mode). Default
-    /// `/run/gpu-arbiter/gpu-arbiter.sock` — a dedicated subdirectory of
-    /// `/run`, not bare `/run` itself, specifically so the daemon (or
-    /// systemd's `RuntimeDirectory=`, see `packaging/gpu-arbiter.service`)
-    /// has a directory of its own to lock down to `0700` rather than relying
-    /// solely on the socket file's mode. The TCP `/units/*`/`/ollama/*`
-    /// routes keep working (loopback-gated) for back-compat but are
-    /// deprecated in favor of this socket. An **empty string** disables the
-    /// unix socket entirely.
+    /// /units/{unit}/start|stop`) — the only control surface (local-only, no
+    /// bearer tokens). Bound mode `0600`, root-owned, inside a mode-`0700`
+    /// root-owned parent directory (see [`crate::http::serve_uds`] — the
+    /// parent directory closes a bind-then-chmod permission race and is
+    /// itself part of the auth boundary, not just the socket file's own
+    /// mode). Default `/run/gpu-arbiter/gpu-arbiter.sock` — a dedicated
+    /// subdirectory of `/run`, not bare `/run` itself, specifically so the
+    /// daemon (or systemd's `RuntimeDirectory=`, see
+    /// `packaging/gpu-arbiter.service`) has a directory of its own to lock
+    /// down to `0700` rather than relying solely on the socket file's mode.
+    /// An **empty string** disables the unix socket entirely, leaving the
+    /// daemon with no write path at all.
     #[serde(default = "default_socket_path")]
     pub socket_path: String,
 }
@@ -527,9 +510,9 @@ fn default_bind() -> IpAddr {
 ///
 /// Empty on Windows, which disables the unix-socket listener. `http::bind_uds`
 /// and `serve_uds_on` are `#[cfg(unix)]` with no Windows counterpart, so a
-/// non-empty default here would name a socket that can never be bound. The
-/// control surface is TCP-only on Windows until the named-pipe listener lands;
-/// see the port plan's §5.5 for the security tradeoff that implies.
+/// non-empty default here would name a socket that can never be bound.
+/// Windows therefore has **no write path at all** until a named-pipe listener
+/// lands — manual start/stop overrides are Linux-only in the meantime.
 fn default_socket_path() -> String {
     if cfg!(windows) {
         String::new()
@@ -540,20 +523,13 @@ fn default_socket_path() -> String {
 
 impl Default for Config {
     fn default() -> Self {
-        let ollama_unit = "ollama.service".to_string();
-        let eager_ollama = true;
-        let managed_units = Vec::new();
-        let units = synthesize_units(&ollama_unit, eager_ollama, &managed_units);
         Self {
             enabled: true,
             port: 48750,
             bind: default_bind(),
             game_priority: DEFAULT_GAME_PRIORITY,
             yield_timeout_s: default_yield_timeout_s(),
-            ollama_unit,
-            eager_ollama,
-            managed_units,
-            units,
+            managed_units: default_managed_units(),
             eviction_timeout_s: 5,
             vram_free_threshold_mb: 2000,
             reconcile_interval_s: 30,
@@ -583,74 +559,45 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
 }
 
-/// Compute the normalized [`Config::units`] list from the raw `managed_units` /
-/// legacy `ollama_unit` / `eager_ollama` fields. Pure — the sole place the
-/// backward-compatibility synthesis happens, called once per [`Config`]
-/// construction (see [`Config::from_toml`] and `impl Default for Config`).
-///
-/// If `managed_units` is non-empty it's returned verbatim (order preserved —
-/// eviction runs in this order). Otherwise a **one-element** list is synthesized
-/// from `ollama_unit` / `eager_ollama` with `vram_match = "ollama"` and
-/// `kind = "ollama"`, so an unconfigured daemon (or one still using only the old
-/// keys) evicts, attributes VRAM for, and introspects (`ollama ps`) Ollama
-/// exactly as it did before `managed_units` existed. This is the
-/// backward-compatibility contract.
-fn synthesize_units(
-    ollama_unit: &str,
-    eager_ollama: bool,
-    managed_units: &[ManagedUnit],
-) -> Vec<ManagedUnit> {
-    if managed_units.is_empty() {
-        vec![ManagedUnit {
-            unit: ollama_unit.to_string(),
-            eager_restart: eager_ollama,
-            // Legacy synthesized unit: the default tier, and no busy probe. It
-            // is a preemption target (a game evicts it) but never a source,
-            // which is exactly the pre-priorities behavior.
-            priority: DEFAULT_UNIT_PRIORITY,
-            busy_cmd: None,
-            yield_cmd: None,
-            resume_cmd: None,
-            yield_timeout_s: None,
-            vram_match: Some("ollama".to_string()),
-            kind: Some("ollama".to_string()),
-            introspect_cmd: None,
-            // Legacy synthesized unit is always systemd-driven (no overrides).
-            stop_cmd: None,
-            start_cmd: None,
-            is_active_cmd: None,
-            kill_cmd: None,
-        }]
-    } else {
-        managed_units.to_vec()
-    }
+/// serde default for [`Config::managed_units`]: a single Ollama entry,
+/// systemd-driven, at the default priority with no busy probe (a preemption
+/// target only, never a source). Used only when the key is absent from the
+/// config file — an explicit `managed_units = []` stays empty.
+fn default_managed_units() -> Vec<ManagedUnit> {
+    vec![ManagedUnit {
+        unit: "ollama.service".to_string(),
+        eager_restart: true,
+        priority: DEFAULT_UNIT_PRIORITY,
+        busy_cmd: None,
+        yield_cmd: None,
+        resume_cmd: None,
+        yield_timeout_s: None,
+        vram_match: Some("ollama".to_string()),
+        kind: Some("ollama".to_string()),
+        introspect_cmd: None,
+        stop_cmd: None,
+        start_cmd: None,
+        is_active_cmd: None,
+        kill_cmd: None,
+    }]
 }
 
 impl Config {
     /// The ordered list of managed units the daemon actually drives — the single
     /// source of truth for eviction/restart and `/status`.
-    ///
-    /// Borrowed, not cloned: [`Config::units`] is computed once at load time (see
-    /// [`Config::from_toml`]), so a reconcile pass or an HTTP request calling this
-    /// several times per pass/request costs nothing beyond the initial synthesis.
     #[must_use]
     pub fn resolved_units(&self) -> &[ManagedUnit] {
-        &self.units
+        &self.managed_units
     }
 
     /// Parse a [`Config`] from a TOML string. Pure — unit-tested on macOS.
-    ///
-    /// Normalizes [`Config::units`] immediately after deserializing (see
-    /// [`synthesize_units`]) so every other constructor of a live `Config`
-    /// (`load`, `Default`) produces a consistently-resolved unit list.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] if `s` isn't valid TOML, or a known field has
     /// the wrong type, or an unknown key is present (`deny_unknown_fields`).
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
-        let mut cfg: Config = toml::from_str(s)?;
-        cfg.units = synthesize_units(&cfg.ollama_unit, cfg.eager_ollama, &cfg.managed_units);
+        let cfg: Config = toml::from_str(s)?;
         Ok(cfg)
     }
 
@@ -742,14 +689,14 @@ mod tests {
         let c = Config::from_toml(
             "
             port = 9000
-            eager_ollama = false
+            detect_steam = false
             ",
         )
         .unwrap();
         assert_eq!(c.port, 9000);
-        assert!(!c.eager_ollama);
-        // Unspecified keys keep defaults.
-        assert_eq!(c.ollama_unit, "ollama.service");
+        assert!(!c.detect_steam);
+        // Unspecified keys keep defaults, including the default managed_units.
+        assert_eq!(c.resolved_units()[0].unit, "ollama.service");
         assert_eq!(c.reconcile_interval_s, 30);
     }
 
@@ -821,18 +768,17 @@ mod tests {
 
     #[test]
     fn units_toml_key_is_rejected_not_silently_accepted() {
-        // Config::units is `#[serde(skip)]` (computed, never read from the file) —
-        // a config that tries to set it directly must be a typed error, not
-        // silently ignored (which was the pre-deny_unknown_fields behavior).
+        // There is no top-level `units` key — a config that tries to set it
+        // directly must be a typed error, not silently ignored.
         let err = Config::from_toml("units = []").unwrap_err();
         assert!(matches!(err, ConfigError::Parse(_)));
     }
 
     #[test]
-    fn resolved_units_legacy_fallback_synthesizes_single_entry() {
-        // No `managed_units` → the legacy single-Ollama-unit behavior: exactly one
-        // entry, carrying the legacy `ollama_unit` / `eager_ollama` values and the
-        // implicit `vram_match = "ollama"` so /status attribution is unchanged.
+    fn resolved_units_default_synthesizes_single_ollama_entry() {
+        // No `managed_units` key → the zero-config default: exactly one entry
+        // for `ollama.service`, eager-restarted, with `vram_match = "ollama"`
+        // so /status attribution works out of the box.
         let c = Config::default();
         let units = c.resolved_units();
         assert_eq!(units.len(), 1);
@@ -842,19 +788,19 @@ mod tests {
     }
 
     #[test]
-    fn resolved_units_legacy_fields_carry_through() {
-        // The old keys still steer the synthesized entry.
+    fn explicit_managed_units_overrides_the_default() {
+        // Any explicit `managed_units` list replaces the default Ollama entry
+        // outright — nothing is appended alongside it.
         let c = Config::from_toml(
             r#"
-            ollama_unit = "custom-llm.service"
-            eager_ollama = false
+            [[managed_units]]
+            unit = "only.service"
             "#,
         )
         .unwrap();
         let units = c.resolved_units();
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].unit, "custom-llm.service");
-        assert!(!units[0].eager_restart);
+        assert_eq!(units[0].unit, "only.service");
     }
 
     #[test]
@@ -891,23 +837,6 @@ mod tests {
         assert_eq!(units[0].vram_match.as_deref(), Some("ollama"));
         assert_eq!(units[1].vram_match.as_deref(), Some("vllm"));
         assert_eq!(units[2].vram_match, None);
-    }
-
-    #[test]
-    fn managed_units_take_precedence_over_legacy_fields() {
-        // When both are present, `managed_units` wins — the legacy fields are
-        // ignored (no implicit Ollama entry is appended).
-        let c = Config::from_toml(
-            r#"
-            ollama_unit = "ignored.service"
-            [[managed_units]]
-            unit = "only.service"
-            "#,
-        )
-        .unwrap();
-        let units = c.resolved_units();
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].unit, "only.service");
     }
 
     #[test]
@@ -1078,8 +1007,6 @@ mod tests {
 # can't break out of its TOML string and inject arbitrary config.
 enabled = true
 port = 48750
-ollama_unit = "ollama.service"
-eager_ollama = true
 eviction_timeout_s = 5
 vram_free_threshold_mb = 2000
 reconcile_interval_s = 30
@@ -1087,8 +1014,7 @@ reconcile_interval_s = 30
 # --- detection ---
 detect_steam = true
 
-# Multi-tenant eviction (v0.3.0+). When this list is present it TAKES PRECEDENCE
-# over the legacy ollama_unit/eager_ollama keys above. Eviction runs in order.
+# Ordered eviction list. Eviction runs in array order.
 [[managed_units]]
 unit = "ollama.service"
 eager_restart = true
@@ -1115,8 +1041,6 @@ match = "Has\"Quote\\Back"
         // daemon) fails loudly here too.
         assert!(c.enabled);
         assert_eq!(c.port, 48750);
-        assert_eq!(c.ollama_unit, "ollama.service");
-        assert!(c.eager_ollama);
         assert_eq!(c.eviction_timeout_s, 5);
         assert_eq!(c.vram_free_threshold_mb, 2000);
         assert_eq!(c.reconcile_interval_s, 30);
@@ -1166,14 +1090,11 @@ match = "Has\"Quote\\Back"
 # can't break out of its TOML string and inject arbitrary config.
 enabled = true
 port = 48750
-ollama_unit = "ollama.service"
-eager_ollama = true
 eviction_timeout_s = 5
 vram_free_threshold_mb = 2000
 reconcile_interval_s = 30
 
-# Multi-tenant eviction (v0.3.0+). When this list is present it TAKES PRECEDENCE
-# over the legacy ollama_unit/eager_ollama keys above. Eviction runs in order.
+# Ordered eviction list. Eviction runs in array order.
 [[managed_units]]
 unit = "ollama.service"
 eager_restart = true

@@ -37,8 +37,7 @@ touching systemd).
 .B port
 Integer (u16). Default
 .BR 48750 .
-HTTP listen port for the read\-only surface (and the deprecated TCP write
-routes), bound to
+HTTP listen port for the read\-only surface, bound to
 .BR bind .
 .TP
 .B bind
@@ -54,8 +53,8 @@ and firewall the port yourself if you do.
 String (filesystem path). Default
 .BR """/run/gpu-arbiter/gpu-arbiter.sock""" .
 Path to the unix control socket serving the write path
-.RB ( "POST /units/{unit}/start|stop" ", " /ollama/start|stop ),
-created mode 0600, root\-owned \(em the sanctioned control surface (local root
+.RB ( "POST /units/{unit}/start|stop" ),
+created mode 0600, root\-owned \(em the only control surface (local root
 only, no bearer tokens). The parent directory is created if missing at mode
 0700, root\-owned, and is itself part of the auth boundary, not just the
 socket file's own mode: it closes the brief window between the socket file
@@ -71,35 +70,19 @@ is fatal at startup \(em the daemon exits nonzero so the service manager
 surfaces and retries it, instead of half\-running without a control surface.
 An
 .B empty string
-disables the unix socket entirely (the write path is then reachable only via
-the deprecated, loopback\-gated TCP routes on
-.BR port ).
+disables the unix socket entirely, leaving no write path at all.
 .TP
 .B managed_units
-Array of tables. Default: synthesized from
-.B ollama_unit
-/
-.B eager_ollama
-(a single entry). The ordered list of systemd units the arbiter evicts from the
-GPU on a game launch and restores when gaming ends; eviction runs in array
-order. See
+Array of tables. Default: a single entry \(em
+.BR "unit = ""ollama.service""" ,
+.BR "eager_restart = true" ,
+.BR "vram_match = ""ollama""" ,
+.BR "kind = ""ollama""" .
+The ordered list of systemd units the arbiter evicts from the GPU on a game
+launch and restores when gaming ends; eviction runs in array order. An
+explicit empty array disables eviction entirely. See
 .B MANAGED UNIT FIELDS
 below.
-.TP
-.B ollama_unit
-String. Default
-.BR """ollama.service""" .
-.B Legacy
-single managed unit, used only when
-.B managed_units
-is unset (then synthesized into a one\-element list with
-.BR "vram_match = ""ollama""" " and " "kind = ""ollama""" ).
-.TP
-.B eager_ollama
-Boolean. Default
-.BR true .
-.B Legacy
-restart\-on\-gaming\-end toggle for the synthesized single unit.
 .TP
 .B eviction_timeout_s
 Integer (seconds). Default

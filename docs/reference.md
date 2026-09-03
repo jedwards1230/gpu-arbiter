@@ -16,32 +16,24 @@ The read-only surface (`/status`, `/metrics`, `/healthz`) is a single TCP port
 LAN address to let other hosts read it, and firewall the port yourself if you
 do.
 
-The **write** path (`POST /units/{unit}/start|stop`, `/ollama/*`) is served
-twice: on a **unix control socket** (`socket_path`, default
-`/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned, inside a
-mode-`0700` root-owned parent directory) — the sanctioned surface,
-local-root-only, no bearer tokens — and, **deprecated**, on the same TCP port
-(loopback-only) for back-compat with the tray and any existing scripts. Both
-transports validate `{unit}` against `managed_units` before touching
-`systemctl`.
+The **write** path (`POST /units/{unit}/start|stop`) is a **unix control
+socket only** (`socket_path`, default `/run/gpu-arbiter/gpu-arbiter.sock`,
+mode `0600` root-owned, inside a mode-`0700` root-owned parent directory) —
+local-root-only, no bearer tokens. It validates `{unit}` against
+`managed_units` before touching `systemctl`.
 
 > **Windows:** there is no unix-socket listener — `http::bind_uds` and
 > `serve_uds_on` are `cfg(unix)` with no counterpart, and `socket_path` is
 > ignored (with a warning, so a `socket_path` copied from a Linux config isn't
-> silently dropped). The **only** write path there is the TCP surface, which
-> has no peer-credential check — the loopback default on `bind` is what
-> mitigates that, so don't widen it on Windows. A named-pipe listener that
-> restores parity is planned.
+> silently dropped). That leaves **no write path at all** on Windows — manual
+> start/stop overrides are Linux-only until a named-pipe listener lands.
 
 | Method | Path | Transport | Purpose |
 |---|---|---|---|
 | GET | `/status` | TCP | Full state snapshot (below) |
 | GET | `/metrics` | TCP | Prometheus text-format exposition (below) |
 | GET | `/healthz` | TCP | Liveness |
-| POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket | Manual override — the sanctioned write path |
-| POST | `/ollama/start`, `/ollama/stop` | unix socket | Back-compat alias for the first managed unit |
-| POST | `/units/{unit}/start`, `/units/{unit}/stop` | TCP, localhost | **Deprecated** — same alias, kept for back-compat |
-| POST | `/ollama/start`, `/ollama/stop` | TCP, localhost | **Deprecated** alias |
+| POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket | Manual override — the only write path |
 
 State is fully **auto** — derived from observed reality; there is no manual
 override of `state` itself. The `{unit}` must be one of the configured
@@ -68,7 +60,6 @@ curl --unix-socket /run/gpu-arbiter/gpu-arbiter.sock -X POST http://localhost/un
     { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false },
     { "unit": "vllm.service", "running": null, "models": [], "held": true }
   ],
-  "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false },
   "gpu_vram_used_mb": 21500,
   "gpu_vram_total_mb": 32768,
   "since": "2026-06-07T20:00:00Z",
@@ -79,11 +70,9 @@ curl --unix-socket /run/gpu-arbiter/gpu-arbiter.sock -X POST http://localhost/un
 }
 ```
 
-`units` is the per-managed-unit array, in eviction order. `ollama` is a
-**back-compat alias** mirroring the Ollama unit (or the first managed unit if
-none is named `ollama`), so consumers written against the old singular block keep
-working. `state` is `gaming` | `available` | `evicting` (the transient kill
-window — remote consumers treat `evicting` as busy).
+`units` is the per-managed-unit array, in eviction order. `state` is
+`gaming` | `available` | `evicting` (the transient kill window — remote
+consumers treat `evicting` as busy).
 
 Per-unit `running` is a **tristate**: `true`/`false` are confirmed
 running/stopped, and `null` means the daemon's `is-active` check itself failed
@@ -93,12 +82,6 @@ unit and it hasn't been manually started again (see below). Top-level
 `degraded` is `true` when the most recent eviction had at least one unit fail
 to evict — gaming still won the GPU unconditionally, but a tenant may still be
 holding VRAM.
-
-**Wire note:** `running` is a JSON-visible type change from a plain boolean —
-a consumer that deserializes `/status` into a strict `bool` field (rather than
-`Option<bool>`/`bool | null`) will fail to parse on a `null`. This is rare in
-practice (it only happens when `is-active` itself can't be run), but a
-strict-typed client should be updated to expect it.
 
 ### Manual start/stop and holds
 
@@ -264,11 +247,9 @@ yields the defaults below.
 |---|---|---|
 | `enabled` | `true` | Master enable |
 | `port` | `48750` | HTTP listen port |
-| `bind` | `"127.0.0.1"` | TCP bind address for the read-only surface + deprecated TCP write routes; loopback by default — set to a LAN address (and firewall it yourself) to allow remote reads |
+| `bind` | `"127.0.0.1"` | TCP bind address for the read-only surface; loopback by default — set to a LAN address (and firewall it yourself) to allow remote reads |
 | `socket_path` | `"/run/gpu-arbiter/gpu-arbiter.sock"` | Unix control socket path for the write path (mode `0600`, root-owned, inside a mode-`0700` root-owned parent directory); empty string disables it |
-| `managed_units` | _(synthesized from `ollama_unit`)_ | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
-| `ollama_unit` | `"ollama.service"` | **Legacy** single managed unit (used when `managed_units` is unset) |
-| `eager_ollama` | `true` | **Legacy** restart-on-gaming-end for the single unit |
+| `managed_units` | one Ollama entry | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
 | `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation |
 | `yield_timeout_s` | `3` | Default cooperative-release budget, for units that set `yield_cmd` but no per-unit `yield_timeout_s` (see [Priority ladder](#priority-ladder-and-cooperative-eviction)) |
 | `game_priority` | `100` | The priority a detected **game** claims at. Above every tenant's default (`50`), which is what makes gaming preempt everything |
@@ -305,10 +286,11 @@ gaming ends. Each entry:
 | `is_active_cmd` | _(none)_ | Override: command whose **exit 0 = running** (`None` → `systemctl is-active`) |
 | `kill_cmd` | _(none)_ | Override: SIGKILL-escalation command (`None` → re-run `stop_cmd`) |
 
-If `managed_units` is omitted, a single entry is synthesized from the legacy
-`ollama_unit` / `eager_ollama` fields (with `vram_match = "ollama"` and
-`kind = "ollama"`), so an unconfigured daemon behaves exactly as before —
-including `ollama ps` model introspection.
+If `managed_units` is omitted entirely, it defaults to a single entry —
+`unit = "ollama.service"`, `eager_restart = true`, `vram_match = "ollama"`,
+`kind = "ollama"` — so an unconfigured daemon evicts Ollama, attributes its
+VRAM, and introspects its loaded models (`ollama ps`) with zero setup. An
+explicit `managed_units = []` disables eviction entirely.
 
 ### Priority ladder and cooperative eviction
 

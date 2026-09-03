@@ -47,8 +47,8 @@ pub mod units;
 // snapshot→claim-set logic is pure; the scan itself is Linux-gated internally.
 pub mod reconcile;
 
-// axum HTTP control surface: GET /status /healthz, POST /units/{unit}/* (and the
-// /ollama/* back-compat alias). Cross-platform (tokio/axum only).
+// axum HTTP control surface: GET /status /healthz, POST /units/{unit}/*.
+// Cross-platform (tokio/axum only).
 pub mod http;
 
 // cn_proc netlink listener (neli) → debounced reconcile trigger. Linux-only:

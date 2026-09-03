@@ -459,20 +459,18 @@ mod daemon {
             }
         });
 
-        // 6b. Unix control socket: the sanctioned write path — local root
-        // only, file-permission-gated (mode 0600 file, mode 0700 parent
-        // directory), no bearer tokens. Serves ONLY `/units/*` +
-        // `/ollama/*`; the read-only surface above stays TCP.
-        // `socket_path = ""` opts out entirely.
+        // 6b. Unix control socket: the only write path — local root only,
+        // file-permission-gated (mode 0600 file, mode 0700 parent
+        // directory), no bearer tokens. Serves ONLY `/units/*`; the
+        // read-only surface above stays TCP. `socket_path = ""` opts out
+        // entirely.
         //
         // Windows has no unix-socket listener at all (`http::bind_uds` and
         // `serve_uds_on` are `#[cfg(unix)]` with no counterpart), so the whole
         // block is unix-gated and `socket_path` defaults to empty there. That
-        // is a real, deliberate security downgrade to name: on Windows the
-        // only write path is the TCP surface, which has no peer-credential
-        // check — the loopback default on `bind` is what mitigates that, so
-        // don't widen it on Windows without a named-pipe listener to replace
-        // this socket.
+        // means Windows has no write path at all — manual start/stop
+        // overrides are Linux-only until a named-pipe listener replaces this
+        // socket there.
         #[cfg(unix)]
         let socket_handle = if cfg.socket_path.is_empty() {
             tracing::info!("unix control socket disabled (socket_path is empty)");

@@ -16,8 +16,8 @@
 # cleanly (a quick disable without touching systemd).
 #enabled = true
 
-# HTTP listen port for the read-only surface (/status /metrics /healthz) and
-# the deprecated TCP write routes, bound to `bind`.
+# HTTP listen port for the read-only surface (/status /metrics /healthz),
+# bound to `bind`.
 #port = 48750
 
 # TCP bind address for the HTTP control surface. Loopback-only by default;
@@ -25,13 +25,12 @@
 # and firewall the port yourself if you do.
 #bind = "127.0.0.1"
 
-# Unix control socket serving the write path (POST /units/{unit}/start|stop,
-# /ollama/start|stop) — the sanctioned control surface: local root only, no
-# bearer tokens, mode 0600 root-owned, inside a mode 0700 root-owned parent
-# directory (the parent directory is itself part of the auth boundary — it
-# closes the bind-then-chmod permission window; see gpu-arbiter-config(5)).
-# An empty string disables the socket entirely, leaving only the deprecated,
-# loopback-gated TCP write routes on `port`.
+# Unix control socket serving the write path (POST /units/{unit}/start|stop)
+# — the only control surface: local root only, no bearer tokens, mode 0600
+# root-owned, inside a mode 0700 root-owned parent directory (the parent
+# directory is itself part of the auth boundary — it closes the
+# bind-then-chmod permission window; see gpu-arbiter-config(5)). An empty
+# string disables the socket entirely, leaving no write path at all.
 #socket_path = "/run/gpu-arbiter/gpu-arbiter.sock"
 
 # Seconds to wait for a graceful tenant teardown (VRAM dropping below
@@ -104,11 +103,10 @@
 # (each runs the same stop → poll-VRAM-free → SIGKILL loop, in order) and
 # restores when gaming ends.
 #
-# If `managed_units` is omitted entirely, a single Ollama entry is synthesized
-# from the legacy `ollama_unit` / `eager_ollama` keys (default
-# "ollama.service", eager_restart = true, vram_match = "ollama",
-# kind = "ollama"), so an unconfigured daemon evicts Ollama — and reports its
-# loaded models via `ollama ps` — exactly as before.
+# If `managed_units` is omitted entirely, it defaults to a single entry —
+# unit = "ollama.service", eager_restart = true, vram_match = "ollama",
+# kind = "ollama" — so an unconfigured daemon evicts Ollama and reports its
+# loaded models via `ollama ps` with zero setup.
 #
 # Tenant 1 — Ollama, driven by systemd (the default supervisor). VRAM
 # attribution for a systemd unit is automatic via cgroup PID resolution — no
