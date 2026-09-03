@@ -110,8 +110,8 @@
 #
 # Tenant 1 — Ollama, driven by systemd (the default supervisor). VRAM
 # attribution for a systemd unit is automatic via cgroup PID resolution — no
-# vram_match needed; it's set below only to keep working on the (rare) VRAM
-# heuristic / legacy fallback paths where cgroup data isn't available.
+# vram_match needed; it's set below only as the fallback for command-driven
+# units and non-systemd hosts, where cgroup attribution doesn't apply.
 #[[managed_units]]
 #unit = "ollama.service"        # systemd unit the daemon exclusively owns
 #eager_restart = true           # restart this unit when gaming ends
@@ -128,44 +128,15 @@
 
 # --- the priority ladder & cooperative eviction -------------------------------
 #
-# Gaming-beats-everything is the floor, not the whole model. Tenants also rank
-# against EACH OTHER, and a tenant that supports it can be asked to let go of
-# the GPU without being killed.
-#
-# `priority` (default 50) is the tier. A demand at priority P preempts every
-# unit with priority < P and leaves everything at >= P alone. The comparison is
-# strict, so equal tiers coexist rather than fight — which is why a config that
-# never mentions priorities behaves exactly as it did before the ladder existed.
-#
-# A unit only PREEMPTS a lower tier when its `busy_cmd` exits 0 ("I have work
-# right now"). With no busy_cmd a unit is a preemption target only, never a
-# source — the right default, since a merely-running server holding an idle
-# model should not evict anything. The probe runs on EVERY reconcile pass, so it
-# must be cheap and non-blocking; one that fails to spawn, times out, or exits
-# non-zero reads as NOT busy, so a broken probe can't evict on a false pretext.
-#
-# `yield_cmd` adds a cooperative stage before the stop path: ask the tenant to
-# drop the GPU while staying alive (for a PyTorch service, typically
-# `model.cpu()` + `torch.cuda.empty_cache()`), then poll `busy_cmd` until it
-# reports not busy. Exit 0 from yield_cmd means "request accepted", NOT "the GPU
-# is free" — which is why release is confirmed by polling rather than trusted.
-# On success the unit is never stopped: no in-flight work lost, no cold model
-# reload after. On timeout or failure it falls through to the ordinary
-# stop → poll-VRAM → SIGKILL path, so a tenant that ignores the request can
-# never hold the GPU against a higher tier.
-#
-# !! yield_cmd WITHOUT busy_cmd DOES NOTHING. Release would be unobservable, so
-# !! the daemon logs a warning, skips the yield stage entirely, and stops the
-# !! unit. Always configure the two together.
-#
-# `resume_cmd` is the undo, run on the restore path before any start. It MUST be
-# idempotent: the daemon deliberately does not track whether a unit was yielded
-# or stopped (that state would have to survive a daemon restart to be
-# trustworthy), so it runs resume unconditionally.
-#
-# Tune both budgets from the gpu_arbiter_eviction_duration_seconds{stage=...}
-# histogram — the yield/stop split is what shows whether the cooperative stage
-# is paying for itself or just adding latency ahead of an inevitable stop.
+# `priority` (default 50) sets a tenant's tier; a demand at P preempts every
+# unit with priority < P. `busy_cmd` (exit 0 = busy) is required for a unit to
+# preempt anything — without it, a unit can only be preempted, never preempt.
+# `yield_cmd`/`resume_cmd` add a cooperative release stage ahead of the stop
+# path: the daemon asks the tenant to drop the GPU while staying alive, then
+# polls busy_cmd until it agrees the GPU is free. yield_cmd is ignored unless
+# busy_cmd is also set. Tune both budgets from
+# gpu_arbiter_eviction_duration_seconds{stage=...}. Full treatment:
+# docs/reference.md#priority-ladder-and-cooperative-eviction.
 #[[managed_units]]
 #unit = "asr.service"
 #priority = 25                                  # below the default 50: yields to other tenants

@@ -40,7 +40,7 @@ override of `state` itself. The `{unit}` must be one of the configured
 `managed_units`; an unknown unit is rejected with `404`, so the endpoint can't
 drive arbitrary systemd units. A manual start/stop is handled by the same
 reconcile task that drives automatic eviction/restart (never a directly-racing
-HTTP handler), and `POST /units/{unit}/stop` now **holds** the unit down —
+HTTP handler), and `POST /units/{unit}/stop` **holds** the unit down —
 see [Manual start/stop and holds](#manual-startstop-and-holds) below.
 
 Talk to the unix socket with any HTTP client that supports one, e.g.:
@@ -85,7 +85,7 @@ holding VRAM.
 
 ### Manual start/stop and holds
 
-`POST /units/{unit}/stop` now **holds** the unit down: without a hold, the
+`POST /units/{unit}/stop` **holds** the unit down: without a hold, the
 ensure-running self-heal step would restart the unit on the very next
 reconcile pass (even the periodic backstop timer), making a manual stop a
 self-reverting no-op. A held unit stays down across game launches/exits until
@@ -382,8 +382,8 @@ gating](#eviction-vram-gating)) is attributed via two channels, tried in order:
 1. **cgroup PID resolution** (primary, systemd units only, no config needed):
    every GPU compute process's `/proc/<pid>/cgroup` names the systemd unit
    that spawned it, regardless of what binary the unit actually execs. This
-   can't be fooled by a wrapper interpreter or launcher script — the historical
-   `vram_match` gap: an `asr-runner.service` unit's GPU process might be
+   can't be fooled by a wrapper interpreter or launcher script, unlike
+   `vram_match`: an `asr-runner.service` unit's GPU process might be
    `/opt/asr-runner/venv/bin/python` (the venv interpreter), so a name
    substring like `vram_match = "parakeet"` never matches even though the unit
    is definitely the one holding the GPU. Cgroup attribution sidesteps that
@@ -405,7 +405,7 @@ VRAM. This matters during a real game launch: the game is loading its own
 VRAM onto the GPU *concurrently* with the tenant's teardown, so gating on
 total usage rarely dropped below `vram_free_threshold_mb` before the timeout
 elapsed — eviction routinely escalated to SIGKILL even when the tenant itself
-released cleanly. Falls back to the legacy total-GPU-VRAM gate when
+released cleanly. Falls back to the total-GPU-VRAM gate when
 attribution isn't available this poll (an attribution-incapable backend —
 AMD, always — a failed compute-proc query, or a command-driven unit with no
 `vram_match`).

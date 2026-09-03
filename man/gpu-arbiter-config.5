@@ -191,9 +191,9 @@ and finally to NVIDIA if neither can be detected.
 and
 .B amd
 force the respective backend. On AMD there is no per\-process VRAM via sysfs, so
-the opt\-in VRAM heuristic and per\-unit
+per\-unit
 .I /status
-VRAM attribution degrade to empty (never an error); eviction itself is identical.
+VRAM attribution degrades to empty (never an error); eviction itself is identical.
 .TP
 .B presence_detection
 Boolean. Default
@@ -382,7 +382,7 @@ and parses its table for loaded model names. Any other non\-empty value reports
 .B no
 models and
 .B suppresses
-the name\-based back\-compat heuristic below: an explicit non\-Ollama
+the name\-based heuristic below: an explicit non\-Ollama
 .B kind
 is taken as "this tenant is not Ollama", so e.g.\&
 .B "kind = ""vllm"""
@@ -392,7 +392,7 @@ will
 .B not
 run
 .BR "ollama ps" .
-The back\-compat heuristic applies
+The name\-based heuristic applies
 .B only
 when
 .B kind
@@ -574,13 +574,14 @@ name contains
 .BR "ollama ps" ;
 otherwise report no models.
 .PP
-This preserves the original Ollama behavior as the default for an
-Ollama\-kinded or Ollama\-named unit (steps 2 and 4), while letting any other
-tenant report a model/process list via
+An Ollama\-kinded or Ollama\-named unit therefore introspects via
+.B "ollama ps"
+by default (steps 2 and 4), any other tenant can report its own model/process
+list via
 .B introspect_cmd
-(step 1) and letting an explicit non\-Ollama
+(step 1), and an explicit non\-Ollama
 .B kind
-opt out of Ollama introspection entirely (step 3).
+opts a unit out of Ollama introspection entirely (step 3).
 .SH EXAMPLES
 A two\-tenant config where Ollama and a vLLM server both yield to gaming, the
 vLLM server reporting its own loaded\-model list via an explicit command:
