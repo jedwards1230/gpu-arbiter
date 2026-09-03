@@ -842,24 +842,32 @@ async fn socket_is_live(path: &std::path::Path) -> bool {
 ///   fails with [`HttpError::SocketInUse`] rather than unlinking it if one
 ///   answers — a stale-looking socket file is not always actually stale.
 /// - Only once the probe clears: removes a stale socket file left by an
-///   unclean prior shutdown before binding (a leftover file makes `bind`
-///   fail with `AddrInUse`).
-/// - Sets the socket file mode to `0600` **after** binding (the mode a
-///   freshly-created unix socket gets is umask-dependent, so this pins it
-///   explicitly) — root-owned (the daemon runs as root), so this is
-///   *additional* hardening for the write path's auth boundary, not the
-///   whole of it (see the parent-directory note below).
+///   unclean prior shutdown before binding (a leftover file would otherwise
+///   block the no-replace move below with `AlreadyExists`).
+/// - Binds inside a fresh `0700` staging directory of its own — a sibling of
+///   `socket_path`, not the socket's eventual parent — chmods the socket to
+///   `0600`, then moves it onto `socket_path` with a rename that refuses to
+///   replace an existing destination. Binding directly under `socket_path`'s
+///   own parent, even under a temporary name, would let anyone who can
+///   already traverse that directory watch for the entry and connect during
+///   the umask-derived window before the chmod call narrows it; a directory
+///   this call alone creates, at `0700` from the moment it exists, has no
+///   such window regardless of the real parent's permissions. The
+///   no-replace move closes a second race: two `bind_uds` calls (a second
+///   gpu-arbiter instance racing startup) can each pass the live-probe and
+///   bind their own staging socket, but only one can win the move onto
+///   `socket_path` — the other gets [`HttpError::SocketInUse`] instead of
+///   silently overwriting the winner's socket.
+/// - If `socket_path`'s parent directory already existed and is wider than
+///   `0700` or not owned by this process, logs a warning naming the mode —
+///   informational, not fatal, since the staging directory above keeps the
+///   bind itself sound regardless of the parent's permissions.
 ///
-/// **The parent directory is part of the auth boundary, not just the
-/// post-bind `0600` file mode:** between `UnixListener::bind()` creating the
-/// socket file (with an umask-derived, potentially world-connectable mode)
-/// and the `set_permissions` call above pinning it to `0600`, the listener
-/// is already accepting connections. Creating the parent directory at mode
-/// `0700` (root-only traversal) closes that window structurally — no other
-/// user can resolve the socket path to attempt a connection during it,
-/// regardless of the file's own mode at any instant. The post-bind chmod is
-/// defense in depth for a `socket_path` pointed at a pre-existing, more
-/// permissive directory, not the sole defense.
+/// **The parent directory is still part of the intended auth boundary**,
+/// alongside the socket's own `0600` mode: creating it at `0700` (root-only
+/// traversal) means no other user can even resolve the socket path. That
+/// holds whenever this call creates it; the warning above covers the case
+/// where it doesn't.
 ///
 /// `#[cfg(unix)]`: `tokio::net::UnixListener`/`UnixStream`,
 /// `tokio::fs::DirBuilder::mode`, and the `0600`-mode step all need a unix
@@ -869,17 +877,18 @@ async fn socket_is_live(path: &std::path::Path) -> bool {
 /// # Errors
 ///
 /// Returns [`HttpError::SocketInUse`] if a live process is already listening
-/// at `socket_path`. Returns [`HttpError::Io`] if the parent directory can't
-/// be created at mode `0700`, a stale socket file can't be removed, binding
-/// the unix listener fails, or its mode can't be set to `0600`.
+/// at `socket_path`, or if the final move loses a race to another process
+/// that claimed `socket_path` first. Returns [`HttpError::Io`] if the parent
+/// directory can't be created at mode `0700`, a stale socket file can't be
+/// removed, the staging directory or its socket can't be created, the
+/// socket's mode can't be set to `0600`, or the move onto `socket_path`
+/// fails for any other reason.
 #[cfg(unix)]
 pub async fn bind_uds(socket_path: &str) -> Result<tokio::net::UnixListener, HttpError> {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = std::path::Path::new(socket_path);
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+
+    if let Some(parent) = parent {
         // `recursive(true)` covers a nested custom `socket_path` (matching the
         // old `create_dir_all` behavior) and is also what makes this a no-op
         // when systemd's `RuntimeDirectory=`/`RuntimeDirectoryMode=0700` (see
@@ -891,6 +900,7 @@ pub async fn bind_uds(socket_path: &str) -> Result<tokio::net::UnixListener, Htt
         builder.recursive(true);
         builder.mode(0o700);
         builder.create(parent).await?;
+        warn_if_uds_parent_dir_is_loose(parent).await;
     }
 
     if socket_is_live(path).await {
@@ -905,10 +915,137 @@ pub async fn bind_uds(socket_path: &str) -> Result<tokio::net::UnixListener, Htt
         Err(e) => return Err(e.into()),
     }
 
-    let listener = tokio::net::UnixListener::bind(path)?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-    tracing::info!(socket = socket_path, "unix control socket listening");
+    // A private staging directory, created fresh by this call, is what makes
+    // the bind itself sound regardless of the real parent's permissions —
+    // see the doc comment above. Clean it up (and whatever's left in it) on
+    // every path out, success or failure, so a half-finished attempt never
+    // leaves it behind.
+    let staging_dir = uds_staging_dir_path(parent.unwrap_or_else(|| std::path::Path::new(".")));
+    let mut staging_builder = tokio::fs::DirBuilder::new();
+    staging_builder.mode(0o700);
+    staging_builder.create(&staging_dir).await?;
+
+    let result = bind_uds_via_staging(&staging_dir, path).await;
+    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+    match result {
+        Ok(listener) => {
+            tracing::info!(socket = socket_path, "unix control socket listening");
+            Ok(listener)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(HttpError::SocketInUse {
+            path: socket_path.to_string(),
+        }),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The bind-in-staging-then-move sequence at the core of [`bind_uds`],
+/// factored out so the staging directory's cleanup (which must run whether
+/// this succeeds or fails) lives in exactly one place.
+#[cfg(unix)]
+async fn bind_uds_via_staging(
+    staging_dir: &std::path::Path,
+    final_path: &std::path::Path,
+) -> std::io::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp_path = staging_dir.join("gpu-arbiter.sock");
+    let listener = tokio::net::UnixListener::bind(&tmp_path)?;
+    tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await?;
+    rename_no_replace(&tmp_path, final_path)?;
     Ok(listener)
+}
+
+/// A unique staging-directory path for [`bind_uds`]'s bind-then-move
+/// sequence, as a sibling of `parent` (or the current directory, for a
+/// relative `socket_path` with no parent component) so the final move stays
+/// on one filesystem — required for both `rename`'s atomicity and
+/// [`rename_no_replace`]'s no-replace guarantee. The counter, not just the
+/// PID, keeps concurrent binds within the same process — as `cargo test`
+/// runs them — from colliding on the same staging name.
+#[cfg(unix)]
+fn uds_staging_dir_path(parent: &std::path::Path) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    parent.join(format!(".gpu-arbiter-bind-{}-{n}", std::process::id()))
+}
+
+/// Logs a warning if [`bind_uds`]'s control-socket parent directory is wider
+/// than `0700` or not owned by this process. Purely informational — the
+/// staging-directory bind keeps the socket itself unreachable through the
+/// parent either way — but a loose parent still means another local user
+/// can at least confirm the socket's presence, so it's worth surfacing.
+#[cfg(unix)]
+async fn warn_if_uds_parent_dir_is_loose(parent: &std::path::Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(meta) = tokio::fs::metadata(parent).await else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    // SAFETY: geteuid(2) takes no arguments and always succeeds.
+    let our_uid = unsafe { libc::geteuid() };
+    if mode & 0o077 != 0 || meta.uid() != our_uid {
+        tracing::warn!(
+            dir = %parent.display(),
+            mode = format!("{mode:03o}"),
+            owner_uid = meta.uid(),
+            "control socket parent directory is wider than 0700 or not owned by this process"
+        );
+    }
+}
+
+/// Moves `from` onto `to`, refusing to replace an existing destination —
+/// the primitive that lets [`bind_uds`] give two racing daemons a definite
+/// winner instead of letting the second one silently steal the first one's
+/// socket via an ordinary `rename`, which overwrites on Unix. Both paths
+/// must be on the same filesystem (same requirement as `rename(2)`).
+///
+/// Fails with [`std::io::ErrorKind::AlreadyExists`] if `to` already exists.
+#[cfg(target_os = "linux")]
+fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let to_invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
+    let from = CString::new(from.as_os_str().as_bytes()).map_err(|_| to_invalid())?;
+    let to = CString::new(to.as_os_str().as_bytes()).map_err(|_| to_invalid())?;
+    // musl's libc.so doesn't export a `renameat2` symbol (glibc does), so the
+    // static musl release build fails to link against `libc::renameat2`
+    // directly. The syscall itself exists on any Linux kernel new enough to
+    // support `RENAME_NOREPLACE` regardless of libc — going through
+    // `libc::syscall`/`SYS_renameat2` sidesteps the missing wrapper on both
+    // targets.
+    //
+    // SAFETY: `from`/`to` are valid, NUL-terminated C strings kept alive for
+    // the duration of the call. `AT_FDCWD` resolves both relative to the
+    // current working directory, matching `std::fs::rename`'s behavior. The
+    // five arguments match `renameat2(2)`'s signature exactly.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Non-Linux unix fallback: no `renameat2` here, but `hard_link` gives the
+/// same no-replace guarantee — it fails with `AlreadyExists` if `to` already
+/// exists — and is equally atomic. The temporary name is then unlinked,
+/// leaving the original inode serving the already-bound listener at `to`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    std::fs::remove_file(from)
 }
 
 /// Serve [`write_router`] (the manual start/stop write path) on an
@@ -1828,33 +1965,24 @@ mod tests {
         });
 
         // Poll for the socket file to appear rather than a fixed sleep — bind
-        // + chmod is fast, but not instant, and a fixed sleep would either
-        // flake under load or waste time in the common case.
+        // + chmod + move is fast, but not instant, and a fixed sleep would
+        // either flake under load or waste time in the common case.
+        //
+        // `bind_uds` binds its listener inside a private 0700 staging
+        // directory, chmods it to 0600 there, then moves it onto
+        // `socket_path` with a no-replace rename. So unlike a
+        // bind-then-chmod-in-place sequence, the file is never observable at
+        // `socket_path` at any mode other than 0600: assert that on first
+        // sight instead of looping for the mode to settle.
         let socket_file = dir.join("gpu-arbiter.sock");
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-
-        // Wait for the socket to reach its FINAL mode, not merely to exist.
-        //
-        // `bind_uds` binds first and narrows the permissions immediately after,
-        // so the file is briefly whatever the umask allows (0755 under the
-        // common 022) before becoming 0600. Waiting on `exists()` alone and
-        // then asserting the mode races that window — rarely, and only under a
-        // loaded parallel run, which is the worst kind of flake to debug.
-        //
-        // This asserts the intended end state instead. It does NOT paper over
-        // the window: that window is real in production too, and is tracked
-        // separately — here the parent directory is 0700, so nothing can
-        // traverse in to exploit it.
         let socket_mode = loop {
-            let mode = std::fs::metadata(&socket_file)
-                .map(|m| m.permissions().mode() & 0o777)
-                .ok();
-            if mode == Some(0o600) {
-                break 0o600;
+            if let Ok(meta) = std::fs::metadata(&socket_file) {
+                break meta.permissions().mode() & 0o777;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "socket file never reached mode 0600 within 5s (last saw {mode:?})"
+                "serve_uds never created the socket file within 5s"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
@@ -1864,8 +1992,22 @@ mod tests {
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700, "parent directory must be mode 0700");
 
-        // The socket file itself: still pinned to 0600 (belt-and-braces).
-        assert_eq!(socket_mode, 0o600, "socket file must be mode 0600");
+        assert_eq!(
+            socket_mode, 0o600,
+            "socket file must be mode 0600 the first time it is observable at its final path"
+        );
+
+        // No staging directory should be left behind in the parent either.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "gpu-arbiter.sock")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging directory left behind in socket dir: {leftovers:?}"
+        );
 
         handle.abort();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2043,6 +2185,70 @@ mod tests {
             }
         };
         drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── no-replace move ──────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_no_replace_refuses_to_overwrite_an_existing_destination() {
+        let dir = short_unique_socket_dir("no-replace-unit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let from = dir.join("from");
+        let to = dir.join("to");
+        std::fs::write(&from, b"source").unwrap();
+        std::fs::write(&to, b"already here").unwrap();
+
+        let err = rename_no_replace(&from, &to).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // Neither side of a refused move should be touched.
+        assert_eq!(std::fs::read(&from).unwrap(), b"source");
+        assert_eq!(std::fs::read(&to).unwrap(), b"already here");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_uds_two_racing_binds_at_the_same_path_yield_exactly_one_winner() {
+        // Regression coverage for the ordinary-`rename`-overwrites race: two
+        // `bind_uds` calls targeting the same final path, running
+        // concurrently so both pass the live-probe (neither socket exists
+        // yet), must still leave exactly one of them holding the socket at
+        // `socket_path` — the loser gets `SocketInUse` from the no-replace
+        // move rather than silently replacing the winner.
+        let dir = short_unique_socket_dir("race");
+        let _ = std::fs::remove_dir_all(&dir);
+        let socket_path = dir.join("gpu-arbiter.sock").to_string_lossy().into_owned();
+
+        let a = socket_path.clone();
+        let b = socket_path.clone();
+        let (ra, rb) = tokio::join!(bind_uds(&a), bind_uds(&b));
+
+        let outcomes: Vec<&str> = [&ra, &rb]
+            .iter()
+            .map(|r| match r {
+                Ok(_) => "ok",
+                Err(HttpError::SocketInUse { .. }) => "in_use",
+                Err(HttpError::Io(_)) => "io_error",
+            })
+            .collect();
+        assert_eq!(
+            outcomes.iter().filter(|o| **o == "ok").count(),
+            1,
+            "expected exactly one winner: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes.iter().filter(|o| **o == "in_use").count(),
+            1,
+            "expected the loser to see SocketInUse: {outcomes:?}"
+        );
+
+        drop(ra);
+        drop(rb);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

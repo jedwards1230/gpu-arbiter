@@ -208,6 +208,7 @@ daemon itself refuses to start (see [Design notes](#design-notes) for why).
 | [`man/gpu-arbiter.8`](man/gpu-arbiter.8) | Daemon usage, eviction model, control surface, signals |
 | [`man/gpu-arbiter-config.5`](man/gpu-arbiter-config.5) | Config file reference |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, CI checks, release process |
+| [SECURITY.md](SECURITY.md) | Supported versions, vulnerability reporting, security scope |
 
 ## License
 
