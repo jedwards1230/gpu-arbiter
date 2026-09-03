@@ -2078,8 +2078,8 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
 
     #[test]
     fn check_config_warns_on_yield_without_busy() {
-        // The same misconfiguration, caught at deploy time by the Ansible role's
-        // validate step instead of only at the next eviction.
+        // The same misconfiguration, caught by `--check-config` at deploy
+        // time instead of only at the next eviction.
         let dir = std::env::temp_dir().join(format!(
             "ga-yieldcheck-{}-{}",
             std::process::id(),

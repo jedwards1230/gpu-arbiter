@@ -12,8 +12,9 @@ For the overview, install instructions, and design notes, see the
 
 The read-only surface (`/status`, `/metrics`, `/healthz`) is a single TCP port
 (default `48750`, bind address configurable via `bind` — see
-[Configuration](#configuration)), LAN-restricted by a firewalld rich rule (the
-configurable bind is defense-in-depth *on top of*, not instead of, that rule).
+[Configuration](#configuration)), loopback-only by default. Set `bind` to a
+LAN address to let other hosts read it, and firewall the port yourself if you
+do.
 
 The **write** path (`POST /units/{unit}/start|stop`, `/ollama/*`) is served
 twice: on a **unix control socket** (`socket_path`, default
@@ -27,15 +28,16 @@ transports validate `{unit}` against `managed_units` before touching
 > **Windows:** there is no unix-socket listener — `http::bind_uds` and
 > `serve_uds_on` are `cfg(unix)` with no counterpart, and `socket_path` is
 > ignored (with a warning, so a `socket_path` copied from a Linux config isn't
-> silently dropped). The **only** write path there is the TCP surface, which has
-> no peer-credential check, so `bind` must be scoped by firewall rule rather
-> than left open. A named-pipe listener that restores parity is planned.
+> silently dropped). The **only** write path there is the TCP surface, which
+> has no peer-credential check — the loopback default on `bind` is what
+> mitigates that, so don't widen it on Windows. A named-pipe listener that
+> restores parity is planned.
 
 | Method | Path | Transport | Purpose |
 |---|---|---|---|
-| GET | `/status` | TCP (LAN) | Full state snapshot (below) |
-| GET | `/metrics` | TCP (LAN) | Prometheus text-format exposition (below) |
-| GET | `/healthz` | TCP (LAN) | Liveness |
+| GET | `/status` | TCP | Full state snapshot (below) |
+| GET | `/metrics` | TCP | Prometheus text-format exposition (below) |
+| GET | `/healthz` | TCP | Liveness |
 | POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket | Manual override — the sanctioned write path |
 | POST | `/ollama/start`, `/ollama/stop` | unix socket | Back-compat alias for the first managed unit |
 | POST | `/units/{unit}/start`, `/units/{unit}/stop` | TCP, localhost | **Deprecated** — same alias, kept for back-compat |
@@ -254,16 +256,15 @@ above); when `degraded` is set the summary also prints a `Degraded: ...` line.
 
 ## Configuration
 
-Loaded from a TOML file (e.g. rendered by your deployment tooling). The path is
-resolved as above (`--config` → `GPU_ARBITER_CONFIG` → default). Every
-key is optional; a missing file yields the defaults below. Keys mirror the
-`gpu_arbiter_*` variable names minus the prefix.
+Loaded from a TOML file. The path is resolved as above (`--config` →
+`GPU_ARBITER_CONFIG` → default). Every key is optional; a missing file
+yields the defaults below.
 
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `true` | Master enable |
 | `port` | `48750` | HTTP listen port |
-| `bind` | `"0.0.0.0"` | TCP bind address for the read-only surface + deprecated TCP write routes |
+| `bind` | `"127.0.0.1"` | TCP bind address for the read-only surface + deprecated TCP write routes; loopback by default — set to a LAN address (and firewall it yourself) to allow remote reads |
 | `socket_path` | `"/run/gpu-arbiter/gpu-arbiter.sock"` | Unix control socket path for the write path (mode `0600`, root-owned, inside a mode-`0700` root-owned parent directory); empty string disables it |
 | `managed_units` | _(synthesized from `ollama_unit`)_ | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
 | `ollama_unit` | `"ollama.service"` | **Legacy** single managed unit (used when `managed_units` is unset) |

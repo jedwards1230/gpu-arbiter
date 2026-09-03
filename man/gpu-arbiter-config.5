@@ -7,15 +7,11 @@ gpu\-arbiter\-config \- configuration file for gpu\-arbiter(8)
 .BR gpu-arbiter (8)
 reads its configuration from a TOML file (by default
 .IR /etc/gpu-arbiter/config.toml ,
-typically rendered by deployment tooling such as Ansible). A
+typically rendered by a configuration\-management tool). A
 .B missing file is not an error
 \(em it yields the built\-in defaults, so the daemon is fully usable with zero
 configuration. Every key is optional; a sparse file overrides only the keys it
 names and leaves the rest at their defaults.
-.PP
-TOML keys mirror the deployment variable names minus the
-.I gpu_arbiter_
-prefix.
 .PP
 An
 .B unknown or misspelled key
@@ -43,17 +39,16 @@ Integer (u16). Default
 .BR 48750 .
 HTTP listen port for the read\-only surface (and the deprecated TCP write
 routes), bound to
-.B bind
-and LAN\-restricted by firewalld.
+.BR bind .
 .TP
 .B bind
 String (IP address). Default
-.BR """0.0.0.0""" .
+.BR """127.0.0.1""" .
 TCP bind address for the HTTP control surface. Accepts any IPv4 or IPv6
 address literal; a malformed value is a parse error naming the bad string.
-Scoping this to a LAN\-only address is defense\-in\-depth
-.B on top of,
-not instead of, the firewalld rich rule.
+Loopback\-only by default; set this to a LAN address to let other hosts read
+.IR /status " and " /metrics ,
+and firewall the port yourself if you do.
 .TP
 .B socket_path
 String (filesystem path). Default

@@ -4,10 +4,10 @@
 //!
 //! | Method | Path | Transport | Purpose |
 //! |---|---|---|---|
-//! | GET | `/status` | TCP (LAN) | Full [`StatusSnapshot`] for remote machines + dashboards |
-//! | GET | `/metrics` | TCP (LAN) | Prometheus text-format exposition of the current state |
-//! | GET | `/healthz` | TCP (LAN) | Liveness |
-//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | unix socket | Manual override (the sanctioned write path — #17) |
+//! | GET | `/status` | TCP | Full [`StatusSnapshot`] for remote machines + dashboards |
+//! | GET | `/metrics` | TCP | Prometheus text-format exposition of the current state |
+//! | GET | `/healthz` | TCP | Liveness |
+//! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | unix socket | Manual override (the sanctioned write path) |
 //! | POST | `/ollama/start`,`/ollama/stop` | unix socket | Back-compat alias for the first managed unit |
 //! | POST | `/units/{unit}/start`,`/units/{unit}/stop` | TCP (localhost-only) | **Deprecated** — same alias, kept working for the tray/existing scripts |
 //! | POST | `/ollama/start`,`/ollama/stop` | TCP (localhost-only) | **Deprecated** alias |
@@ -16,10 +16,10 @@
 //!
 //! Security: the read-only surface (`/status`/`/metrics`/`/healthz`) is a
 //! single TCP port (default `48750`, bind address configurable — see
-//! [`crate::config::Config::bind`]), LAN-restricted by a firewalld rich rule
-//! (firewalld-gated HTTP bridge pattern; the configurable bind is
-//! defense-in-depth on top of, not instead of, that rule). The **write** path
-//! (`/units/*`, `/ollama/*`) is served twice:
+//! [`crate::config::Config::bind`], which defaults to loopback only). Widen
+//! `bind` to a LAN address to let other hosts read it, and firewall the port
+//! yourself if you do. The **write** path (`/units/*`, `/ollama/*`) is served
+//! twice:
 //!
 //! - a **unix domain socket** ([`crate::config::Config::socket_path`],
 //!   default `/run/gpu-arbiter/gpu-arbiter.sock`, mode `0600` root-owned,
@@ -31,7 +31,7 @@
 //! - the **TCP** port, kept working for back-compat (the tray and existing
 //!   scripts) but **deprecated** — it additionally rejects any client whose
 //!   peer address is not loopback, enforced in-process via [`ConnectInfo`] so
-//!   it holds even if the firewall rule is missing/misconfigured.
+//!   it holds even if `bind` is later widened to a LAN address.
 //!
 //! Both paths validate `{unit}` against the configured managed-unit list
 //! before any `systemctl` runs, so a caller can't drive arbitrary units

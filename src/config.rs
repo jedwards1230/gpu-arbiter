@@ -403,47 +403,24 @@ impl<'de> Deserialize<'de> for ArgvCmd {
 }
 
 /// The full daemon configuration. Field names are the TOML keys.
-///
-/// Maps to the deployment variable names (TOML key ← `gpu_arbiter_*`):
-///
-/// | TOML key | Ansible var |
-/// |---|---|
-/// | `enabled` | `gpu_arbiter_enabled` |
-/// | `port` | `gpu_arbiter_port` |
-/// | `ollama_unit` | `gpu_arbiter_ollama_unit` (legacy; see `managed_units`) |
-/// | `eager_ollama` | `gpu_arbiter_eager_ollama` (legacy; see `managed_units`) |
-/// | `managed_units` | `gpu_arbiter_managed_units` |
-/// | `eviction_timeout_s` | `gpu_arbiter_eviction_timeout_s` |
-/// | `vram_free_threshold_mb` | `gpu_arbiter_vram_free_threshold_mb` |
-/// | `reconcile_interval_s` | `gpu_arbiter_reconcile_interval_s` |
-/// | `detect_steam` | `gpu_arbiter_detect_steam` |
-/// | `game_patterns` | `gpu_arbiter_game_patterns` |
-/// | `vram_heuristic` | `gpu_arbiter_vram_heuristic` |
-/// | `vram_game_threshold_mb` | `gpu_arbiter_vram_game_threshold_mb` |
-/// | `gpu_allowlist` | `gpu_arbiter_gpu_allowlist` |
-/// | `presence_detection` | `gpu_arbiter_presence_detection` |
-/// | `presence_idle_threshold_s` | `gpu_arbiter_presence_idle_threshold_s` |
-/// | `gpu_backend` | `gpu_arbiter_gpu_backend` |
-/// | `bind` | `gpu_arbiter_bind` |
-/// | `socket_path` | `gpu_arbiter_socket_path` |
-// The bool fields are independent TOML config toggles (1:1 with the table
-// above), not a state machine — splitting them into a builder/bitflags type
-// would break the flat `deny_unknown_fields` TOML schema for no readability
-// win.
+// The bool fields are independent TOML config toggles, not a state machine —
+// splitting them into a builder/bitflags type would break the flat
+// `deny_unknown_fields` TOML schema for no readability win.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Master enable. (The Ansible role also gates the unit on this.)
+    /// Master enable. Configuration management may also gate the unit on
+    /// this.
     pub enabled: bool,
-    /// HTTP listen port (bound to `bind`; LAN-restricted by firewalld).
+    /// HTTP listen port (bound to `bind`).
     pub port: u16,
     /// TCP bind address for the HTTP control surface (`GET /status /metrics
     /// /healthz` plus the deprecated `POST /units/*` / `/ollama/*` write
     /// routes — see [`Config::socket_path`] for the sanctioned write path).
-    /// Default `0.0.0.0` (unchanged historical behavior — every interface).
-    /// Scoping this to a LAN-only address is defense-in-depth **on top of**,
-    /// not instead of, the firewalld rich rule.
+    /// Defaults to loopback only. Set this to a LAN address to let other
+    /// hosts read `/status`/`/metrics`, and firewall the port yourself if
+    /// you do.
     #[serde(default = "default_bind")]
     pub bind: IpAddr,
     /// **Legacy** single managed unit. Superseded by `managed_units`; still
@@ -548,10 +525,9 @@ pub struct Config {
     pub socket_path: String,
 }
 
-/// serde default for [`Config::bind`] — `0.0.0.0` (every interface), the
-/// historical hardcoded behavior.
+/// serde default for [`Config::bind`] — loopback only.
 fn default_bind() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
 /// serde default for [`Config::socket_path`]: `/run/gpu-arbiter/gpu-arbiter.sock`.
@@ -730,13 +706,9 @@ mod tests {
         // Presence defaults: on, 10-minute idle threshold.
         assert!(c.presence_detection);
         assert_eq!(c.presence_idle_threshold_s, 600);
-        // #22/#17: bind defaults to every interface (unchanged historical
-        // behavior); the unix control socket defaults to a dedicated,
-        // lockable-to-0700 subdirectory of /run (#61).
-        assert_eq!(
-            c.bind,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-        );
+        // bind defaults to loopback only; the unix control socket defaults
+        // to a dedicated, lockable-to-0700 subdirectory of /run.
+        assert_eq!(c.bind, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         // Platform-split: Windows has no unix-socket listener at all
         // (`http::bind_uds`/`serve_uds_on` are `#[cfg(unix)]` with no Windows
         // counterpart), so its default is the empty string, which disables the
@@ -961,8 +933,8 @@ mod tests {
     #[test]
     fn gpu_backend_defaults_to_auto_and_parses_each_variant() {
         // Omitted → Auto (the `#[serde(default)]` on the struct supplies it, so a
-        // config without the key — like the rendered Ansible template — still
-        // parses).
+        // config without the key — like a templated one missing this field —
+        // still parses).
         assert_eq!(Config::default().gpu_backend, GpuBackendKind::Auto);
         assert_eq!(
             Config::from_toml("").unwrap().gpu_backend,
@@ -1098,23 +1070,23 @@ mod tests {
     }
 
     /// Config contract guard: this is the **verbatim** output of a real
-    /// configuration-management template (an Ansible Jinja2 `config.toml.j2`)
-    /// rendered with realistic values — **two** `[[managed_units]]` entries
-    /// (Ollama + an ASR runner, both carrying `vram_match`) and two
-    /// `[[game_patterns]]` entries (exercising the loop and the `\`/`"`
-    /// escaping). If the daemon's serde schema and the rendered file ever drift
-    /// apart, this parse fails — keeping the deployment contract honest.
-    /// Regenerate from the template, do not hand-edit.
+    /// templating tool rendering realistic values — **two**
+    /// `[[managed_units]]` entries (Ollama + an ASR runner, both carrying
+    /// `vram_match`) and two `[[game_patterns]]` entries (exercising the loop
+    /// and the `\`/`"` escaping). If the daemon's serde schema and the
+    /// rendered file ever drift apart, this parse fails — keeping the
+    /// deployment contract honest. Regenerate from the template, do not
+    /// hand-edit.
     ///
     /// Root scalars (`enabled` through `gpu_allowlist`) all render **before**
     /// both table headers — this is the corrected ordering. See
     /// [`unknown_key_after_managed_units_table_is_rejected`] just below for what
-    /// happens (and why) when they don't (#35).
+    /// happens (and why) when they don't.
     #[test]
-    fn parses_rendered_ansible_template() {
-        let rendered = r#"# Managed by Ansible - DO NOT EDIT MANUALLY
+    fn parses_templated_config() {
+        let rendered = r#"# Managed by configuration management - do not edit
 # gpu-arbiter daemon config. Keys map 1:1 to the serde Config struct in
-# gpu-arbiter src/config.rs (TOML key = gpu_arbiter_* var minus the prefix).
+# gpu-arbiter src/config.rs.
 #
 # TOML ordering is load-bearing: every root-level bare key MUST appear before
 # the first table header ([[managed_units]] / [[game_patterns]]) — a bare key
@@ -1122,8 +1094,8 @@ mod tests {
 # >= 0.10.0 parses with deny_unknown_fields and rejects a misplaced key
 # outright (0.9.0 silently discarded them, which hid exactly this bug).
 
-# String values are escaped (`\` and `"`) so a quote in any Ansible var can't
-# break out of its TOML string and inject arbitrary config.
+# String values are escaped (`\` and `"`) so a quote in any templated value
+# can't break out of its TOML string and inject arbitrary config.
 enabled = true
 port = 48750
 ollama_unit = "ollama.service"
@@ -1157,7 +1129,7 @@ match = "Heroic"
 name = "quo\"te\\back"
 match = "Has\"Quote\\Back"
 "#;
-        let c = Config::from_toml(rendered).expect("rendered Ansible config must parse");
+        let c = Config::from_toml(rendered).expect("rendered config must parse");
 
         // Every root-level serde field is populated by the rendered file (the
         // contract) — asserted against the actual values, not just "it parses",
@@ -1199,8 +1171,8 @@ match = "Has\"Quote\\Back"
         assert_eq!(c.game_patterns[1].match_substr, "Has\"Quote\\Back");
     }
 
-    /// Negative companion to [`parses_rendered_ansible_template`] (#35): the
-    /// **older** version of that deployment template rendered the detection keys
+    /// Negative companion to [`parses_templated_config`]: an older version of
+    /// that template rendered the detection keys
     /// (`detect_steam`/`vram_heuristic`/`vram_game_threshold_mb`/`gpu_allowlist`)
     /// *below* the `[[managed_units]]` tables. In TOML, a bare `key = value`
     /// belongs to the most recently opened table — there is no "back to root"
@@ -1208,21 +1180,20 @@ match = "Has\"Quote\\Back"
     /// deserialized as fields of the *last* `[[managed_units]]` entry
     /// (`asr-runner.service`) instead of the `Config` root. `ManagedUnit` also
     /// carries `#[serde(deny_unknown_fields)]`, so gpu-arbiter >= 0.10.0 fails
-    /// to parse this file outright — which is exactly what crash-looped
-    /// the deployment host on the v0.10.0 rollout (0.9.0's absence of
-    /// `deny_unknown_fields` had silently dropped the misplaced keys instead,
-    /// masking the bug rather than fixing it). This fixture is the verbatim
-    /// output of that old template with the same values as the corrected fixture
-    /// above — it must fail, and the error must name the first misplaced key,
+    /// to parse this file outright (0.9.0's absence of `deny_unknown_fields`
+    /// had silently dropped the misplaced keys instead, masking the bug
+    /// rather than fixing it). This fixture is the verbatim output of that
+    /// old template with the same values as the corrected fixture above — it
+    /// must fail, and the error must name the first misplaced key,
     /// `detect_steam`.
     #[test]
     fn unknown_key_after_managed_units_table_is_rejected() {
-        let rendered = r#"# Managed by Ansible - DO NOT EDIT MANUALLY
+        let rendered = r#"# Managed by configuration management - do not edit
 # gpu-arbiter daemon config. Keys map 1:1 to the serde Config struct in
-# gpu-arbiter src/config.rs (TOML key = gpu_arbiter_* var minus the prefix).
+# gpu-arbiter src/config.rs.
 
-# String values are escaped (`\` and `"`) so a quote in any Ansible var can't
-# break out of its TOML string and inject arbitrary config.
+# String values are escaped (`\` and `"`) so a quote in any templated value
+# can't break out of its TOML string and inject arbitrary config.
 enabled = true
 port = 48750
 ollama_unit = "ollama.service"

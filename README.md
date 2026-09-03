@@ -143,10 +143,12 @@ a shell-free argv. Full key reference:
 
 ## HTTP surface
 
-Read-only endpoints on a TCP port (default `48750`); on Linux the **write** path
-is a root-owned `0600` unix socket, so there are no bearer tokens to leak.
-Windows has no unix-socket listener, so its only write path is the TCP surface,
-which has no peer-credential check — scope `bind` with a firewall rule there.
+Read-only endpoints on a TCP port (default `48750`, bound to loopback unless
+you set `bind`); on Linux the **write** path is a root-owned `0600` unix
+socket, so there are no bearer tokens to leak. Windows has no unix-socket
+listener, so its only write path is the TCP surface, which has no
+peer-credential check — the loopback default on `bind` is what mitigates
+that, so don't widen it on Windows.
 
 | Method | Path | Transport |
 |---|---|---|
@@ -202,7 +204,7 @@ A few decisions that are less obvious than they look:
 That last point is what makes the test suite worth its weight: **283 tests
 across ~6,500 lines of test code against ~7,500 lines of implementation**,
 driven by literal captured inputs (real `nvidia-smi` output, real `/proc`
-cmdlines, the verbatim render of a real deployment template) rather than mocks.
+cmdlines, a config rendered by a templating tool) rather than mocks.
 
 ## Platform support
 
@@ -217,7 +219,7 @@ how units are driven — but the differences are worth knowing before you deploy
 | **Detection latency** | milliseconds | `reconcile_interval_s` — **lower it** (the 30 s default means a 30 s worst case) |
 | **Supervisor** | systemd by default | no default — set the per-unit `*_cmd` overrides (`sc.exe`, WinSW, …) |
 | **Per-unit VRAM** | cgroup attribution, `vram_match` fallback | unavailable — WDDM reports `[N/A]` per process, so eviction gates on service state instead |
-| **Write path** | unix socket, `0600` root-owned | **TCP only** — no peer-credential check, so scope `bind` with a firewall rule. A named-pipe listener is planned |
+| **Write path** | unix socket, `0600` root-owned | **TCP only** — no peer-credential check, so leave `bind` at its loopback default. A named-pipe listener is planned |
 | **Presence detection** | evdev input devices | unavailable — reported as unknown |
 | **Tray indicator** | ✅ | — |
 

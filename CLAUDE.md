@@ -76,7 +76,7 @@ The annotated example at `packaging/config.example.toml` is the authoritative re
 - **Detection** — `detect_steam` (on by default), `[[game_patterns]]` (cmdline substrings for non-Steam launchers), `vram_heuristic` (opt-in heavy-graphics-proc detection), `gpu_allowlist`.
 - **Presence** — `presence_detection`, `presence_idle_threshold_s` (default 600 s).
 - **GPU backend** — `gpu_backend`: `"auto"` (default), `"nvidia"`, or `"amd"`.
-- **Control surface** — `bind` (TCP bind address, default `0.0.0.0`), `socket_path` (unix control-socket path, default `/run/gpu-arbiter/gpu-arbiter.sock`; empty string disables it).
+- **Control surface** — `bind` (TCP bind address, default `127.0.0.1`), `socket_path` (unix control-socket path, default `/run/gpu-arbiter/gpu-arbiter.sock`; empty string disables it).
 
 **Tray binary config**: `gpu-arbiter-tray` reads `GPU_ARBITER_URL` (default `http://127.0.0.1:48750`) to locate the daemon. No config file — all state is polled from the daemon's `/status` endpoint every 2 s.
 

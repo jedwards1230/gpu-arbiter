@@ -270,12 +270,11 @@ instead. See
 .SH HTTP CONTROL SURFACE
 The read\-only surface is a single TCP port (default 48750, bind address
 .BR bind ,
-default 0.0.0.0) restricted to the LAN by a firewalld rich rule (a
-non\-default
+default 127.0.0.1 \(em loopback only). Set
 .B bind
-is defense\-in\-depth
-.B on top of,
-not instead of, that rule). The
+to a LAN address to let other hosts read
+.IR /status " and " /metrics ,
+and firewall the port yourself if you do. The
 .B write
 path \(em
 .I /units/*
