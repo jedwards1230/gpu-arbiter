@@ -185,10 +185,10 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
 ///
 /// journald's default retention is measured in hours, not enough for durable
 /// history, so these are the only record of eviction/restart/reconcile
-/// activity that survives that long. **Monotonic for the life of the process; a daemon restart resets
-/// every one of them to 0** — use `rate()`/`increase()` in Prometheus, never
-/// compare raw values across a restart (each metric's `# HELP` text repeats
-/// this).
+/// activity that survives that long. **Monotonic for the life of the
+/// process; a daemon restart resets every one of them to 0** — use
+/// `rate()`/`increase()` in Prometheus, never compare raw values across a
+/// restart (each metric's `# HELP` text repeats this).
 ///
 /// - `gpu_arbiter_evictions_total{unit,outcome}` — cumulative eviction
 ///   attempts, `outcome` ∈ `yielded`/`graceful`/`sigkill`/`error`. A no-op

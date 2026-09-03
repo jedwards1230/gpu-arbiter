@@ -444,12 +444,12 @@ pub enum UnitVramReading {
     ///
     /// The total-VRAM `Fallback` is *also* wrong here, and more subtly so.
     /// Device-level `memory.used` does vary meaningfully on WDDM as models load
-    /// and unload, so it is good enough to *report* on the dashboard — but it
-    /// is the whole
-    /// device, including the game that just launched. Gating eviction on it
-    /// would mean waiting for total VRAM to fall below a threshold that the
-    /// incoming game is simultaneously pushing up, so the gate would never open
-    /// and every eviction would run to timeout and SIGKILL.
+    /// and unload, so it is good enough to *report* on the dashboard — but
+    /// it is the whole device, including the game that just launched. Gating
+    /// eviction on it would mean waiting for total VRAM to fall below a
+    /// threshold that the incoming game is simultaneously pushing up, so the
+    /// gate would never open and every eviction would run to timeout and
+    /// SIGKILL.
     ///
     /// Gating on service state is not a workaround, it is *more* correct here:
     /// a Windows service that reaches `SERVICE_STOPPED` has had its process
