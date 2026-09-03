@@ -144,17 +144,17 @@ a shell-free argv. Full key reference:
 ## HTTP surface
 
 Read-only endpoints on a TCP port (default `48750`, bound to loopback unless
-you set `bind`); the **write** path is a root-owned `0600` unix socket, so
-there are no bearer tokens to leak. Windows has no unix-socket listener and
-no other write path, so manual start/stop overrides are Linux-only until a
-named-pipe listener lands.
+you set `bind`). The **write** path differs by platform: on Linux it's a
+root-owned `0600` unix socket, so there are no bearer tokens to leak; Windows
+has no unix-socket listener, so it's served on the same TCP port instead,
+gated to loopback peers only.
 
 | Method | Path | Transport |
 |---|---|---|
 | GET | `/status` | TCP — full state snapshot |
 | GET | `/metrics` | TCP — Prometheus exposition |
 | GET | `/healthz` | TCP — liveness |
-| POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket — manual override |
+| POST | `/units/{unit}/start`, `/units/{unit}/stop` | unix socket (Linux) or TCP, loopback-only (Windows) — manual override |
 
 `{unit}` is validated against `managed_units`, so the endpoint cannot drive
 arbitrary systemd units. `/metrics` exposes the state machine, per-unit VRAM
@@ -218,7 +218,7 @@ how units are driven — but the differences are worth knowing before you deploy
 | **Detection latency** | milliseconds | `reconcile_interval_s` — **lower it** (the 30 s default means a 30 s worst case) |
 | **Supervisor** | systemd by default | no default — set the per-unit `*_cmd` overrides (`sc.exe`, WinSW, …) |
 | **Per-unit VRAM** | cgroup attribution, `vram_match` fallback | unavailable — WDDM reports `[N/A]` per process, so eviction gates on service state instead |
-| **Write path** | unix socket, `0600` root-owned | none yet — manual start/stop overrides are Linux-only until a named-pipe listener lands |
+| **Write path** | unix socket, `0600` root-owned | TCP port, loopback peers only |
 | **Presence detection** | evdev input devices | unavailable — reported as unknown |
 | **Tray indicator** | ✅ | — |
 

@@ -17,7 +17,7 @@
 #enabled = true
 
 # HTTP listen port for the read-only surface (/status /metrics /healthz),
-# bound to `bind`.
+# plus (on Windows only) the loopback-gated write routes, bound to `bind`.
 #port = 48750
 
 # TCP bind address for the HTTP control surface. Loopback-only by default;
@@ -26,11 +26,12 @@
 #bind = "127.0.0.1"
 
 # Unix control socket serving the write path (POST /units/{unit}/start|stop)
-# — the only control surface: local root only, no bearer tokens, mode 0600
-# root-owned, inside a mode 0700 root-owned parent directory (the parent
-# directory is itself part of the auth boundary — it closes the
-# bind-then-chmod permission window; see gpu-arbiter-config(5)). An empty
-# string disables the socket entirely, leaving no write path at all.
+# on Linux: local root only, no bearer tokens, mode 0600 root-owned, inside a
+# mode 0700 root-owned parent directory (the parent directory is itself part
+# of the auth boundary — it closes the bind-then-chmod permission window;
+# see gpu-arbiter-config(5)). An empty string disables the socket entirely,
+# leaving Linux with no write path at all. Ignored on Windows, where the
+# write routes are served on the TCP port instead, gated to loopback peers.
 #socket_path = "/run/gpu-arbiter/gpu-arbiter.sock"
 
 # Seconds to wait for a graceful tenant teardown (VRAM dropping below

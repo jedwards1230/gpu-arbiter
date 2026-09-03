@@ -275,13 +275,20 @@ and firewall the port yourself if you do. The
 .B write
 path \(em
 .I /units/*
-\(em is a
+\(em is platform\-specific. On
+.B Linux
+it is a
 .B unix control socket only
 .RB ( socket_path ,
 default
 .IR /run/gpu-arbiter/gpu-arbiter.sock ,
 mode 0600 root\-owned, inside a mode 0700 root\-owned parent directory) \(em
-local\-root\-only, no bearer tokens. It validates
+local\-root\-only, no bearer tokens. On
+.B Windows
+there is no unix\-socket listener, so the write routes are served on the same
+TCP port instead, restricted to
+.B loopback peers only
+\(em see PLATFORMS below. Both transports validate
 .I {unit}
 against
 .B managed_units
@@ -315,7 +322,8 @@ Prometheus text\-format exposition.
 Liveness probe.
 .TP
 .B "POST /units/{unit}/start, /units/{unit}/stop"
-Manual override for debugging, on the unix socket \(em the only write path.
+Manual override for debugging \(em on the unix socket on Linux, or on this
+TCP port (loopback peers only) on Windows.
 .I {unit}
 must be one of the configured managed units; an unknown unit is rejected with
 404. Routes through the same reconcile task that drives automatic
@@ -470,9 +478,8 @@ draining, and per\-unit VRAM is absent from
 .IR /status .
 .TP
 .B Control socket
-The unix control socket is Linux\-only, and it is the only write path \(em
-Windows has none yet. Manual start/stop overrides are Linux\-only until a
-named\-pipe listener lands.
+The unix control socket is Linux\-only. On Windows the write routes are
+served on the TCP port instead, restricted to loopback peers only.
 .TP
 .B Presence detection
 Linux\-only (evdev). On Windows presence is always reported as unknown.

@@ -432,9 +432,11 @@ mod daemon {
         });
 
         // 6. HTTP control surface: the read-only surface (`/status /metrics
-        //    /healthz`) plus the deprecated TCP write routes, bound to
-        //    `cfg.bind` (loopback by default). The sanctioned write path is
-        //    the unix socket below.
+        //    /healthz`), bound to `cfg.bind` (loopback by default). On
+        //    Windows this TCP listener also carries the loopback-gated write
+        //    routes (`http::router` registers them only under
+        //    `#[cfg(windows)]`); on Linux the write path is the unix socket
+        //    below.
         //
         //    Both listeners are BOUND HERE, synchronously, before either
         //    serve loop is spawned (#61): a bind failure (the TCP port
@@ -459,7 +461,7 @@ mod daemon {
             }
         });
 
-        // 6b. Unix control socket: the only write path — local root only,
+        // 6b. Unix control socket: the write path on Linux — local root only,
         // file-permission-gated (mode 0600 file, mode 0700 parent
         // directory), no bearer tokens. Serves ONLY `/units/*`; the
         // read-only surface above stays TCP. `socket_path = ""` opts out
@@ -467,10 +469,10 @@ mod daemon {
         //
         // Windows has no unix-socket listener at all (`http::bind_uds` and
         // `serve_uds_on` are `#[cfg(unix)]` with no counterpart), so the whole
-        // block is unix-gated and `socket_path` defaults to empty there. That
-        // means Windows has no write path at all — manual start/stop
-        // overrides are Linux-only until a named-pipe listener replaces this
-        // socket there.
+        // block is unix-gated and `socket_path` defaults to empty there.
+        // Windows drives manual start/stop through the loopback-gated TCP
+        // write routes registered in `http::router` instead (see step 6
+        // above).
         #[cfg(unix)]
         let socket_handle = if cfg.socket_path.is_empty() {
             tracing::info!("unix control socket disabled (socket_path is empty)");
