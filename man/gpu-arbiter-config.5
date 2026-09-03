@@ -64,15 +64,20 @@ Path to the unix control socket serving the write path
 on
 .BR Linux ,
 created mode 0600, root\-owned \(em local root only, no bearer tokens. It is
-bound under a temporary name, chmod'd to 0600, then renamed into place, so
-it is never observable at this path at a wider mode. The parent directory
-is created if missing at mode 0700, root\-owned, and is itself part of the
-auth boundary too: no other local user can even resolve the socket path.
-Before binding, an existing socket file is probed with a short connect: if
-a live process answers (another gpu\-arbiter instance), startup fails
-rather than stealing its socket; only a genuinely stale file from an
-unclean prior shutdown (nothing listening) is removed. A failure to bind
-either listener (this socket or the TCP
+bound inside a private, freshly\-created 0700 staging directory, chmod'd to
+0600 there, then moved into place with a rename that refuses to replace an
+existing destination, so it is never observable at this path at a wider
+mode and a second daemon racing startup can never silently take over an
+already\-bound socket. The parent directory is created if missing at mode
+0700, root\-owned, and is itself part of the auth boundary too: no other
+local user can even resolve the socket path. Before the move, an existing
+socket file at this path is probed with a short connect: a live process
+answering (another gpu\-arbiter instance) fails startup rather than
+unlinking it; only a genuinely stale file from an unclean prior shutdown
+(nothing listening) is removed \(em the guarantee is that a live socket is
+never unlinked, and the move itself never overwrites a path that was
+claimed concurrently. A failure to bind either listener (this socket or
+the TCP
 .BR port )
 is fatal at startup \(em the daemon exits nonzero so the service manager
 surfaces and retries it, instead of half\-running without a control surface.
