@@ -440,7 +440,7 @@ pub enum UnitVramReading {
     /// `Fallback(None)`. NVIDIA reports `NVML_VALUE_NOT_AVAILABLE` for
     /// per-process VRAM on **every** WDDM system, unconditionally, and a
     /// display-attached `GeForce` card cannot leave WDDM (no `GeForce` product
-    /// supports TCC, and TCC is deprecated regardless). Measured on desktop-2
+    /// supports TCC, and TCC is deprecated regardless). Measured on a Windows host
     /// (RTX 5090, driver 610.88): every process — the game itself and
     /// `llama-server.exe` included — reports `[N/A]`.
     ///

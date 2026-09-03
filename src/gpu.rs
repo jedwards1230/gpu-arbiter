@@ -207,7 +207,7 @@ impl GpuBackend {
 /// (reads `PATH` + stats files); never panics.
 fn nvidia_smi_on_path() -> bool {
     // Windows needs the `.exe` suffix: the binary ships as `nvidia-smi.exe`
-    // (verified on desktop-2 at `C:\Windows\System32\nvidia-smi.exe`), so
+    // (verified on a Windows RTX 5090 host at `C:\Windows\System32\nvidia-smi.exe`), so
     // probing the bare stem finds nothing and `auto` detection silently
     // concludes there is no NVIDIA GPU on a machine holding an RTX 5090.
     const NAMES: &[&str] = if cfg!(windows) {

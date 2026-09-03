@@ -87,8 +87,8 @@
 # root — so an uncommented root key placed after one of the [[game_patterns]]
 # or [[managed_units]] tables below would silently join THAT table instead of
 # Config, and (since every table here carries deny_unknown_fields) fail to
-# parse rather than apply. This bit a real deploy: see gpu-arbiter#35 /
-# homelab-ansible#195, and the `parses_rendered_ansible_template` /
+# parse rather than apply. This bit a real deploy: see issue #35, and the
+# `parses_rendered_ansible_template` /
 # `unknown_key_after_managed_units_table_is_rejected` contract tests in
 # src/config.rs.
 # ------------------------------------------------------------------------------

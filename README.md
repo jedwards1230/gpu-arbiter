@@ -258,8 +258,8 @@ the GPU is free before starting an AI workload:
 gpu-arbiter wait --for available --timeout 30 && ./start-inference-server.sh
 ```
 
-`watch` streams state transitions for local observability (also useful given
-desktop-1's journald retention is short — see the hardening plan):
+`watch` streams state transitions for local observability — useful on hosts
+where journald retention is short enough to lose the daemon's own log record:
 
 ```text
 $ gpu-arbiter watch

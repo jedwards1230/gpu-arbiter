@@ -262,7 +262,7 @@ pub async fn observe(cfg: &Config, backend: GpuBackend) -> Result<ProcSnapshot, 
 
     // The VRAM heuristic cannot work under WDDM: per-process `used_memory` is
     // reported as `[N/A]` for every process, unconditionally (measured on
-    // desktop-2, driver 610.88 — including the game itself and llama-server).
+    // a Windows RTX 5090 host, driver 610.88 — including the game itself and llama-server).
     // Skip the query rather than spend a subprocess per pass on a structurally
     // unusable result. `cgroup::attribute_units` is likewise a Linux concept.
     let _ = (cfg, backend);
@@ -583,11 +583,11 @@ pub async fn reconcile(
     // while `state` stays `available`.
     //
     // `state` deliberately does NOT become `gaming` or `evicting` here. Those
-    // words are earmark's wire contract for "a game owns the GPU, back off
-    // entirely" — reporting them because the LLM is busy would tell earmark the
-    // box is unavailable for AI work at exactly the moment it is doing AI work.
-    // Inter-tenant preemption is visible through `units[].running`, which is the
-    // honest place for it.
+    // words are the `/status` wire contract for "a game owns the GPU, back off
+    // entirely" — reporting them because one tenant preempted another would
+    // tell a remote AI-routing consumer the box is unavailable for AI work at
+    // exactly the moment it is doing AI work. Inter-tenant preemption is
+    // visible through `units[].running`, which is the honest place for it.
     //
     // Skipped while gaming/evicting: the transition arm above owns the units in
     // that window, and re-entering eviction here would race it.
@@ -1934,7 +1934,7 @@ mod tests {
 
     // ── priority ladder ─────────────────────────────────────────────────────
 
-    /// The desktop-2 ladder: gaming > comfyui > llm > asr.
+    /// A representative ladder: gaming > comfyui > llm > asr.
     fn ladder_cfg() -> Config {
         Config::from_toml(&crate::testutil::portable_toml(
             r#"
@@ -1949,7 +1949,7 @@ mod tests {
             priority = 50
 
             [[managed_units]]
-            unit = "earmark-asr"
+            unit = "asr-runner"
             priority = 25
             "#,
         ))
@@ -1988,7 +1988,7 @@ mod tests {
         assert_eq!(demand, Some(100));
         assert_eq!(
             preempted_names(&cfg, demand),
-            vec!["comfyui", "earmark-asr", "ollama"]
+            vec!["asr-runner", "comfyui", "ollama"]
         );
     }
 
@@ -2029,12 +2029,12 @@ mod tests {
     #[test]
     fn a_busy_middle_tier_preempts_only_below_it() {
         // The case the whole feature exists for: ollama (50) busy evicts
-        // earmark-asr (25) and leaves comfyui (75) alone.
+        // asr-runner (25) and leaves comfyui (75) alone.
         let cfg = ladder_cfg();
         let ollama = unit_named(&cfg, "ollama");
         let demand = effective_demand(&[], &cfg, &[ollama]);
         assert_eq!(demand, Some(50));
-        assert_eq!(preempted_names(&cfg, demand), vec!["earmark-asr"]);
+        assert_eq!(preempted_names(&cfg, demand), vec!["asr-runner"]);
     }
 
     #[test]
@@ -2042,7 +2042,7 @@ mod tests {
         // Strict `<`, so a unit is never in its own preempted set — otherwise a
         // busy tenant would evict itself the moment it started doing work.
         let cfg = ladder_cfg();
-        for name in ["comfyui", "ollama", "earmark-asr"] {
+        for name in ["comfyui", "ollama", "asr-runner"] {
             let u = unit_named(&cfg, name);
             let demand = effective_demand(&[], &cfg, &[u]);
             assert!(
@@ -2084,7 +2084,7 @@ mod tests {
         assert_eq!(demand, Some(100));
         assert_eq!(
             preempted_names(&cfg, demand),
-            vec!["comfyui", "earmark-asr", "ollama"]
+            vec!["asr-runner", "comfyui", "ollama"]
         );
     }
 
@@ -2153,7 +2153,7 @@ mod tests {
         let targets = ensure_running_targets(State::Available, &cfg, &no_holds, &preempted);
         let names: Vec<&str> = targets.iter().map(|u| u.unit.as_str()).collect();
         assert!(
-            !names.contains(&"earmark-asr"),
+            !names.contains(&"asr-runner"),
             "preempted unit was queued for restart: {names:?}"
         );
         // The tiers at or above the demand are still eligible.

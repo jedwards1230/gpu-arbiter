@@ -42,7 +42,7 @@ pub struct GamePattern {
     ///
     /// This exists because a location-based `match` cannot distinguish a game
     /// from the launcher's own machinery living in the same directory tree.
-    /// Measured on desktop-2 (2026-08-22): launching a Steam title first spawns
+    /// Measured on a Windows RTX 5090 host (2026-08-22): launching a Steam title first spawns
     /// the redistributable stage, and all three of these contain
     /// `steamapps\common` while none is a game —
     ///
@@ -233,12 +233,12 @@ pub struct ManagedUnit {
     pub busy_cmd: Option<ArgvCmd>,
     /// Optional **cooperative** GPU release, tried before any stop.
     ///
-    /// Asks the tenant to let go of the GPU while staying alive — for
-    /// earmark's asr-runner that means flipping its `runner_control` gate, on
-    /// which `runner.py` parks its model to host RAM (`asr_model.cpu()` +
-    /// `torch.cuda.empty_cache()`) and restores it on resume. The win over a
-    /// stop is real: no in-flight transcription is lost and there is no cold
-    /// model reload afterwards.
+    /// Asks the tenant to let go of the GPU while staying alive. For a
+    /// PyTorch-backed ASR service, for example, that can mean flipping a
+    /// control gate on which the worker parks its model to host RAM
+    /// (`model.cpu()` + `torch.cuda.empty_cache()`) and restores it on resume.
+    /// The win over a stop is real: no in-flight work is lost and there is no
+    /// cold model reload afterwards.
     ///
     /// Exit 0 means "the request was accepted", **not** "the GPU is free" — the
     /// tenant needs time to actually drop its context, so the eviction then
@@ -1097,15 +1097,14 @@ mod tests {
         assert_eq!(c.game_patterns[0].match_substr, "Heroic");
     }
 
-    /// Config contract guard: this is the **verbatim** output of the current
-    /// deployment template (`homelab-ansible` `roles/desktop-common/templates/
-    /// gpu-arbiter/config.toml.j2`, fixed in homelab-ansible#195) rendered with
-    /// realistic desktop-1 values — **two** `[[managed_units]]` entries (Ollama +
-    /// an ASR runner, both carrying `vram_match`) and two `[[game_patterns]]`
-    /// entries (exercising the loop and the `\`/`"` escaping). If the daemon's
-    /// serde schema and the rendered file ever drift apart, this parse fails —
-    /// keeping the deployment contract honest. Regenerate from the template, do
-    /// not hand-edit.
+    /// Config contract guard: this is the **verbatim** output of a real
+    /// configuration-management template (an Ansible Jinja2 `config.toml.j2`)
+    /// rendered with realistic values — **two** `[[managed_units]]` entries
+    /// (Ollama + an ASR runner, both carrying `vram_match`) and two
+    /// `[[game_patterns]]` entries (exercising the loop and the `\`/`"`
+    /// escaping). If the daemon's serde schema and the rendered file ever drift
+    /// apart, this parse fails — keeping the deployment contract honest.
+    /// Regenerate from the template, do not hand-edit.
     ///
     /// Root scalars (`enabled` through `gpu_allowlist`) all render **before**
     /// both table headers — this is the corrected ordering. See
@@ -1201,7 +1200,7 @@ match = "Has\"Quote\\Back"
     }
 
     /// Negative companion to [`parses_rendered_ansible_template`] (#35): the
-    /// **pre-homelab-ansible#195** template rendered the detection keys
+    /// **older** version of that deployment template rendered the detection keys
     /// (`detect_steam`/`vram_heuristic`/`vram_game_threshold_mb`/`gpu_allowlist`)
     /// *below* the `[[managed_units]]` tables. In TOML, a bare `key = value`
     /// belongs to the most recently opened table — there is no "back to root"
@@ -1210,7 +1209,7 @@ match = "Has\"Quote\\Back"
     /// (`asr-runner.service`) instead of the `Config` root. `ManagedUnit` also
     /// carries `#[serde(deny_unknown_fields)]`, so gpu-arbiter >= 0.10.0 fails
     /// to parse this file outright — which is exactly what crash-looped
-    /// desktop-1 on the v0.10.0 rollout (0.9.0's absence of
+    /// the deployment host on the v0.10.0 rollout (0.9.0's absence of
     /// `deny_unknown_fields` had silently dropped the misplaced keys instead,
     /// masking the bug rather than fixing it). This fixture is the verbatim
     /// output of that old template with the same values as the corrected fixture

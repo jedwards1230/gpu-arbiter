@@ -95,7 +95,7 @@ pub struct GpuGraphicsProc {
 /// basename, not the whole path, to match.
 ///
 /// Splits on **both** `/` and `\` unconditionally, on every platform. Windows
-/// `nvidia-smi` reports backslash paths (verified on desktop-2:
+/// `nvidia-smi` reports backslash paths (verified on a Windows RTX 5090 host:
 /// `C:\Program Files\Ollama\lib\ollama\llama-server.exe`), and a `/`-only split
 /// would return the whole string, so no allowlist entry could ever match. The
 /// split is not `cfg`-gated because `\` is not a legal byte in a POSIX filename
@@ -209,7 +209,7 @@ mod tests {
 
     /// The Windows Steam config from the port plan, carrying the exclusions
     /// Phase 0 proved are required. Every cmdline in the tests below was
-    /// captured live on desktop-2 on 2026-08-22, not invented.
+    /// captured live on a Windows RTX 5090 host on 2026-08-22, not invented.
     fn windows_steam_cfg() -> Config {
         // detect_steam off: the `SteamLaunch AppId=` marker comes from Steam's
         // Linux-only `reaper` shim and never appears on Windows.
@@ -242,7 +242,7 @@ mod tests {
         // The false-positive class Phase 0 caught: launching any Steam title
         // first spawns the redistributable stage, and all three of these contain
         // `steamapps\common` while none is a game. Without the veto the arbiter
-        // would evict Ollama (and later asr-runner) for a .NET installer — on
+        // would evict Ollama (and any other tenant) for a .NET installer — on
         // first launch after any game or Steam update, so routinely.
         let cfg = windows_steam_cfg();
         for cmdline in [
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn allowlist_matches_basename_of_windows_path() {
         // Windows nvidia-smi reports backslash-delimited paths. Verified live on
-        // desktop-2 (driver 610.88), which listed the Ollama GPU process as
+        // a Windows RTX 5090 host (driver 610.88), which listed the Ollama GPU process as
         // `C:\Program Files\Ollama\lib\ollama\llama-server.exe`. Before the
         // `rsplit(['/', '\\'])` fix, `basename` returned the entire string and no
         // allowlist entry could ever match on Windows.
