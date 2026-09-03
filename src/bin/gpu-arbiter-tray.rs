@@ -128,25 +128,29 @@ mod linux {
         fn tooltip_text(&self) -> String {
             match (&self.status, &self.last_error) {
                 (Some(s), _) => {
-                    let models = if s.ollama.models.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", s.ollama.models.join(", "))
-                    };
+                    // The primary tenant — first in eviction order — is what the
+                    // tooltip surfaces; a config with more than one managed unit
+                    // still shows the rest via `units[]` in `/status` directly.
+                    let unit = s.units.first();
+                    let models = unit
+                        .filter(|u| !u.models.is_empty())
+                        .map(|u| format!(" ({})", u.models.join(", ")))
+                        .unwrap_or_default();
                     format!(
                         "State: {}\n\
                          VRAM: {} / {} MiB used\n\
-                         Ollama: {}{}\n\
+                         {}: {}{}\n\
                          Since: {}\n\
                          Daemon: v{}",
                         state_label(s.state),
                         s.gpu_vram_used_mb,
                         s.gpu_vram_total_mb,
+                        unit.map_or("Unit", |u| u.unit.as_str()),
                         // Tristate (#15): `running: None` means the daemon
                         // couldn't confirm either way — render that distinctly
                         // from a confirmed "stopped" rather than defaulting to
                         // one or the other.
-                        match s.ollama.running {
+                        match unit.and_then(|u| u.running) {
                             Some(true) => "running",
                             Some(false) => "stopped",
                             None => "unknown",

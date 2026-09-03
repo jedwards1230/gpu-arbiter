@@ -432,9 +432,11 @@ mod daemon {
         });
 
         // 6. HTTP control surface: the read-only surface (`/status /metrics
-        //    /healthz`) plus the deprecated TCP write routes, bound to
-        //    `cfg.bind` (loopback by default). The sanctioned write path is
-        //    the unix socket below.
+        //    /healthz`), bound to `cfg.bind` (loopback by default). On
+        //    Windows this TCP listener also carries the loopback-gated write
+        //    routes (`http::router` registers them only under
+        //    `#[cfg(windows)]`); on Linux the write path is the unix socket
+        //    below.
         //
         //    Both listeners are BOUND HERE, synchronously, before either
         //    serve loop is spawned (#61): a bind failure (the TCP port
@@ -459,20 +461,18 @@ mod daemon {
             }
         });
 
-        // 6b. Unix control socket: the sanctioned write path — local root
-        // only, file-permission-gated (mode 0600 file, mode 0700 parent
-        // directory), no bearer tokens. Serves ONLY `/units/*` +
-        // `/ollama/*`; the read-only surface above stays TCP.
-        // `socket_path = ""` opts out entirely.
+        // 6b. Unix control socket: the write path on Linux — local root only,
+        // file-permission-gated (mode 0600 file, mode 0700 parent
+        // directory), no bearer tokens. Serves ONLY `/units/*`; the
+        // read-only surface above stays TCP. `socket_path = ""` opts out
+        // entirely.
         //
         // Windows has no unix-socket listener at all (`http::bind_uds` and
         // `serve_uds_on` are `#[cfg(unix)]` with no counterpart), so the whole
-        // block is unix-gated and `socket_path` defaults to empty there. That
-        // is a real, deliberate security downgrade to name: on Windows the
-        // only write path is the TCP surface, which has no peer-credential
-        // check — the loopback default on `bind` is what mitigates that, so
-        // don't widen it on Windows without a named-pipe listener to replace
-        // this socket.
+        // block is unix-gated and `socket_path` defaults to empty there.
+        // Windows drives manual start/stop through the loopback-gated TCP
+        // write routes registered in `http::router` instead (see step 6
+        // above).
         #[cfg(unix)]
         let socket_handle = if cfg.socket_path.is_empty() {
             tracing::info!("unix control socket disabled (socket_path is empty)");

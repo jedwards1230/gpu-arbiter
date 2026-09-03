@@ -275,22 +275,20 @@ and firewall the port yourself if you do. The
 .B write
 path \(em
 .I /units/*
-and the
-.I /ollama/*
-back\-compat alias \(em is served on
-.B two
-transports: a
-.B unix control socket
+\(em is platform\-specific. On
+.B Linux
+it is a
+.B unix control socket only
 .RB ( socket_path ,
 default
 .IR /run/gpu-arbiter/gpu-arbiter.sock ,
 mode 0600 root\-owned, inside a mode 0700 root\-owned parent directory) \(em
-the sanctioned surface, local\-root\-only, no bearer tokens \(em and,
-.BR deprecated ,
-the same TCP port (additionally localhost\-only there), kept for back\-compat
-with
-.BR gpu-arbiter-tray (1)
-and any existing scripts. Both transports validate
+local\-root\-only, no bearer tokens. On
+.B Windows
+there is no unix\-socket listener, so the write routes are served on the same
+TCP port instead, restricted to
+.B loopback peers only
+\(em see PLATFORMS below. Both transports validate
 .I {unit}
 against
 .B managed_units
@@ -313,9 +311,7 @@ way \(em reported
 .B models[]
 list, attributed VRAM, and whether the unit is manually
 .BR held ),
-an
-.I ollama
-back\-compat alias block, total GPU memory, and a top\-level
+total GPU memory, and a top\-level
 .B degraded
 flag (see DETECTION AND EVICTION MODEL).
 .TP
@@ -326,13 +322,12 @@ Prometheus text\-format exposition.
 Liveness probe.
 .TP
 .B "POST /units/{unit}/start, /units/{unit}/stop"
-Manual override for debugging, on the unix socket (sanctioned) or,
-.BR deprecated ,
-the localhost\-only TCP port.
+Manual override for debugging \(em on the unix socket on Linux, or on this
+TCP port (loopback peers only) on Windows.
 .I {unit}
 must be one of the configured managed units; an unknown unit is rejected with
-404. Both transports route through the same reconcile task that drives
-automatic eviction/restart (never a directly\-racing HTTP handler).
+404. Routes through the same reconcile task that drives automatic
+eviction/restart (never a directly\-racing HTTP handler).
 .B stop
 additionally
 .B holds
@@ -360,9 +355,6 @@ curl \-\-unix\-socket /run/gpu\-arbiter/gpu\-arbiter.sock \e
   \-X POST http://localhost/units/ollama.service/stop
 .fi
 .RE
-.TP
-.B "POST /ollama/start, /ollama/stop"
-Back\-compat alias for the first managed unit. Same two transports as above.
 .SH FILES
 .TP
 .I /etc/gpu-arbiter/config.toml
@@ -486,10 +478,8 @@ draining, and per\-unit VRAM is absent from
 .IR /status .
 .TP
 .B Control socket
-The unix control socket is Linux\-only; on Windows the sole write path is the TCP
-surface, which has no peer\-credential check. Scope
-.B bind
-with a firewall rule there.
+The unix control socket is Linux\-only. On Windows the write routes are
+served on the TCP port instead, restricted to loopback peers only.
 .TP
 .B Presence detection
 Linux\-only (evdev). On Windows presence is always reported as unknown.

@@ -101,8 +101,8 @@ pub enum ReconcileTrigger {
     /// only for [`Self::pass_trigger`]'s metric bucketing; behaviorally it is
     /// handled identically to every other trigger.
     Startup,
-    /// `POST /units/{unit}/start` (or the `/ollama/start` alias): start `unit`
-    /// now via its supervisor. Routed through the reconcile task — the sole
+    /// `POST /units/{unit}/start`: start `unit` now via its supervisor.
+    /// Routed through the reconcile task — the sole
     /// caller of [`crate::units::start`]/[`crate::units::evict`] — so an HTTP
     /// handler never races the reconcile task driving the same unit.
     /// **Rejected** (with [`ManualActionError::GpuHeldByGame`], any hold left
@@ -121,8 +121,8 @@ pub enum ReconcileTrigger {
         /// a `409` rejection from a `500` failure).
         reply: oneshot::Sender<Result<(), ManualActionError>>,
     },
-    /// `POST /units/{unit}/stop` (or the `/ollama/stop` alias): evict `unit` now
-    /// via its supervisor, and add it to the manually-held set (see
+    /// `POST /units/{unit}/stop`: evict `unit` now via its supervisor, and
+    /// add it to the manually-held set (see
     /// [`ArbiterState::held`]) so the ensure-running post-step — including the
     /// very next reconcile pass, even the periodic backstop timer — doesn't
     /// immediately restart it. The handler awaits `reply` for the outcome.
@@ -204,16 +204,12 @@ pub struct UnitStatus {
 ///   "state": "gaming",
 ///   "claims": ["steam:440"],
 ///   "units": [{ "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 }],
-///   "ollama": { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000 },
 ///   "gpu_vram_used_mb": 21500, "gpu_vram_total_mb": 32768,
 ///   "since": "2026-06-07T20:00:00Z"
 /// }
 /// ```
 ///
-/// `units` is the per-unit array (the managed-units generalization). `ollama` is
-/// a **back-compat alias** mirroring the Ollama unit (or the first managed unit
-/// if none is named "ollama"), so consumers written against the pre-`units`
-/// singular block keep working unchanged.
+/// `units` is the per-managed-unit array, in eviction order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     /// Daemon version (`CARGO_PKG_VERSION`, baked from the git tag at release
@@ -225,9 +221,6 @@ pub struct StatusSnapshot {
     pub claims: Vec<String>,
     /// Per-managed-unit sub-state, in eviction order.
     pub units: Vec<UnitStatus>,
-    /// Back-compat alias for the Ollama (or first) managed unit. Mirrors the
-    /// pre-`units` singular block.
-    pub ollama: UnitStatus,
     /// Total GPU VRAM used (MiB), across all tenants.
     pub gpu_vram_used_mb: u64,
     /// Total GPU VRAM capacity (MiB).
@@ -257,19 +250,6 @@ pub struct StatusSnapshot {
     /// pass that succeeds cleanly, or when the state resolves back to
     /// `available`.
     pub degraded: bool,
-}
-
-impl StatusSnapshot {
-    /// Pick the back-compat `ollama` alias from the per-unit list: the unit whose
-    /// name contains `ollama`, else the first unit, else an empty default. Pure.
-    fn ollama_alias(units: &[UnitStatus]) -> UnitStatus {
-        units
-            .iter()
-            .find(|u| u.unit.contains("ollama"))
-            .or_else(|| units.first())
-            .cloned()
-            .unwrap_or_default()
-    }
 }
 
 /// The live, in-memory state owned by the single reconcile task.
@@ -483,8 +463,7 @@ pub struct ReconcilePassCounts {
     pub proc_event: u64,
     /// Passes driven by the periodic backstop timer.
     pub timer: u64,
-    /// Passes driven by a `POST /units/{unit}/start|stop` (or `/ollama/*`
-    /// alias) manual trigger.
+    /// Passes driven by a `POST /units/{unit}/start|stop` manual trigger.
     pub manual: u64,
     /// The one-off startup pass `main` runs before any other task starts.
     pub startup: u64,
@@ -587,7 +566,6 @@ impl ArbiterState {
             version: env!("CARGO_PKG_VERSION").to_string(),
             state: self.state,
             claims: self.claims.iter().map(Claim::token).collect(),
-            ollama: StatusSnapshot::ollama_alias(&self.units),
             units: self.units.clone(),
             gpu_vram_used_mb: self.gpu_vram_used_mb,
             gpu_vram_total_mb: self.gpu_vram_total_mb,
@@ -760,8 +738,7 @@ mod tests {
         assert!(json.contains(r#""state":"gaming""#));
         assert!(json.contains(r#""claims":["steam:440"]"#));
         assert!(json.contains(r#""since":"2026-06-07T20:00:00Z""#));
-        // No units observed → both `units` is empty and the `ollama` alias
-        // defaults (vram_mb None → skipped).
+        // No units observed → `units` is empty (vram_mb None → skipped).
         assert!(json.contains(r#""units":[]"#));
         assert!(!json.contains("vram_mb"));
     }
@@ -807,9 +784,8 @@ mod tests {
     }
 
     #[test]
-    fn ollama_alias_mirrors_named_unit_not_just_first() {
-        // The back-compat `ollama` alias picks the ollama-named unit even when it
-        // isn't first, so legacy consumers keep reading Ollama's block.
+    fn snapshot_preserves_unit_order() {
+        // `units` order is preserved verbatim from `ArbiterState` (eviction order).
         let mut s = ArbiterState::new();
         s.units = vec![
             UnitStatus {
@@ -829,26 +805,9 @@ mod tests {
         ];
         let snap = s.snapshot();
         assert_eq!(snap.units.len(), 2);
-        // alias resolves to the ollama unit (second in the list).
-        assert_eq!(snap.ollama.unit, "ollama.service");
-        assert_eq!(snap.ollama.vram_mb, Some(21000));
-        // order of `units` is preserved (eviction order).
         assert_eq!(snap.units[0].unit, "vllm.service");
-    }
-
-    #[test]
-    fn ollama_alias_falls_back_to_first_unit() {
-        // No ollama-named unit → alias is the first managed unit.
-        let mut s = ArbiterState::new();
-        s.units = vec![UnitStatus {
-            unit: "vllm.service".into(),
-            running: Some(false),
-            models: vec![],
-            vram_mb: None,
-            held: false,
-        }];
-        let snap = s.snapshot();
-        assert_eq!(snap.ollama.unit, "vllm.service");
+        assert_eq!(snap.units[1].unit, "ollama.service");
+        assert_eq!(snap.units[1].vram_mb, Some(21000));
     }
 
     #[test]
