@@ -389,7 +389,10 @@ against a higher tier; it just falls through to stage 2.
 **edge-triggered**: it runs once when a unit becomes eligible to run again after
 an eviction attempt (yielded, stopped, or errored), and once per unit when the
 daemon starts. It does not run on steady-state passes. A failed resume is
-retried on the next pass until it succeeds.
+retried on the next pass until it succeeds. "Eligible" means no game holds the
+GPU and the unit is neither held nor preempted; it does **not** depend on
+`eager_restart`, which only controls whether a stopped unit is started.
+Resuming never starts a unit.
 
 The resume ledger is in memory only. The startup resume is what makes that
 safe: a daemon that restarted while a tenant was yielded cannot know it was, so

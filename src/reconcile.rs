@@ -579,6 +579,32 @@ pub async fn reconcile(
         let guard = read_state(state);
         (guard.held.clone(), guard.needs_resume.clone())
     };
+
+    // Undo any owed cooperative yield first, before any start. This covers
+    // every unit allowed to hold the GPU again (see [`resume_targets`]), not
+    // just eager ones and not just stopped ones:
+    //
+    // - A unit that released the GPU via `yield_cmd` is still *running*, so it
+    //   never reaches `to_start` below. Gating the resume on "needs starting"
+    //   would leave it paused forever: alive, healthy by every check here, and
+    //   quietly not doing any work.
+    // - A non-eager unit is never auto-started, but it can still be yielded.
+    //   `resume_cmd` is the un-yield hook, not a start, so running it for a
+    //   non-eager unit never starts anything; skipping it would leave that
+    //   tenant parked indefinitely.
+    //
+    // Edge-triggered via `needs_resume` (see its docs): a unit owes a resume
+    // after any eviction attempt and once at daemon startup, so `resume_cmd`
+    // runs on the way out of a yield instead of every 2 s pass. Running it
+    // every pass made it a second writer that could clobber state the tenant's
+    // own coordinator had set since. A failed resume stays owed and is retried
+    // next pass.
+    for u in resume_targets(desired, cfg, &held, &preempted) {
+        if needs_resume.contains(&u.unit) && units::resume(u).await {
+            write_state(state).needs_resume.remove(&u.unit);
+        }
+    }
+
     let eager_targets = ensure_running_targets(desired, cfg, &held, &preempted);
     if !eager_targets.is_empty() {
         // Only units NOT already running are actual start candidates
@@ -588,23 +614,6 @@ pub async fn reconcile(
         // silently coerced.
         let mut to_start = Vec::new();
         for u in eager_targets {
-            // Undo any cooperative yield first — for every eligible unit that
-            // owes one, not just the stopped ones. A unit that released the GPU
-            // via `yield_cmd` is still *running*, so it never reaches
-            // `to_start`, and gating the resume on "needs starting" would leave
-            // it paused forever: alive, healthy by every check here, and quietly
-            // not doing any work.
-            //
-            // Edge-triggered via `needs_resume` (see its docs): a unit owes a
-            // resume after any eviction attempt and once at daemon startup, so
-            // `resume_cmd` runs on the way out of a yield instead of every 2 s
-            // pass. Running it every pass made it a second writer that could
-            // clobber state the tenant's own coordinator had set since. A
-            // failed resume stays owed and is retried next pass.
-            if needs_resume.contains(&u.unit) && units::resume(u).await {
-                write_state(state).needs_resume.remove(&u.unit);
-            }
-
             let confirmed_running = units::is_running(u)
                 .await
                 .inspect_err(|e| {
@@ -747,14 +756,34 @@ fn ensure_running_targets<'c>(
     held: &std::collections::HashSet<String>,
     preempted: &[&ManagedUnit],
 ) -> Vec<&'c ManagedUnit> {
+    resume_targets(desired, cfg, held, preempted)
+        .into_iter()
+        .filter(|u| u.eager_restart)
+        .collect()
+}
+
+/// The units allowed to hold the GPU again this pass, and therefore the ones
+/// an owed `resume_cmd` may run for. **Pure** — unit-tested.
+///
+/// The same safety gate as [`ensure_running_targets`] **without** the
+/// `eager_restart` filter: `desired` must be exactly [`State::Available`], and
+/// held and preempted units are excluded. `eager_restart` only governs whether
+/// the daemon *starts* a stopped unit; resuming is the undo of a cooperative
+/// yield, so a non-eager unit that was yielded must still be resumed, or it
+/// stays parked indefinitely.
+fn resume_targets<'c>(
+    desired: State,
+    cfg: &'c Config,
+    held: &std::collections::HashSet<String>,
+    preempted: &[&ManagedUnit],
+) -> Vec<&'c ManagedUnit> {
     if desired != State::Available {
         return Vec::new();
     }
     cfg.resolved_units()
         .iter()
         .filter(|u| {
-            u.eager_restart
-                && !held.contains(&u.unit)
+            !held.contains(&u.unit)
                 // A unit a higher tier is currently preempting must not be
                 // restarted, or this post-step would immediately undo the
                 // tenant preemption the same pass performed. This is the
@@ -1806,6 +1835,14 @@ mod tests {
     /// Two-tier ladder: `high` (75) and an eager `low` (25) that yields
     /// cooperatively. `high_busy` decides whether `high` demands the GPU.
     fn yield_ladder_cfg(marker: &std::path::Path, high_busy: bool) -> Config {
+        yield_ladder_cfg_eager(marker, high_busy, true)
+    }
+
+    fn yield_ladder_cfg_eager(
+        marker: &std::path::Path,
+        high_busy: bool,
+        low_eager: bool,
+    ) -> Config {
         let busy = if high_busy { "true" } else { "false" };
         Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
@@ -1820,6 +1857,7 @@ mod tests {
             [[managed_units]]
             unit = "low.service"
             priority = 25
+            eager_restart = {low_eager}
             start_cmd = ["true"]
             stop_cmd = ["true"]
             is_active_cmd = "true"
@@ -1860,6 +1898,105 @@ mod tests {
 
         pass(&state, &idle, ReconcileTrigger::Timer).await;
         assert!(!take_marker(&marker), "only once per yield");
+    }
+
+    #[tokio::test]
+    async fn non_eager_unit_is_resumed_after_a_yield() {
+        // Review regression: resume used to be reached only while iterating the
+        // eager targets, so a non-eager unit that yielded stayed parked forever.
+        let marker = marker_path("resume-noneager");
+        let busy = yield_ladder_cfg_eager(&marker, true, false);
+        let idle = yield_ladder_cfg_eager(&marker, false, false);
+        let state = shared(ArbiterState::new());
+
+        pass(&state, &busy, ReconcileTrigger::Timer).await;
+        assert!(!take_marker(&marker), "no resume while still preempted");
+        assert!(read_state(&state).needs_resume.contains("low.service"));
+
+        pass(&state, &idle, ReconcileTrigger::Timer).await;
+        assert!(take_marker(&marker), "a non-eager unit must be resumed too");
+        assert!(read_state(&state).needs_resume.is_empty());
+
+        pass(&state, &idle, ReconcileTrigger::Timer).await;
+        assert!(!take_marker(&marker), "only once per yield");
+    }
+
+    #[tokio::test]
+    async fn non_eager_unit_is_resumed_at_startup_but_never_started() {
+        let resume_marker = marker_path("resume-noneager-startup");
+        let start_marker = marker_path("start-noneager-startup");
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            eager_restart = false
+            start_cmd = ["touch", "{start}"]
+            stop_cmd = ["true"]
+            is_active_cmd = "false"
+            resume_cmd = ["touch", "{resume}"]
+            "#,
+            start = crate::testutil::toml_path(&start_marker),
+            resume = crate::testutil::toml_path(&resume_marker),
+        )))
+        .unwrap();
+        let state = shared(ArbiterState::with_config(&cfg));
+
+        pass(&state, &cfg, ReconcileTrigger::Startup).await;
+        assert!(
+            take_marker(&resume_marker),
+            "startup resume reaches non-eager units"
+        );
+        assert!(
+            !take_marker(&start_marker),
+            "resuming must never start a non-eager unit"
+        );
+        pass(&state, &cfg, ReconcileTrigger::Timer).await;
+        assert!(!take_marker(&resume_marker));
+    }
+
+    #[test]
+    fn resume_targets_include_non_eager_but_respect_every_gate() {
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "eager.service"
+
+            [[managed_units]]
+            unit = "lazy.service"
+            eager_restart = false
+
+            [[managed_units]]
+            unit = "held.service"
+            eager_restart = false
+
+            [[managed_units]]
+            unit = "preempted.service"
+            eager_restart = false
+            "#,
+        )
+        .unwrap();
+        let held: std::collections::HashSet<String> =
+            std::iter::once("held.service".to_string()).collect();
+        let preempted = vec![unit_named(&cfg, "preempted.service")];
+        let names = |v: Vec<&ManagedUnit>| v.iter().map(|u| u.unit.clone()).collect::<Vec<_>>();
+
+        assert_eq!(
+            names(resume_targets(State::Available, &cfg, &held, &preempted)),
+            vec!["eager.service", "lazy.service"]
+        );
+        // Eager-start eligibility is still eager-only.
+        assert_eq!(
+            names(ensure_running_targets(
+                State::Available,
+                &cfg,
+                &held,
+                &preempted
+            )),
+            vec!["eager.service"]
+        );
+        for blocked in [State::Gaming, State::Evicting] {
+            assert!(resume_targets(blocked, &cfg, &held, &preempted).is_empty());
+        }
     }
 
     #[tokio::test]

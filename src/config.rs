@@ -262,7 +262,8 @@ pub struct ManagedUnit {
     /// Undo for [`ManagedUnit::yield_cmd`] — lets the tenant use the GPU again.
     ///
     /// Run on the restore path **before** any start, and only on an edge: once
-    /// when the unit becomes eligible to run again after an eviction attempt
+    /// when the unit becomes eligible to run again (no game, not held, not
+    /// preempted — regardless of `eager_restart`) after an eviction attempt
     /// (yielded or stopped), and once per unit when the daemon starts. A failed
     /// resume is retried on the next pass. It must be idempotent, because the
     /// startup resume also runs on units that were never yielded — that is what

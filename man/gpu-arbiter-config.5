@@ -322,6 +322,10 @@ any start, and
 once when the unit becomes eligible to run again after an eviction attempt
 (yielded, stopped, or errored), and once per unit when the daemon starts \(em
 never on steady\-state passes. A failed resume is retried on the next pass.
+This applies whether or not the unit sets
+.BR eager_restart ,
+which only controls whether a stopped unit is started; resuming never starts
+a unit.
 The ledger is in memory only; the startup resume is what keeps a daemon
 restart from leaving a yielded tenant parked. It must therefore be
 .BR idempotent ,
