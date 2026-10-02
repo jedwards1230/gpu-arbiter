@@ -274,7 +274,10 @@ below.
 .B busy_cmd
 String or array of strings. Default: none.
 Probe for "this tenant has work right now" \(em
-.B exit 0 means busy.
+.B exit 0 means busy, exit 1 means idle.
+Any other exit code also reads as idle (logged at debug level only), so a
+.B curl \-sf
+probe that signals idle with an HTTP error status (curl exit 22) keeps working.
 This is what lets a tenant
 .I preempt
 lower tiers rather than merely surviving them; without it a unit is a
@@ -282,10 +285,13 @@ preemption target only, never a source (the right default, since a
 merely\-running server holding an idle model should not evict anything). Run on
 .B every
 reconcile pass, so it must be cheap and must not block. A probe that fails to
-spawn, times out, or exits non\-zero reads as
+spawn, times out, or is killed by a signal also reads as
 .BR "not busy" ,
 the conservative direction \(em a broken probe must not be able to evict a
-lower tier on a false pretext.
+lower tier on a false pretext. Only those genuine failures are logged as
+warnings and counted in
+.BR gpu_arbiter_hook_failures_total ;
+an idle reply never is.
 .TP
 .B yield_cmd
 String or array of strings. Default: none.
@@ -311,12 +317,19 @@ String or array of strings. Default: none. Undo for
 .BR yield_cmd ,
 letting the tenant use the GPU again. Run on the restore path
 .B before
-any start, and expected to be
-.BR idempotent :
-the daemon deliberately does not track whether a given unit was yielded or
-stopped, because that state would have to survive a daemon restart to be
-trustworthy. Running an idempotent resume unconditionally is cheaper and
-cannot desync.
+any start, and
+.B edge\-triggered:
+once when the unit becomes eligible to run again after an eviction attempt
+(yielded, stopped, or errored), and once per unit when the daemon starts \(em
+never on steady\-state passes. A failed resume is retried on the next pass.
+This applies whether or not the unit sets
+.BR eager_restart ,
+which only controls whether a stopped unit is started; resuming never starts
+a unit.
+The ledger is in memory only; the startup resume is what keeps a daemon
+restart from leaving a yielded tenant parked. It must therefore be
+.BR idempotent ,
+because the startup resume also reaches units that were never yielded.
 .TP
 .B yield_timeout_s
 Integer (seconds). Default: none (falls back to the top\-level
@@ -397,9 +410,11 @@ String. Default: none. Introspection backend selector for the
 .B models[]
 list. The only recognized value is
 .BR """ollama""" ,
-which runs
-.B "ollama ps"
-and parses its table for loaded model names. Any other non\-empty value reports
+which queries the Ollama HTTP API
+.RB ( "GET {ollama_url}/api/ps" ;
+see
+.BR ollama_url )
+for loaded model names. Any other non\-empty value reports
 .B no
 models and
 .B suppresses
@@ -411,8 +426,7 @@ on a unit named
 .I ollama.service
 will
 .B not
-run
-.BR "ollama ps" .
+query Ollama.
 The name\-based heuristic applies
 .B only
 when
@@ -482,6 +496,29 @@ since this query runs on every reconcile pass's
 .I /status
 refresh and must stay fast); a custom introspection command that runs longer
 is killed and silently yields an empty list, so keep it fast.
+.TP
+.B ollama_url
+String. Default:
+.BR http://127.0.0.1:11434 .
+Base URL of the Ollama HTTP API, used when the unit introspects as Ollama (see
+.B kind
+and INTROSPECTION RESOLUTION). The daemon queries
+.B "GET {ollama_url}/api/ps"
+directly rather than running the
+.B ollama
+CLI, which is often not on a service account's
+.BR PATH ;
+proxy environment variables are ignored. Plain
+.B http://
+only \(em the daemon carries no TLS stack, and
+.B \-\-check\-config
+warns about any other scheme. Bounded to 2 seconds. A failed query (refused,
+non\-2xx, unparseable body, timeout) is reported in the unit's
+.I /status
+.B models_error
+field rather than as an empty
+.B models[]
+list. Daemons older than this key reject it as unknown.
 .SH THE PRIORITY LADDER
 Gaming\-beats\-everything is the floor, not the whole model. Tenants also rank
 against
@@ -567,8 +604,8 @@ else
 .B kind
 ==
 .B """ollama"""
-\(rA run
-.BR "ollama ps" .
+\(rA query
+.BR "GET {ollama_url}/api/ps" .
 .IP 3. 4
 else
 .B kind
@@ -591,12 +628,12 @@ unset) \(rA name heuristic: if the
 .B unit
 name contains
 .I ollama
-(case\-insensitive), run
-.BR "ollama ps" ;
+(case\-insensitive), query
+.BR "GET {ollama_url}/api/ps" ;
 otherwise report no models.
 .PP
 An Ollama\-kinded or Ollama\-named unit therefore introspects via
-.B "ollama ps"
+.B "GET {ollama_url}/api/ps"
 by default (steps 2 and 4), any other tenant can report its own model/process
 list via
 .B introspect_cmd

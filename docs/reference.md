@@ -61,7 +61,8 @@ curl --unix-socket /run/gpu-arbiter/gpu-arbiter.sock -X POST http://localhost/un
   "claims": ["steam:440"],
   "units": [
     { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false },
-    { "unit": "vllm.service", "running": null, "models": [], "held": true }
+    { "unit": "vllm.service", "running": null, "models": [], "held": true },
+    { "unit": "ollama-b", "running": true, "models": [], "models_error": "GET http://127.0.0.1:11500/api/ps: Connection refused", "held": false }
   ],
   "gpu_vram_used_mb": 21500,
   "gpu_vram_total_mb": 32768,
@@ -80,7 +81,11 @@ consumers treat `evicting` as busy).
 Per-unit `running` is a **tristate**: `true`/`false` are confirmed
 running/stopped, and `null` means the daemon's `is-active` check itself failed
 (a wedged supervisor, a missing `*_cmd` binary) — "couldn't tell", not a
-confirmed answer. `held` is `true` while an operator has manually stopped that
+confirmed answer. `models_error` is present only when the unit's model query
+failed (for an Ollama unit: the `GET {ollama_url}/api/ps` request) — so an
+empty `models` list without it is a real "nothing loaded", never a silent
+failure. A failing query is logged at WARN when it starts failing and at INFO
+when it recovers. `held` is `true` while an operator has manually stopped that
 unit and it hasn't been manually started again (see below). Top-level
 `degraded` is `true` when the most recent eviction had at least one unit fail
 to evict — gaming still won the GPU unconditionally, but a tenant may still be
@@ -148,7 +153,14 @@ It also exposes four **counters** — durable eviction/restart/reconcile history
 that outlives journald's short retention on the deployment host. Monotonic for
 the daemon's process lifetime; a restart resets them to 0, so alert/dashboard
 queries should use `rate()`/`increase()` rather than comparing raw values
-across a restart:
+across a restart.
+
+The per-unit eviction series (`gpu_arbiter_evictions_total` for every
+`outcome`, and `gpu_arbiter_eviction_duration_seconds` for every `stage`) are
+**pre-seeded at 0 for every configured unit at startup**, so they exist before
+the first eviction. `absent()` alerts and dashboards therefore work on a fresh
+daemon, and `increase()` does not miss the first eviction for lack of a prior
+sample.
 
 | Metric | Meaning |
 |---|---|
@@ -157,7 +169,7 @@ across a restart:
 | `gpu_arbiter_unit_restarts_total{unit}` | Cumulative successful managed-unit starts driven by the daemon (eager restore or manual start) |
 | `gpu_arbiter_proc_events_dropped_total` | Cumulative `cn_proc` drop occurrences: kernel `ENOBUFS` overflow plus full-trigger-channel drops |
 | `gpu_arbiter_reconcile_passes_total{trigger}` | Cumulative reconcile passes, `trigger` ∈ `proc_event`\|`timer`\|`manual`\|`startup` |
-| `gpu_arbiter_hook_failures_total{unit,hook,outcome}` | Cumulative tenant-hook failures, `hook` ∈ `busy`\|`yield`\|`resume`, `outcome` ∈ `nonzero` (ran, exited non-zero) \| `unrunnable` (could not spawn, or timed out). A hook failing on every call is otherwise invisible: `up` stays 1 and `degraded` stays false. |
+| `gpu_arbiter_hook_failures_total{unit,hook,outcome}` | Cumulative tenant-hook failures, `hook` ∈ `busy`\|`yield`\|`resume`, `outcome` ∈ `nonzero` (ran, exited non-zero — for `busy` only a signal death, since any exit code is a busy/idle reply) \| `unrunnable` (could not spawn, or timed out). A hook failing on every call is otherwise invisible: `up` stays 1 and `degraded` stays false. |
 
 ## Command-line usage
 
@@ -277,13 +289,14 @@ gaming ends. Each entry:
 | `unit` | _(required)_ | systemd unit the daemon owns (or a free-form label when command overrides are set) |
 | `eager_restart` | `true` | Restart this unit when gaming ends |
 | `priority` | `50` | Tier on the [priority ladder](#priority-ladder-and-cooperative-eviction). A demand at `P` preempts every unit with `priority < P`; the comparison is strict, so equal tiers coexist |
-| `busy_cmd` | _(none)_ | Probe for "this tenant has work right now" — **exit 0 = busy**. Required for a unit to *preempt* lower tiers, and required for `yield_cmd` to work at all |
+| `busy_cmd` | _(none)_ | Probe for "this tenant has work right now" — **exit 0 = busy, exit 1 = idle** (other codes also read idle; see [the contract](#priority-ladder-and-cooperative-eviction)). Required for a unit to *preempt* lower tiers, and required for `yield_cmd` to work at all |
 | `yield_cmd` | _(none)_ | Cooperative release: ask the tenant to drop the GPU while staying alive, tried before any stop. **Ignored unless `busy_cmd` is also set** |
-| `resume_cmd` | _(none)_ | Undo for `yield_cmd`, run on the restore path before any start. Must be idempotent |
+| `resume_cmd` | _(none)_ | Undo for `yield_cmd`, run on the restore path before any start — once after each eviction attempt and once per unit at daemon startup, never on steady-state passes. Must be idempotent |
 | `yield_timeout_s` | _(none)_ | Per-unit cooperative-release budget before escalating to the stop path; falls back to the top-level `yield_timeout_s` |
 | `vram_match` | _(none)_ | **Fallback** substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution. A systemd-supervised unit is attributed automatically via cgroup PID resolution with no config needed; `vram_match` is consulted whenever cgroup resolution doesn't produce a match for that poll — always the case for command-driven (`*_cmd`) units and non-systemd hosts, and occasionally for a systemd unit too (see [VRAM attribution](#vram-attribution)) |
-| `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (runs `ollama ps`); any other value reports no models and suppresses the name heuristic |
+| `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (queries `GET {ollama_url}/api/ps`); any other value reports no models and suppresses the name heuristic |
 | `introspect_cmd` | _(none)_ | Explicit command (shell-free argv) whose stdout lists loaded model/process names, one per line. Takes precedence over `kind` and the name heuristic |
+| `ollama_url` | `http://127.0.0.1:11434` | Base URL of the Ollama HTTP API, used when the unit introspects as Ollama. Queried directly (no `ollama` CLI needed, proxy env vars ignored). Plain `http://` only — the daemon has no TLS; `--check-config` warns otherwise. A failed query sets `units[].models_error`. Daemons up to v0.12.x reject the key as unknown (`deny_unknown_fields`) |
 | `stop_cmd` | _(none)_ | Override: command to stop/evict the tenant (`None` → `systemctl stop`) |
 | `start_cmd` | _(none)_ | Override: command to start the tenant (`None` → `systemctl start`) |
 | `is_active_cmd` | _(none)_ | Override: command whose **exit 0 = running** (`None` → `systemctl is-active`) |
@@ -292,7 +305,7 @@ gaming ends. Each entry:
 If `managed_units` is omitted entirely, it defaults to a single entry —
 `unit = "ollama.service"`, `eager_restart = true`, `vram_match = "ollama"`,
 `kind = "ollama"` — so an unconfigured daemon evicts Ollama, attributes its
-VRAM, and introspects its loaded models (`ollama ps`) with zero setup. An
+VRAM, and introspects its loaded models (`GET /api/ps` on `ollama_url`) with zero setup. An
 explicit `managed_units = []` disables eviction entirely.
 
 ### Priority ladder and cooperative eviction
@@ -329,9 +342,19 @@ priority = 25              # background batch work — yields to everyone
 `busy_cmd` exits 0 ("I have work right now"). Without a `busy_cmd` a unit is a
 preemption target only, never a source — the right default, since a
 merely-running server holding an idle model should not evict anything. The probe
-runs on every reconcile pass, so it must be cheap and non-blocking; one that
-fails to spawn, times out, or exits non-zero reads as **not busy**, so a broken
-probe can never evict a lower tier on a false pretext.
+runs on every reconcile pass, so it must be cheap and non-blocking.
+
+The exit-code contract:
+
+| Exit | Reads as | Logged / counted |
+|---|---|---|
+| `0` | busy | silent |
+| `1` | idle (the canonical reply) | silent |
+| any other code | idle — kept for `curl -sf` probes, which say "idle" with exit 22 (HTTP error) or 7 (refused) | debug log only |
+| spawn failure, timeout, killed by a signal | idle | WARN + `gpu_arbiter_hook_failures_total{hook="busy"}` |
+
+Every failure reads as **not busy**, so a broken probe can never evict a lower
+tier on a false pretext.
 
 Inter-tenant preemption deliberately does **not** move `state` to `gaming` or
 `evicting` — those words are the `/status` contract for "a game owns the GPU,
@@ -362,11 +385,19 @@ against a higher tier; it just falls through to stage 2.
 > budget: waiting cannot produce information it is structurally unable to
 > observe. Always configure the two together.
 
-`resume_cmd` is the undo, run on the restore path before any start. It must be
-**idempotent** — the daemon deliberately does not track whether a given unit was
-yielded or stopped, because that state would have to survive a daemon restart to
-be trustworthy; running an idempotent resume unconditionally is cheaper and
-cannot desync.
+`resume_cmd` is the undo, run on the restore path before any start. It is
+**edge-triggered**: it runs once when a unit becomes eligible to run again after
+an eviction attempt (yielded, stopped, or errored), and once per unit when the
+daemon starts. It does not run on steady-state passes. A failed resume is
+retried on the next pass until it succeeds. "Eligible" means no game holds the
+GPU and the unit is neither held nor preempted; it does **not** depend on
+`eager_restart`, which only controls whether a stopped unit is started.
+Resuming never starts a unit.
+
+The resume ledger is in memory only. The startup resume is what makes that
+safe: a daemon that restarted while a tenant was yielded cannot know it was, so
+it resumes every unit once. `resume_cmd` must therefore be **idempotent**, since
+the startup resume also reaches units that were never yielded.
 
 Tune the two budgets from
 `gpu_arbiter_eviction_duration_seconds{stage="yield"|"stop"}` rather than by

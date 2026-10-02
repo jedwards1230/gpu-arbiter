@@ -248,7 +248,9 @@ impl Hook {
 /// and collapsing them would hide that distinction from an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HookFailure {
-    /// Spawned and exited with a non-zero status.
+    /// Spawned and exited with a non-zero status. For `busy_cmd` only a
+    /// signal death lands here: a non-zero exit *code* is the probe's "idle"
+    /// reply, not a failure (see [`BusyReply`]).
     NonZero,
     /// Could not be spawned, or timed out before producing a status.
     Unrunnable,
@@ -357,13 +359,13 @@ fn stderr_excerpt(stderr: &[u8]) -> String {
 /// below any reasonable systemd transaction timeout.
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Hard ceiling on the `/status` refresh path's model-introspection shell-outs
-/// (`ollama ps` / a configured `introspect_cmd`) — tighter than
+/// Hard ceiling on the `/status` refresh path's model introspection (the
+/// Ollama `/api/ps` query / a configured `introspect_cmd`) — tighter than
 /// [`SYSTEMCTL_TIMEOUT`]. These run on every reconcile pass's
 /// `refresh_substate`, which the reconcile task must return from promptly to
 /// react to the next trigger (a game launch); the doc on
 /// [`loaded_models`] already commits to "fast on the /status refresh path", and
-/// 10s wasn't honoring that. 2s is generous for a healthy `ollama ps`/custom
+/// 10s wasn't honoring that. 2s is generous for a healthy Ollama API/custom
 /// script (typically tens of ms) while still bounding the worst case tightly.
 const INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -498,21 +500,91 @@ pub fn eviction_step(reading: UnitVramReading, elapsed: Duration, cfg: &Config) 
     }
 }
 
-/// Parse `ollama ps` table output into the list of loaded model names. Pure.
+/// Why a `/status` `models[]` query failed. Rendered into
+/// [`crate::state::UnitStatus::models_error`].
+#[derive(Debug, thiserror::Error)]
+pub enum IntrospectError {
+    /// The HTTP request failed: connection refused, a non-2xx status, an
+    /// unsupported URL (e.g. `https://` — the daemon has no TLS), or ureq's own
+    /// timeout. Stringified because `ureq::Error` is not worth carrying across
+    /// the `spawn_blocking` boundary for a value that is only ever displayed.
+    #[error("GET {url}: {detail}")]
+    Request {
+        /// The URL queried.
+        url: String,
+        /// The failure, as reported by the HTTP client.
+        detail: String,
+    },
+    /// The request succeeded but the body was not the expected JSON shape.
+    #[error("GET {url}: unexpected response body: {source}")]
+    Parse {
+        /// The URL queried.
+        url: String,
+        /// The JSON decode failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The query did not finish within [`INTROSPECTION_TIMEOUT`].
+    #[error("GET {url}: timed out after {elapsed:?}")]
+    Timeout {
+        /// The URL queried.
+        url: String,
+        /// The bound that elapsed.
+        elapsed: Duration,
+    },
+    /// The blocking HTTP task panicked or was cancelled.
+    #[error("GET {url}: query task failed: {detail}")]
+    Task {
+        /// The URL queried.
+        url: String,
+        /// The join failure.
+        detail: String,
+    },
+}
+
+/// The subset of Ollama's `GET /api/ps` response the daemon reads.
+#[derive(Debug, serde::Deserialize)]
+struct OllamaPsResponse {
+    /// Loaded models. Ollama sends `[]` when none are loaded. Required and
+    /// non-null on purpose: a missing key or `null` means the response is not
+    /// what we asked for, and reading it as "no models" would hide that behind
+    /// an idle-looking status.
+    models: Vec<OllamaPsModel>,
+}
+
+/// One loaded model in an `/api/ps` response.
+#[derive(Debug, serde::Deserialize)]
+struct OllamaPsModel {
+    /// The model tag (`"qwen3:30b"`).
+    #[serde(default)]
+    name: Option<String>,
+    /// Same tag under the newer key; used when `name` is absent.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Parse an Ollama `GET /api/ps` JSON body into loaded model names. Pure —
+/// unit-tested. `{"models":[]}` is the only genuine empty list; a body that is
+/// not JSON of that shape — including a missing or `null` `models` — is an
+/// error, never an empty list.
 ///
-/// `ollama ps` prints a header row (`NAME  ID  SIZE  PROCESSOR  UNTIL`) followed
-/// by one row per loaded model; the model name is the first whitespace-delimited
-/// column. A header-only table (no models loaded) yields an empty vec.
-pub fn parse_ollama_ps(out: &str) -> Vec<String> {
-    out.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        // Drop exactly the header row (the first non-empty line). `skip(1)` is
-        // unambiguous — `skip_while`-on-"NAME" would also swallow a model that
-        // happened to be named `NAME`.
-        .skip(1)
-        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
-        .collect()
+/// # Errors
+///
+/// Returns the JSON decode error when `body` is not an `/api/ps` response.
+pub fn parse_ollama_api_ps(body: &str) -> Result<Vec<String>, serde_json::Error> {
+    let resp: OllamaPsResponse = serde_json::from_str(body)?;
+    Ok(resp
+        .models
+        .into_iter()
+        .filter_map(|m| m.name.or(m.model))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect())
+}
+
+/// `{base}/api/ps`, tolerating a trailing slash on `base`.
+fn ollama_ps_url(base: &str) -> String {
+    format!("{}/api/ps", base.trim_end_matches('/'))
 }
 
 /// Run `systemctl <action> <unit>`; map a non-zero exit / spawn failure into a
@@ -685,18 +757,23 @@ async fn try_yield(u: &ManagedUnit, cfg: &Config) -> YieldOutcome {
 /// Let `u` use the GPU again after a cooperative yield — the undo for
 /// [`ManagedUnit::yield_cmd`].
 ///
-/// Best-effort and expected to be idempotent: the restore path runs it
-/// unconditionally rather than tracking which units were yielded versus stopped,
-/// because that state would have to survive a daemon restart to be trustworthy.
-/// A no-op resume on a unit that was never yielded is cheap; a desynced ledger
-/// that leaves a tenant paused forever is not.
-pub async fn resume(u: &ManagedUnit) {
+/// Edge-triggered by the caller: the restore path runs it once when a unit
+/// leaves preemption (after any eviction attempt, yielded or stopped) and once
+/// per unit at daemon startup — see [`crate::state::ArbiterState::needs_resume`].
+/// It must still be idempotent, because the startup resume runs on units that
+/// were never yielded.
+///
+/// Returns `true` when there is nothing left to do (the resume succeeded, or
+/// the unit has no `resume_cmd`), and `false` when it failed, so the caller
+/// can retry on the next pass rather than leave the tenant parked.
+pub async fn resume(u: &ManagedUnit) -> bool {
     let Some(cmd) = u.resume_cmd.as_ref() else {
-        return;
+        return true;
     };
     match run_argv("resume", &u.unit, &cmd.0, "").await {
         Ok(out) if out.status.success() => {
             tracing::debug!(unit = %u.unit, "tenant resumed");
+            true
         }
         Ok(out) => {
             record_hook_failure(&u.unit, Hook::Resume, HookFailure::NonZero);
@@ -704,18 +781,61 @@ pub async fn resume(u: &ManagedUnit) {
                 unit = %u.unit,
                 code = ?out.status.code(),
                 stderr = %stderr_excerpt(&out.stderr),
-                "resume_cmd exited non-zero"
+                "resume_cmd exited non-zero; will retry next pass"
             );
+            false
         }
         Err(e) => {
             record_hook_failure(&u.unit, Hook::Resume, HookFailure::Unrunnable);
-            tracing::warn!(unit = %u.unit, error = %e, "resume_cmd could not be run");
+            tracing::warn!(unit = %u.unit, error = %e, "resume_cmd could not be run; will retry next pass");
+            false
         }
     }
 }
 
+/// How one `busy_cmd` exit status reads. Produced by the pure
+/// [`classify_busy_exit`]; consumed by [`is_busy`].
+///
+/// The contract is **exit 0 = busy, exit 1 = idle**. Exit 1 is a *reply*, not a
+/// failure: it is how every probe says "no work right now", so it is silent and
+/// never counted. Before this was split out, exit 1 was logged as a WARN and
+/// counted in `gpu_arbiter_hook_failures_total{hook="busy",outcome="nonzero"}`
+/// on every pass — one "failure" per reconcile for a perfectly healthy idle
+/// tenant, which made the counter useless for alerting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyReply {
+    /// Exit 0 — the tenant has work and demands the GPU at its priority.
+    Busy,
+    /// Exit 1 — the canonical "idle" reply.
+    Idle,
+    /// Any other exit code — also read as idle, for backward compatibility.
+    ///
+    /// The shipped examples use `curl -sf <url>` as a probe, which says "idle"
+    /// with curl's own codes (22 for an HTTP error status, 7 for connection
+    /// refused) — never 1. Treating those as failures would page on every pass
+    /// for configs written straight from the docs. Logged at debug level only,
+    /// so a probe that really is broken (a usage error exiting 2, say) is still
+    /// discoverable with `RUST_LOG=debug`.
+    IdleOther(i32),
+    /// No exit code at all: the probe was terminated by a signal. That is a
+    /// crash, not a reply, so it still counts as a hook failure.
+    Killed,
+}
+
+/// Classify a `busy_cmd` exit code (`None` = terminated by a signal). Pure —
+/// unit-tested.
+#[must_use]
+pub fn classify_busy_exit(code: Option<i32>) -> BusyReply {
+    match code {
+        Some(0) => BusyReply::Busy,
+        Some(1) => BusyReply::Idle,
+        Some(other) => BusyReply::IdleOther(other),
+        None => BusyReply::Killed,
+    }
+}
+
 /// Whether `u` currently has work, via its configured `busy_cmd`. **Exit 0 =
-/// busy.**
+/// busy, exit 1 = idle** (see [`BusyReply`] for every other case).
 ///
 /// This is what promotes a tenant from a preemption *target* to a preemption
 /// *source*: a busy unit demands the GPU at its own priority and evicts every
@@ -724,35 +844,45 @@ pub async fn resume(u: &ManagedUnit) {
 /// able to evict anything.
 ///
 /// **Never errors, and every failure reads as "not busy."** A probe that cannot
-/// spawn, times out, or exits non-zero returns `false`. That direction is
+/// spawn, times out, or is killed returns `false`. That direction is
 /// deliberate and is the opposite of [`is_running`]'s unsure-means-still-running
 /// default: a broken `is_running` that under-reports would skip a needed
 /// eviction, whereas a broken `busy_cmd` that over-reports would evict a lower
 /// tier on a false pretext. Each defaults toward the outcome that does less
 /// damage when the probe is wrong.
+///
+/// Only genuine failures — spawn errors, timeouts, signal deaths — are logged at
+/// WARN and counted in `gpu_arbiter_hook_failures_total{hook="busy"}`. Exit 1
+/// is silent; any other non-zero exit is idle with a debug line.
 pub async fn is_busy(u: &ManagedUnit) -> bool {
     let Some(cmd) = u.busy_cmd.as_ref() else {
         return false;
     };
     match run_argv("busy", &u.unit, &cmd.0, "").await {
-        Ok(out) if out.status.success() => true,
-        // The probe ran and said "not busy" only if it exited 0 above. Any other
-        // status means it *broke* — a distinct condition from a genuine
-        // not-busy reply, and it must be observable rather than silently
-        // indistinguishable from a permanently-idle tenant. The
-        // fail-toward-not-busy return stays deliberate; the failure is now
-        // logged and counted.
-        Ok(out) => {
-            record_hook_failure(&u.unit, Hook::Busy, HookFailure::NonZero);
-            tracing::warn!(
-                unit = %u.unit,
-                code = ?out.status.code(),
-                stderr = %stderr_excerpt(&out.stderr),
-                "busy probe exited non-zero; treating as not busy (the unit cannot defend itself \
-                 against preemption while this persists)"
-            );
-            false
-        }
+        Ok(out) => match classify_busy_exit(out.status.code()) {
+            BusyReply::Busy => true,
+            BusyReply::Idle => false,
+            BusyReply::IdleOther(code) => {
+                tracing::debug!(
+                    unit = %u.unit,
+                    code,
+                    stderr = %stderr_excerpt(&out.stderr),
+                    "busy probe exited with a code other than 0/1; reading it as idle"
+                );
+                false
+            }
+            BusyReply::Killed => {
+                record_hook_failure(&u.unit, Hook::Busy, HookFailure::NonZero);
+                tracing::warn!(
+                    unit = %u.unit,
+                    status = %out.status,
+                    stderr = %stderr_excerpt(&out.stderr),
+                    "busy probe was terminated without an exit code; treating as not busy (the \
+                     unit cannot defend itself against preemption while this persists)"
+                );
+                false
+            }
+        },
         Err(e) => {
             record_hook_failure(&u.unit, Hook::Busy, HookFailure::Unrunnable);
             tracing::warn!(unit = %u.unit, error = %e, "busy probe failed; treating as not busy");
@@ -761,27 +891,33 @@ pub async fn is_busy(u: &ManagedUnit) -> bool {
     }
 }
 
-/// Best-effort list of loaded model/process names for a managed unit (for the
-/// `/status` `models[]` field).
+/// List the loaded model/process names for a managed unit (for the `/status`
+/// `models[]` field).
 ///
 /// Generic over the tenant: the backend is resolved purely from the unit's config
 /// (see [`ManagedUnit::introspection`]):
 ///
 /// - [`Introspection::Command`] → run the configured `introspect_cmd` as a
 ///   shell-free argv and turn each non-empty trimmed stdout line into a name.
-/// - [`Introspection::Ollama`] → run `ollama ps` and parse it with
-///   [`parse_ollama_ps`] — the default for an `ollama`-kinded or
-///   `ollama`-named unit.
-/// - [`Introspection::None`] → empty vec (no model reporting for this unit).
+///   Best-effort: a missing binary or non-zero exit yields `Ok(vec![])`.
+/// - [`Introspection::Ollama`] → `GET {ollama_url}/api/ps` — the default for an
+///   `ollama`-kinded or `ollama`-named unit. A failed query is an `Err`, so it
+///   can be reported distinctly from "no models loaded".
+/// - [`Introspection::None`] → `Ok(vec![])` (no model reporting for this unit).
 ///
-/// Best-effort + bounded throughout: a missing binary, failed/empty query,
-/// non-zero exit, or non-systemd host yields an empty vec — **never** an error or
-/// panic (purely informational, must not break a `/status` response).
-pub async fn loaded_models(unit: &ManagedUnit) -> Vec<String> {
+/// Bounded by [`INTROSPECTION_TIMEOUT`] and never panics — it is purely
+/// informational and must not break a `/status` response.
+///
+/// # Errors
+///
+/// Returns [`IntrospectError`] when the Ollama API query fails.
+pub async fn loaded_models(unit: &ManagedUnit) -> Result<Vec<String>, IntrospectError> {
     match unit.introspection() {
-        Introspection::Command(cmd) => run_introspect_cmd(&cmd).await,
-        Introspection::Ollama => ollama_loaded_models().await,
-        Introspection::None => Vec::new(),
+        Introspection::Command(cmd) => Ok(run_introspect_cmd(&cmd).await),
+        Introspection::Ollama => {
+            ollama_loaded_models(unit.ollama_base_url(), INTROSPECTION_TIMEOUT).await
+        }
+        Introspection::None => Ok(Vec::new()),
     }
 }
 
@@ -817,21 +953,52 @@ pub fn parse_model_lines(out: &str) -> Vec<String> {
         .collect()
 }
 
-/// Best-effort list of loaded Ollama model names via `ollama ps`.
+/// Loaded Ollama model names via the HTTP API (`GET {base_url}/api/ps`).
 ///
-/// Returns an empty vec when Ollama is not running, the `ollama` CLI is absent,
-/// or the query fails — never an error. Used by [`loaded_models`] for the Ollama
-/// introspection backend.
-async fn ollama_loaded_models() -> Vec<String> {
-    let fut = tokio::process::Command::new("ollama").arg("ps").output();
-    // Best-effort + bounded: a hung `ollama ps` must not stall the
-    // reconcile — 2s, tighter than the control-verb SYSTEMCTL_TIMEOUT.
-    match tokio::time::timeout(INTROSPECTION_TIMEOUT, fut).await {
-        Ok(Ok(out)) if out.status.success() => {
-            parse_ollama_ps(&String::from_utf8_lossy(&out.stdout))
+/// Replaces a bare `ollama ps` shell-out, which depended on the CLI being on
+/// the daemon's `PATH`. It usually is not for a Windows service running as
+/// `LocalSystem`, and the failed spawn was silently reported as `models: []`.
+/// The CLI is itself only a client of this same endpoint, so on Linux the
+/// answer is unchanged.
+///
+/// `ureq` is synchronous, so the request runs on the blocking pool; it is
+/// bounded twice: ureq's own global timeout, and a `tokio` timeout as a
+/// backstop so the reconcile task can never wait longer than `timeout` plus a
+/// small margin.
+async fn ollama_loaded_models(
+    base_url: &str,
+    timeout: Duration,
+) -> Result<Vec<String>, IntrospectError> {
+    let url = ollama_ps_url(base_url);
+    let req_url = url.clone();
+    let fetch = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            // A local tenant query must not be routed through an HTTP(S)_PROXY
+            // the service environment happens to carry.
+            .proxy(None)
+            .build()
+            .into();
+        let mut resp = agent.get(&req_url).call().map_err(|e| e.to_string())?;
+        resp.body_mut().read_to_string().map_err(|e| e.to_string())
+    });
+    let body = match tokio::time::timeout(timeout + Duration::from_millis(500), fetch).await {
+        Ok(Ok(Ok(body))) => body,
+        Ok(Ok(Err(detail))) => return Err(IntrospectError::Request { url, detail }),
+        Ok(Err(join)) => {
+            return Err(IntrospectError::Task {
+                url,
+                detail: join.to_string(),
+            });
         }
-        _ => Vec::new(),
-    }
+        Err(_) => {
+            return Err(IntrospectError::Timeout {
+                url,
+                elapsed: timeout,
+            });
+        }
+    };
+    parse_ollama_api_ps(&body).map_err(|source| IntrospectError::Parse { url, source })
 }
 
 /// Resolve `unit` (a name) against `cfg.resolved_units()`. Used by the
@@ -1370,6 +1537,90 @@ mod tests {
     }
 
     #[test]
+    fn busy_exit_contract_is_zero_busy_one_idle() {
+        assert_eq!(classify_busy_exit(Some(0)), BusyReply::Busy);
+        assert_eq!(classify_busy_exit(Some(1)), BusyReply::Idle);
+        // `curl -sf` idle replies (HTTP error / refused) stay idle, not failures.
+        assert_eq!(classify_busy_exit(Some(22)), BusyReply::IdleOther(22));
+        assert_eq!(classify_busy_exit(Some(7)), BusyReply::IdleOther(7));
+        assert_eq!(classify_busy_exit(Some(-1)), BusyReply::IdleOther(-1));
+        assert_eq!(classify_busy_exit(None), BusyReply::Killed);
+    }
+
+    /// A one-unit config whose `busy_cmd` exits with `code`.
+    fn busy_unit(name: &str, code: i32) -> ManagedUnit {
+        let argv = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "exit {code}"]"#)
+        } else {
+            format!(r#"["sh", "-c", "exit {code}"]"#)
+        };
+        let cfg = Config::from_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "{name}"
+            busy_cmd = {argv}
+            "#
+        ))
+        .unwrap();
+        cfg.resolved_units()[0].clone()
+    }
+
+    fn busy_failures_for(unit: &str) -> u64 {
+        hook_failures()
+            .into_iter()
+            .filter(|((u, h, _), _)| u == unit && *h == Hook::Busy)
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn busy_probe_exit_zero_is_busy_and_not_a_failure() {
+        let u = busy_unit("tst-busy-exit0", 0);
+        assert!(is_busy(&u).await);
+        assert_eq!(busy_failures_for("tst-busy-exit0"), 0);
+    }
+
+    #[tokio::test]
+    async fn busy_probe_exit_one_is_idle_and_not_a_failure() {
+        // The regression: exit 1 is the canonical idle reply and used to bump
+        // hook_failures_total{hook="busy",outcome="nonzero"} on every pass.
+        let u = busy_unit("tst-busy-exit1", 1);
+        assert!(!is_busy(&u).await);
+        assert!(!is_busy(&u).await);
+        assert_eq!(busy_failures_for("tst-busy-exit1"), 0);
+    }
+
+    #[tokio::test]
+    async fn busy_probe_other_nonzero_is_idle_and_not_a_failure() {
+        // Backward compatibility with `curl -sf` probes (exit 22 on HTTP error).
+        let u = busy_unit("tst-busy-exit22", 22);
+        assert!(!is_busy(&u).await);
+        assert_eq!(busy_failures_for("tst-busy-exit22"), 0);
+    }
+
+    #[tokio::test]
+    async fn busy_probe_spawn_failure_is_idle_and_counted() {
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "tst-busy-unrunnable"
+            busy_cmd = ["gpu-arbiter-definitely-not-a-real-binary"]
+            "#,
+        )
+        .unwrap();
+        let u = &cfg.resolved_units()[0];
+        assert!(!is_busy(u).await);
+        let mine: Vec<_> = hook_failures()
+            .into_iter()
+            .filter(|((name, _, _), _)| name == "tst-busy-unrunnable")
+            .collect();
+        assert_eq!(mine.len(), 1, "{mine:?}");
+        assert_eq!(mine[0].0.1, Hook::Busy);
+        assert_eq!(mine[0].0.2, HookFailure::Unrunnable);
+        assert_eq!(mine[0].1, 1);
+    }
+
+    #[test]
     fn vram_free_predicate() {
         let cfg = Config::default(); // vram_free_threshold_mb = 2000
         assert!(vram_is_free(
@@ -1725,25 +1976,181 @@ mod tests {
     }
 
     #[test]
-    fn parse_ollama_ps_extracts_model_names() {
-        let out = "\
-NAME          ID              SIZE     PROCESSOR    UNTIL
-qwen3:30b     abc123          21 GB    100% GPU     4 minutes from now
-llama3:8b     def456          5 GB     100% GPU     2 minutes from now
-";
-        assert_eq!(parse_ollama_ps(out), vec!["qwen3:30b", "llama3:8b"]);
+    fn parse_ollama_api_ps_extracts_model_names() {
+        // Trimmed from a real Ollama `/api/ps` response.
+        let body = r#"{"models":[
+            {"name":"qwen3:30b","model":"qwen3:30b","size":21000000000,"size_vram":21000000000},
+            {"model":"llama3:8b","size_vram":5000000000}
+        ]}"#;
+        assert_eq!(
+            parse_ollama_api_ps(body).unwrap(),
+            vec!["qwen3:30b", "llama3:8b"]
+        );
     }
 
     #[test]
-    fn parse_ollama_ps_header_only_is_empty() {
-        let out = "NAME    ID    SIZE    PROCESSOR    UNTIL\n";
-        assert!(parse_ollama_ps(out).is_empty());
+    fn parse_ollama_api_ps_empty_list_is_ok_empty() {
+        assert!(parse_ollama_api_ps(r#"{"models":[]}"#).unwrap().is_empty());
     }
 
     #[test]
-    fn parse_ollama_ps_empty_is_empty() {
-        assert!(parse_ollama_ps("").is_empty());
-        assert!(parse_ollama_ps("\n\n").is_empty());
+    fn parse_ollama_api_ps_missing_or_null_models_is_an_error() {
+        // A 200 with the wrong shape must surface as models_error, not read as
+        // "nothing loaded" — only an explicit `[]` is a genuine empty list.
+        assert!(parse_ollama_api_ps("{}").is_err());
+        assert!(parse_ollama_api_ps(r#"{"models":null}"#).is_err());
+        assert!(parse_ollama_api_ps(r#"{"status":"ok"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_ollama_api_ps_garbage_is_an_error_not_empty() {
+        assert!(parse_ollama_api_ps("").is_err());
+        assert!(parse_ollama_api_ps("NAME  ID  SIZE").is_err());
+        assert!(parse_ollama_api_ps(r#"{"models":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn ollama_ps_url_tolerates_trailing_slash() {
+        assert_eq!(
+            ollama_ps_url("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434/api/ps"
+        );
+        assert_eq!(
+            ollama_ps_url("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434/api/ps"
+        );
+    }
+
+    /// A one-shot HTTP server on an ephemeral loopback port: accepts a single
+    /// connection, records the request line, and replies with `response`
+    /// verbatim. Returns the base URL and a handle yielding the request line.
+    ///
+    /// Plain `std::net` on its own thread, not tokio: tokio's `io-util`
+    /// feature only reaches the Linux build transitively, so a tokio-based
+    /// mock would not compile for the Windows CI job.
+    fn mock_http_once(response: String) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut req = Vec::new();
+            // Read until the end of the request head.
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(response.as_bytes()).unwrap();
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            String::from_utf8_lossy(&req)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_reports_loaded_models() {
+        let (base, server) = mock_http_once(http_response(
+            "200 OK",
+            r#"{"models":[{"name":"qwen3:30b","model":"qwen3:30b"}]}"#,
+        ));
+        let models = ollama_loaded_models(&base, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(models, vec!["qwen3:30b"]);
+        assert_eq!(server.join().unwrap(), "GET /api/ps HTTP/1.1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_no_models_is_ok_empty() {
+        let (base, server) = mock_http_once(http_response("200 OK", r#"{"models":[]}"#));
+        let models = ollama_loaded_models(&format!("{base}/"), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(models.is_empty());
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_error_status_is_an_error() {
+        let (base, server) = mock_http_once(http_response("500 Internal Server Error", "{}"));
+        let err = ollama_loaded_models(&base, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntrospectError::Request { .. }), "{err:?}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_non_json_body_is_a_parse_error() {
+        let (base, server) = mock_http_once(http_response("200 OK", "NAME ID SIZE"));
+        let err = ollama_loaded_models(&base, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntrospectError::Parse { .. }), "{err:?}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_connection_refused_is_an_error_not_empty() {
+        // Bind then drop: the port is free, so nothing is listening.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let err = ollama_loaded_models(&format!("http://{addr}"), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntrospectError::Request { .. }), "{err:?}");
+        assert!(err.to_string().contains("/api/ps"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_hung_server_times_out() {
+        // Accepts and then never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(sock);
+        });
+        let started = std::time::Instant::now();
+        let err = ollama_loaded_models(&format!("http://{addr}"), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IntrospectError::Request { .. } | IntrospectError::Timeout { .. }
+            ),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "not bounded");
+        hold.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_https_url_is_an_error() {
+        // No TLS stack: an https URL must surface as an error, not as [].
+        let err = ollama_loaded_models("https://127.0.0.1:1", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntrospectError::Request { .. }), "{err:?}");
     }
 
     /// A bare systemd-driven managed unit (no command overrides) — the default
@@ -1760,6 +2167,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             vram_match: None,
             kind: None,
             introspect_cmd: None,
+            ollama_url: None,
             stop_cmd: None,
             start_cmd: None,
             is_active_cmd: None,
@@ -1788,6 +2196,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             vram_match: None,
             kind: kind.map(str::to_string),
             introspect_cmd: introspect_cmd.map(str::to_string),
+            ollama_url: None,
             stop_cmd: None,
             start_cmd: None,
             is_active_cmd: None,
@@ -1877,19 +2286,30 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         assert!(parse_model_lines("\n  \n").is_empty());
     }
 
-    #[tokio::test]
-    async fn loaded_models_never_errors_without_backends() {
-        // loaded_models is best-effort across all backends: no `ollama` binary, a
-        // missing introspect_cmd binary, or a None unit → empty vec, no panic.
-        let _ = loaded_models(&unit("ollama.service", Some("ollama"), None)).await;
-        let _ = loaded_models(&unit(
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loaded_models_reports_ollama_failure_distinctly() {
+        // Nothing listens on the dropped port: the Ollama backend must say so
+        // rather than reporting an empty model list.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let mut u = unit("ollama.service", Some("ollama"), None);
+        u.ollama_url = Some(format!("http://{addr}"));
+        assert!(loaded_models(&u).await.is_err());
+
+        // The command backend stays best-effort: a missing binary is `Ok([])`.
+        let cmd = loaded_models(&unit(
             "x.service",
             None,
             Some("definitely-not-a-real-binary-xyz"),
         ))
-        .await;
-        let none = loaded_models(&unit("x.service", None, None)).await;
-        assert!(none.is_empty()); // Introspection::None → always empty
+        .await
+        .unwrap();
+        assert!(cmd.is_empty());
+        // Introspection::None → always Ok(empty).
+        let none = loaded_models(&unit("x.service", None, None)).await.unwrap();
+        assert!(none.is_empty());
     }
 
     // ── Supervisor resolution (pure decision) ──────────────────────────────
@@ -2107,6 +2527,88 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn check_config_warns_on_non_http_ollama_url() {
+        let dir = std::env::temp_dir().join(format!(
+            "ga-ollamaurl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[managed_units]]
+            unit = "ok.service"
+            kind = "ollama"
+            ollama_url = "http://127.0.0.1:11434"
+
+            [[managed_units]]
+            unit = "tls.service"
+            kind = "ollama"
+            ollama_url = "https://ollama.example"
+
+            # Same bad URL, but this unit's introspection is not Ollama: the
+            # introspect_cmd override wins, so the URL is never used.
+            [[managed_units]]
+            unit = "cmd-override.service"
+            kind = "ollama"
+            introspect_cmd = "vllm-cli list-models"
+            ollama_url = "https://ollama.example"
+
+            # Same bad URL on a unit with no Ollama introspection at all.
+            [[managed_units]]
+            unit = "plain.service"
+            ollama_url = "https://ollama.example"
+            "#,
+        )
+        .unwrap();
+
+        let out = crate::cli::check_config(path.to_str().unwrap()).unwrap();
+        assert!(out.starts_with("OK:"), "still a valid config: {out}");
+        assert!(
+            out.contains("WARNING: ollama_url") && out.contains("tls.service"),
+            "expected an ollama_url warning naming the unit, got: {out}"
+        );
+        for unused in ["ok.service", "cmd-override.service", "plain.service"] {
+            assert!(!out.contains(unused), "must not warn about {unused}: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_no_ollama_url_warning_when_url_is_unused() {
+        // Only units whose introspection resolves to Ollama are checked; with
+        // none of those, there is no warning at all.
+        let dir = std::env::temp_dir().join(format!(
+            "ga-ollamaurl-unused-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[managed_units]]
+            unit = "vllm.service"
+            kind = "vllm"
+            ollama_url = "https://ollama.example"
+            "#,
+        )
+        .unwrap();
+        let out = crate::cli::check_config(path.to_str().unwrap()).unwrap();
+        assert!(!out.contains("WARNING"), "unexpected warning: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn evict_by_name_already_clear_when_not_running() {
         let cfg = Config::from_toml(&crate::testutil::portable_toml(
@@ -2127,27 +2629,36 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
 
     // ── tristate is_running: the recheck-can't-confirm decision ─────────────
 
-    // Unix-only in premise, not just in the chmod: the fixture is a `#!/bin/sh`
-    // script whose self-disarming depends on shebang execution and on the
-    // executable permission bit gating spawn with EACCES. Windows has neither —
-    // it dispatches by file extension and has no `chmod -x` equivalent — so the
-    // second invocation would succeed and the "couldn't tell" state the test
-    // exists to exercise would never arise.
+    // Unix-only in premise: the fixture is a symlink whose removal makes the
+    // next spawn fail with ENOENT. Windows has no unprivileged symlinks to an
+    // executable, so the "couldn't tell" state would never arise there.
     #[cfg(unix)]
     #[tokio::test]
     async fn evict_escalates_when_recheck_cannot_confirm_still_running() {
-        // A self-disarming is_active_cmd script: the FIRST invocation (evict()'s
-        // initial is_running check) succeeds (exit 0 = running) and then `chmod
-        // -x`s its own file, so the SECOND invocation (the post-escalate
-        // recheck) fails to spawn at all (EACCES) — a genuine "couldn't tell",
-        // not just a non-zero "inactive" exit. (A metadata-only chmod, not an
-        // unlink-while-executing, to avoid the ETXTBSY races self-deletion can
-        // hit on overlay filesystems in some CI sandboxes.) The decision default
-        // (unsure ⇒ assume still running, don't skip the SIGKILL
-        // escalation) must still let eviction complete cleanly rather than hang
-        // or panic.
-        let script = std::env::temp_dir().join(format!(
-            "gpu-arbiter-disarm-{}-{:?}-{:?}.sh",
+        // `is_active_cmd` is a symlink to the system `true` binary, and
+        // `stop_cmd` deletes that symlink. So the FIRST is_active invocation
+        // (evict()'s initial is_running check) succeeds (exit 0 = running), the
+        // stop removes the link, and the SECOND invocation (the post-escalate
+        // recheck) fails to spawn at all (ENOENT) — a genuine "couldn't tell",
+        // not just a non-zero "inactive" exit. The decision default (unsure ⇒
+        // assume still running, don't skip the SIGKILL escalation) must still
+        // let eviction complete cleanly rather than hang or panic.
+        //
+        // Why a symlink and not a written `#!/bin/sh` script: exec'ing a file
+        // this process just wrote races ETXTBSY ("Text file busy"). Any other
+        // test thread that fork()s while the write fd is open hands the child
+        // a copy of it until that child execs, and the kernel refuses to exec
+        // a file with a writer. The suite spawns processes from many parallel
+        // tests, so the script version failed intermittently (seen in CI and
+        // reproduced on main under --test-threads=64). Creating a symlink opens
+        // no fd at all, so there is nothing to leak.
+        let true_bin = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|p| p.exists())
+            .expect("a `true` binary at /bin/true or /usr/bin/true");
+        let link = std::env::temp_dir().join(format!(
+            "gpu-arbiter-disarm-{}-{:?}-{:?}",
             std::process::id(),
             std::thread::current().id(),
             std::time::SystemTime::now()
@@ -2155,37 +2666,32 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::write(&script, "#!/bin/sh\nchmod -x \"$0\"\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
+        std::os::unix::fs::symlink(true_bin, &link).unwrap();
 
-        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+        let cfg = Config::from_toml(&format!(
             r#"
             eviction_timeout_s = 0
             [[managed_units]]
             unit = "fake.service"
-            stop_cmd = ["true"]
-            is_active_cmd = ["{script}"]
+            stop_cmd = ["rm", "-f", "{link}"]
+            is_active_cmd = ["{link}"]
             "#,
-            script = crate::testutil::toml_path(&script),
-        )))
+            link = crate::testutil::toml_path(&link),
+        ))
         .unwrap();
 
         let outcome = evict(&cfg.managed_units[0], &cfg, GpuBackend::default())
             .await
             .unwrap();
         // With eviction_timeout_s = 0 the very first poll escalates immediately
-        // (no real GPU to read), the recheck can't confirm (script now
-        // non-executable), and the unsure-assume-still-running default drives
-        // the SIGKILL fallback (re-running stop_cmd, since no kill_cmd is
-        // configured) rather than a misleading `Freed`.
+        // (no real GPU to read), the recheck can't confirm (the link is gone),
+        // and the unsure-assume-still-running default drives the SIGKILL
+        // fallback (re-running stop_cmd, since no kill_cmd is configured)
+        // rather than a misleading `Freed`.
         assert_eq!(outcome, EvictionOutcome::Escalated);
-
-        let _ = std::fs::remove_file(&script);
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "stop_cmd must have removed the link, or the recheck never failed"
+        );
     }
 }

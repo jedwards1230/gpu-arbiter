@@ -309,14 +309,22 @@ active claims, a per\-managed\-unit array (a tristate
 flag \(em true/false/null, the last meaning the daemon couldn't confirm either
 way \(em reported
 .B models[]
-list, attributed VRAM, and whether the unit is manually
+list plus a
+.B models_error
+string when that query failed, attributed VRAM, and whether the unit is manually
 .BR held ),
 total GPU memory, and a top\-level
 .B degraded
 flag (see DETECTION AND EVICTION MODEL).
 .TP
 .B GET /metrics
-Prometheus text\-format exposition.
+Prometheus text\-format exposition. The per\-unit eviction series
+.RB ( gpu_arbiter_evictions_total
+for every outcome,
+.B gpu_arbiter_eviction_duration_seconds
+for every stage) are pre\-seeded at 0 for each configured unit at startup, so
+they exist before the first eviction. The full metric list is in
+.IR docs/reference.md .
 .TP
 .B GET /healthz
 Liveness probe.

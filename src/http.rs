@@ -482,7 +482,8 @@ pub fn render_metrics(
         "gpu_arbiter_hook_failures_total",
         &format!(
             "Cumulative tenant-hook failures by hook (busy|yield|resume) and outcome \
-             (nonzero = ran and exited non-zero; unrunnable = could not be spawned or timed out). \
+             (nonzero = ran and exited non-zero, or for busy was killed by a signal; \
+             unrunnable = could not be spawned or timed out). \
              {MONOTONIC_NOTE}"
         ),
     );
@@ -1472,6 +1473,7 @@ mod tests {
                 unit: "ollama.service".into(),
                 running: Some(false),
                 models: vec![],
+                models_error: None,
                 vram_mb: None,
                 held: false,
             }],
@@ -1527,6 +1529,7 @@ mod tests {
                 unit: "ollama.service".into(),
                 running: Some(true),
                 models: vec!["qwen3:30b".into()],
+                models_error: None,
                 vram_mb: Some(21000),
                 held: false,
             }],
@@ -1609,6 +1612,7 @@ mod tests {
                     unit: "ollama.service".into(),
                     running: Some(false),
                     models: vec![],
+                    models_error: None,
                     vram_mb: None,
                     held: true,
                 },
@@ -1616,6 +1620,7 @@ mod tests {
                     unit: "vllm.service".into(),
                     running: Some(true),
                     models: vec![],
+                    models_error: None,
                     vram_mb: None,
                     held: false,
                 },
@@ -1692,6 +1697,45 @@ mod tests {
         assert!(out.contains(
             "gpu_arbiter_claim{token=\"pattern:heroic\",kind=\"pattern\",id=\"heroic\"} 1"
         ));
+    }
+
+    /// A configured unit's eviction series exist at 0 before any eviction has
+    /// happened, with the same label sets a real eviction produces — so
+    /// `absent()` alerts and dashboards work from daemon start.
+    #[test]
+    fn render_metrics_exposes_seeded_eviction_series_before_any_eviction() {
+        let cfg = crate::config::Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "comfyui"
+            "#,
+        )
+        .unwrap();
+        let metrics = crate::state::ArbiterState::with_config(&cfg).metrics;
+        let out = render_metrics(&empty_snapshot(), &metrics, 0, 0, 600, 0);
+        for outcome in ["graceful", "sigkill", "yielded", "error"] {
+            let line =
+                format!("gpu_arbiter_evictions_total{{unit=\"comfyui\",outcome=\"{outcome}\"}} 0");
+            assert!(out.contains(&line), "missing `{line}` in:\n{out}");
+        }
+        for stage in ["yield", "stop", "total"] {
+            for line in [
+                format!(
+                    "gpu_arbiter_eviction_duration_seconds_bucket{{unit=\"comfyui\",stage=\"{stage}\",le=\"0.1\"}} 0"
+                ),
+                format!(
+                    "gpu_arbiter_eviction_duration_seconds_bucket{{unit=\"comfyui\",stage=\"{stage}\",le=\"+Inf\"}} 0"
+                ),
+                format!(
+                    "gpu_arbiter_eviction_duration_seconds_count{{unit=\"comfyui\",stage=\"{stage}\"}} 0"
+                ),
+                format!(
+                    "gpu_arbiter_eviction_duration_seconds_sum{{unit=\"comfyui\",stage=\"{stage}\"}} 0"
+                ),
+            ] {
+                assert!(out.contains(&line), "missing `{line}` in:\n{out}");
+            }
+        }
     }
 
     /// A hook that fails must produce a real, well-formed
@@ -1998,12 +2042,22 @@ mod tests {
         );
 
         // No staging directory should be left behind in the parent either.
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.file_name())
-            .filter(|name| name != "gpu-arbiter.sock")
-            .collect();
+        // Polled, not read once: `bind_uds` renames the socket into place
+        // BEFORE it removes the staging directory, so the socket becoming
+        // visible above does not mean cleanup has run yet. A single read here
+        // raced that window and failed intermittently under parallel load.
+        let leftovers = loop {
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.file_name())
+                .filter(|name| name != "gpu-arbiter.sock")
+                .collect();
+            if leftovers.is_empty() || tokio::time::Instant::now() >= deadline {
+                break leftovers;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
         assert!(
             leftovers.is_empty(),
             "staging directory left behind in socket dir: {leftovers:?}"

@@ -179,9 +179,18 @@ pub struct UnitStatus {
     /// `*_cmd` binary) — "couldn't tell", which must render distinctly from a
     /// confirmed `false` ("stopped"). Serializes as JSON `null` when unknown.
     pub running: Option<bool>,
-    /// Loaded model names (best-effort; Ollama-only — empty for other units, or
-    /// when not running / unknown).
+    /// Loaded model names (best-effort; empty for units with no introspection
+    /// backend, or when not running / unknown). An empty list is only ever a
+    /// real "no models loaded" answer when [`UnitStatus::models_error`] is
+    /// `None`.
     pub models: Vec<String>,
+    /// Why the model query failed, when it did (e.g. the Ollama API at
+    /// `ollama_url` refused the connection). `None` — and omitted from the JSON
+    /// — when the query succeeded or was not attempted. Exists so a failed
+    /// query is never indistinguishable from an idle tenant with no models
+    /// loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_error: Option<String>,
     /// VRAM attributed to this unit in MiB (best-effort; `None` when unknown).
     /// Attributed primarily via cgroup PID resolution (works for any
     /// systemd-supervised unit with no config needed), falling back to the
@@ -291,6 +300,19 @@ pub struct ArbiterState {
     /// re-derives everything from observed truth rather than trusting a stale
     /// hold from a prior run.
     pub held: HashSet<String>,
+    /// Units whose `resume_cmd` must run the next time they are eligible to run
+    /// again (the ensure-running post-step). A unit enters this set whenever
+    /// an eviction is attempted on it, whether it was yielded, stopped, or the
+    /// attempt errored, and leaves it once its resume succeeds. That makes
+    /// `resume_cmd` edge-triggered: it fires on the way **out** of a yield,
+    /// not on every reconcile pass.
+    ///
+    /// [`ArbiterState::with_config`] seeds it with **every** configured unit, so
+    /// a freshly started daemon resumes each unit once. That is what keeps the
+    /// set safe to hold in memory only: a daemon that restarted while a tenant
+    /// was yielded cannot know that it was, so it resumes everything once
+    /// rather than leave a tenant parked forever.
+    pub needs_resume: HashSet<String>,
     /// `true` if the most recent eviction pass had at least one unit fail —
     /// feeds [`StatusSnapshot::degraded`].
     pub degraded: bool,
@@ -400,7 +422,38 @@ impl DurationHistogram {
     }
 }
 
+impl EvictionStage {
+    /// Every stage, in exposition order — the label values a unit's
+    /// `gpu_arbiter_eviction_duration_seconds` series are pre-seeded with.
+    pub const ALL: [EvictionStage; 3] = [
+        EvictionStage::Yield,
+        EvictionStage::Stop,
+        EvictionStage::Total,
+    ];
+}
+
 impl Metrics {
+    /// Pre-seed every per-unit eviction series for `unit` at zero: all four
+    /// `gpu_arbiter_evictions_total{outcome}` buckets and the
+    /// `gpu_arbiter_eviction_duration_seconds{stage}` histogram for each
+    /// [`EvictionStage`].
+    ///
+    /// Without this a series only appears after the unit's first eviction, so
+    /// `absent()` alerts fire on a perfectly healthy host and `increase()` over
+    /// a window containing that first eviction under-counts it, because
+    /// Prometheus has no prior sample to diff against. The label sets are the
+    /// exact ones a real observation produces, so a seeded series and a
+    /// recorded one are the same time series. Idempotent: an existing count is
+    /// left untouched.
+    pub fn seed_unit(&mut self, unit: &str) {
+        self.evictions.entry(unit.to_string()).or_default();
+        for stage in EvictionStage::ALL {
+            self.eviction_durations
+                .entry((unit.to_string(), stage))
+                .or_default();
+        }
+    }
+
     /// Record one eviction attempt's outcome for `unit`. Callers get `outcome`
     /// from [`crate::units::eviction_metric_outcome`], which already excludes
     /// the "nothing to evict" case — every call here represents a real
@@ -524,6 +577,7 @@ impl Default for ArbiterState {
             since: SystemTime::now(),
             presence: Presence::default(),
             held: HashSet::new(),
+            needs_resume: HashSet::new(),
             degraded: false,
             metrics: Metrics::default(),
         }
@@ -535,6 +589,20 @@ impl ArbiterState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct the daemon's initial state for `cfg`: [`ArbiterState::new`]
+    /// plus, for every configured unit, its eviction metrics pre-seeded at
+    /// zero (see [`Metrics::seed_unit`]) and a pending startup resume (see
+    /// [`ArbiterState::needs_resume`]). What `main` uses at startup.
+    #[must_use]
+    pub fn with_config(cfg: &crate::config::Config) -> Self {
+        let mut s = Self::new();
+        for u in cfg.resolved_units() {
+            s.metrics.seed_unit(&u.unit);
+            s.needs_resume.insert(u.unit.clone());
+        }
+        s
     }
 
     /// Resolve the externally-visible state from the observed claim set. Pure
@@ -752,6 +820,7 @@ mod tests {
             unit: "ollama.service".into(),
             running: None,
             models: vec![],
+            models_error: None,
             vram_mb: None,
             held: false,
         };
@@ -769,6 +838,7 @@ mod tests {
             unit: "ollama.service".into(),
             running: Some(true),
             models: vec![],
+            models_error: None,
             vram_mb: Some(21000),
             held: true,
         }];
@@ -792,6 +862,7 @@ mod tests {
                 unit: "vllm.service".into(),
                 running: Some(true),
                 models: vec![],
+                models_error: None,
                 vram_mb: Some(8000),
                 held: false,
             },
@@ -799,6 +870,7 @@ mod tests {
                 unit: "ollama.service".into(),
                 running: Some(true),
                 models: vec!["qwen3:30b".into()],
+                models_error: None,
                 vram_mb: Some(21000),
                 held: false,
             },
@@ -984,5 +1056,44 @@ mod tests {
     #[test]
     fn reconcile_trigger_label_covers_startup() {
         assert_eq!(ReconcileTrigger::Startup.label(), "startup");
+    }
+
+    #[test]
+    fn with_config_seeds_every_unit_eviction_series_at_zero() {
+        let cfg = crate::config::Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "a.service"
+
+            [[managed_units]]
+            unit = "b.service"
+            "#,
+        )
+        .unwrap();
+        let s = ArbiterState::with_config(&cfg);
+        for unit in ["a.service", "b.service"] {
+            let c = s.metrics.evictions[unit];
+            assert_eq!((c.yielded, c.graceful, c.sigkill, c.error), (0, 0, 0, 0));
+            for stage in EvictionStage::ALL {
+                let h = &s.metrics.eviction_durations[&(unit.to_string(), stage)];
+                assert_eq!(h.count, 0);
+                assert!(h.sum.abs() < f64::EPSILON);
+            }
+        }
+        assert_eq!(s.metrics.evictions.len(), 2);
+        assert_eq!(s.metrics.eviction_durations.len(), 6);
+    }
+
+    #[test]
+    fn seed_unit_never_resets_existing_counts() {
+        let mut m = Metrics::default();
+        m.record_eviction("u", crate::units::EvictionMetricOutcome::Sigkill);
+        m.record_eviction_duration("u", EvictionStage::Total, 1.5);
+        m.seed_unit("u");
+        assert_eq!(m.evictions["u"].sigkill, 1);
+        assert_eq!(
+            m.eviction_durations[&("u".to_string(), EvictionStage::Total)].count,
+            1
+        );
     }
 }
