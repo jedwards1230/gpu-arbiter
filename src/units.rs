@@ -2579,27 +2579,36 @@ mod tests {
 
     // ── tristate is_running: the recheck-can't-confirm decision ─────────────
 
-    // Unix-only in premise, not just in the chmod: the fixture is a `#!/bin/sh`
-    // script whose self-disarming depends on shebang execution and on the
-    // executable permission bit gating spawn with EACCES. Windows has neither —
-    // it dispatches by file extension and has no `chmod -x` equivalent — so the
-    // second invocation would succeed and the "couldn't tell" state the test
-    // exists to exercise would never arise.
+    // Unix-only in premise: the fixture is a symlink whose removal makes the
+    // next spawn fail with ENOENT. Windows has no unprivileged symlinks to an
+    // executable, so the "couldn't tell" state would never arise there.
     #[cfg(unix)]
     #[tokio::test]
     async fn evict_escalates_when_recheck_cannot_confirm_still_running() {
-        // A self-disarming is_active_cmd script: the FIRST invocation (evict()'s
-        // initial is_running check) succeeds (exit 0 = running) and then `chmod
-        // -x`s its own file, so the SECOND invocation (the post-escalate
-        // recheck) fails to spawn at all (EACCES) — a genuine "couldn't tell",
-        // not just a non-zero "inactive" exit. (A metadata-only chmod, not an
-        // unlink-while-executing, to avoid the ETXTBSY races self-deletion can
-        // hit on overlay filesystems in some CI sandboxes.) The decision default
-        // (unsure ⇒ assume still running, don't skip the SIGKILL
-        // escalation) must still let eviction complete cleanly rather than hang
-        // or panic.
-        let script = std::env::temp_dir().join(format!(
-            "gpu-arbiter-disarm-{}-{:?}-{:?}.sh",
+        // `is_active_cmd` is a symlink to the system `true` binary, and
+        // `stop_cmd` deletes that symlink. So the FIRST is_active invocation
+        // (evict()'s initial is_running check) succeeds (exit 0 = running), the
+        // stop removes the link, and the SECOND invocation (the post-escalate
+        // recheck) fails to spawn at all (ENOENT) — a genuine "couldn't tell",
+        // not just a non-zero "inactive" exit. The decision default (unsure ⇒
+        // assume still running, don't skip the SIGKILL escalation) must still
+        // let eviction complete cleanly rather than hang or panic.
+        //
+        // Why a symlink and not a written `#!/bin/sh` script: exec'ing a file
+        // this process just wrote races ETXTBSY ("Text file busy"). Any other
+        // test thread that fork()s while the write fd is open hands the child
+        // a copy of it until that child execs, and the kernel refuses to exec
+        // a file with a writer. The suite spawns processes from many parallel
+        // tests, so the script version failed intermittently (seen in CI and
+        // reproduced on main under --test-threads=64). Creating a symlink opens
+        // no fd at all, so there is nothing to leak.
+        let true_bin = ["/bin/true", "/usr/bin/true"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|p| p.exists())
+            .expect("a `true` binary at /bin/true or /usr/bin/true");
+        let link = std::env::temp_dir().join(format!(
+            "gpu-arbiter-disarm-{}-{:?}-{:?}",
             std::process::id(),
             std::thread::current().id(),
             std::time::SystemTime::now()
@@ -2607,37 +2616,32 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::write(&script, "#!/bin/sh\nchmod -x \"$0\"\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
+        std::os::unix::fs::symlink(true_bin, &link).unwrap();
 
-        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+        let cfg = Config::from_toml(&format!(
             r#"
             eviction_timeout_s = 0
             [[managed_units]]
             unit = "fake.service"
-            stop_cmd = ["true"]
-            is_active_cmd = ["{script}"]
+            stop_cmd = ["rm", "-f", "{link}"]
+            is_active_cmd = ["{link}"]
             "#,
-            script = crate::testutil::toml_path(&script),
-        )))
+            link = crate::testutil::toml_path(&link),
+        ))
         .unwrap();
 
         let outcome = evict(&cfg.managed_units[0], &cfg, GpuBackend::default())
             .await
             .unwrap();
         // With eviction_timeout_s = 0 the very first poll escalates immediately
-        // (no real GPU to read), the recheck can't confirm (script now
-        // non-executable), and the unsure-assume-still-running default drives
-        // the SIGKILL fallback (re-running stop_cmd, since no kill_cmd is
-        // configured) rather than a misleading `Freed`.
+        // (no real GPU to read), the recheck can't confirm (the link is gone),
+        // and the unsure-assume-still-running default drives the SIGKILL
+        // fallback (re-running stop_cmd, since no kill_cmd is configured)
+        // rather than a misleading `Freed`.
         assert_eq!(outcome, EvictionOutcome::Escalated);
-
-        let _ = std::fs::remove_file(&script);
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "stop_cmd must have removed the link, or the recheck never failed"
+        );
     }
 }
