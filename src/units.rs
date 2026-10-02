@@ -248,7 +248,9 @@ impl Hook {
 /// and collapsing them would hide that distinction from an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HookFailure {
-    /// Spawned and exited with a non-zero status.
+    /// Spawned and exited with a non-zero status. For `busy_cmd` only a
+    /// signal death lands here: a non-zero exit *code* is the probe's "idle"
+    /// reply, not a failure (see [`BusyReply`]).
     NonZero,
     /// Could not be spawned, or timed out before producing a status.
     Unrunnable,
@@ -714,8 +716,49 @@ pub async fn resume(u: &ManagedUnit) {
     }
 }
 
+/// How one `busy_cmd` exit status reads. Produced by the pure
+/// [`classify_busy_exit`]; consumed by [`is_busy`].
+///
+/// The contract is **exit 0 = busy, exit 1 = idle**. Exit 1 is a *reply*, not a
+/// failure: it is how every probe says "no work right now", so it is silent and
+/// never counted. Before this was split out, exit 1 was logged as a WARN and
+/// counted in `gpu_arbiter_hook_failures_total{hook="busy",outcome="nonzero"}`
+/// on every pass — one "failure" per reconcile for a perfectly healthy idle
+/// tenant, which made the counter useless for alerting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyReply {
+    /// Exit 0 — the tenant has work and demands the GPU at its priority.
+    Busy,
+    /// Exit 1 — the canonical "idle" reply.
+    Idle,
+    /// Any other exit code — also read as idle, for backward compatibility.
+    ///
+    /// The shipped examples use `curl -sf <url>` as a probe, which says "idle"
+    /// with curl's own codes (22 for an HTTP error status, 7 for connection
+    /// refused) — never 1. Treating those as failures would page on every pass
+    /// for configs written straight from the docs. Logged at debug level only,
+    /// so a probe that really is broken (a usage error exiting 2, say) is still
+    /// discoverable with `RUST_LOG=debug`.
+    IdleOther(i32),
+    /// No exit code at all: the probe was terminated by a signal. That is a
+    /// crash, not a reply, so it still counts as a hook failure.
+    Killed,
+}
+
+/// Classify a `busy_cmd` exit code (`None` = terminated by a signal). Pure —
+/// unit-tested.
+#[must_use]
+pub fn classify_busy_exit(code: Option<i32>) -> BusyReply {
+    match code {
+        Some(0) => BusyReply::Busy,
+        Some(1) => BusyReply::Idle,
+        Some(other) => BusyReply::IdleOther(other),
+        None => BusyReply::Killed,
+    }
+}
+
 /// Whether `u` currently has work, via its configured `busy_cmd`. **Exit 0 =
-/// busy.**
+/// busy, exit 1 = idle** (see [`BusyReply`] for every other case).
 ///
 /// This is what promotes a tenant from a preemption *target* to a preemption
 /// *source*: a busy unit demands the GPU at its own priority and evicts every
@@ -724,35 +767,45 @@ pub async fn resume(u: &ManagedUnit) {
 /// able to evict anything.
 ///
 /// **Never errors, and every failure reads as "not busy."** A probe that cannot
-/// spawn, times out, or exits non-zero returns `false`. That direction is
+/// spawn, times out, or is killed returns `false`. That direction is
 /// deliberate and is the opposite of [`is_running`]'s unsure-means-still-running
 /// default: a broken `is_running` that under-reports would skip a needed
 /// eviction, whereas a broken `busy_cmd` that over-reports would evict a lower
 /// tier on a false pretext. Each defaults toward the outcome that does less
 /// damage when the probe is wrong.
+///
+/// Only genuine failures — spawn errors, timeouts, signal deaths — are logged at
+/// WARN and counted in `gpu_arbiter_hook_failures_total{hook="busy"}`. Exit 1
+/// is silent; any other non-zero exit is idle with a debug line.
 pub async fn is_busy(u: &ManagedUnit) -> bool {
     let Some(cmd) = u.busy_cmd.as_ref() else {
         return false;
     };
     match run_argv("busy", &u.unit, &cmd.0, "").await {
-        Ok(out) if out.status.success() => true,
-        // The probe ran and said "not busy" only if it exited 0 above. Any other
-        // status means it *broke* — a distinct condition from a genuine
-        // not-busy reply, and it must be observable rather than silently
-        // indistinguishable from a permanently-idle tenant. The
-        // fail-toward-not-busy return stays deliberate; the failure is now
-        // logged and counted.
-        Ok(out) => {
-            record_hook_failure(&u.unit, Hook::Busy, HookFailure::NonZero);
-            tracing::warn!(
-                unit = %u.unit,
-                code = ?out.status.code(),
-                stderr = %stderr_excerpt(&out.stderr),
-                "busy probe exited non-zero; treating as not busy (the unit cannot defend itself \
-                 against preemption while this persists)"
-            );
-            false
-        }
+        Ok(out) => match classify_busy_exit(out.status.code()) {
+            BusyReply::Busy => true,
+            BusyReply::Idle => false,
+            BusyReply::IdleOther(code) => {
+                tracing::debug!(
+                    unit = %u.unit,
+                    code,
+                    stderr = %stderr_excerpt(&out.stderr),
+                    "busy probe exited with a code other than 0/1; reading it as idle"
+                );
+                false
+            }
+            BusyReply::Killed => {
+                record_hook_failure(&u.unit, Hook::Busy, HookFailure::NonZero);
+                tracing::warn!(
+                    unit = %u.unit,
+                    status = %out.status,
+                    stderr = %stderr_excerpt(&out.stderr),
+                    "busy probe was terminated without an exit code; treating as not busy (the \
+                     unit cannot defend itself against preemption while this persists)"
+                );
+                false
+            }
+        },
         Err(e) => {
             record_hook_failure(&u.unit, Hook::Busy, HookFailure::Unrunnable);
             tracing::warn!(unit = %u.unit, error = %e, "busy probe failed; treating as not busy");
@@ -1367,6 +1420,90 @@ mod tests {
         assert_eq!(mine[0].1, 2, "same key must accumulate, not overwrite");
         assert_eq!(mine[1].0.1, Hook::Resume);
         assert_eq!(mine[1].1, 1);
+    }
+
+    #[test]
+    fn busy_exit_contract_is_zero_busy_one_idle() {
+        assert_eq!(classify_busy_exit(Some(0)), BusyReply::Busy);
+        assert_eq!(classify_busy_exit(Some(1)), BusyReply::Idle);
+        // `curl -sf` idle replies (HTTP error / refused) stay idle, not failures.
+        assert_eq!(classify_busy_exit(Some(22)), BusyReply::IdleOther(22));
+        assert_eq!(classify_busy_exit(Some(7)), BusyReply::IdleOther(7));
+        assert_eq!(classify_busy_exit(Some(-1)), BusyReply::IdleOther(-1));
+        assert_eq!(classify_busy_exit(None), BusyReply::Killed);
+    }
+
+    /// A one-unit config whose `busy_cmd` exits with `code`.
+    fn busy_unit(name: &str, code: i32) -> ManagedUnit {
+        let argv = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "exit {code}"]"#)
+        } else {
+            format!(r#"["sh", "-c", "exit {code}"]"#)
+        };
+        let cfg = Config::from_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "{name}"
+            busy_cmd = {argv}
+            "#
+        ))
+        .unwrap();
+        cfg.resolved_units()[0].clone()
+    }
+
+    fn busy_failures_for(unit: &str) -> u64 {
+        hook_failures()
+            .into_iter()
+            .filter(|((u, h, _), _)| u == unit && *h == Hook::Busy)
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn busy_probe_exit_zero_is_busy_and_not_a_failure() {
+        let u = busy_unit("tst-busy-exit0", 0);
+        assert!(is_busy(&u).await);
+        assert_eq!(busy_failures_for("tst-busy-exit0"), 0);
+    }
+
+    #[tokio::test]
+    async fn busy_probe_exit_one_is_idle_and_not_a_failure() {
+        // The regression: exit 1 is the canonical idle reply and used to bump
+        // hook_failures_total{hook="busy",outcome="nonzero"} on every pass.
+        let u = busy_unit("tst-busy-exit1", 1);
+        assert!(!is_busy(&u).await);
+        assert!(!is_busy(&u).await);
+        assert_eq!(busy_failures_for("tst-busy-exit1"), 0);
+    }
+
+    #[tokio::test]
+    async fn busy_probe_other_nonzero_is_idle_and_not_a_failure() {
+        // Backward compatibility with `curl -sf` probes (exit 22 on HTTP error).
+        let u = busy_unit("tst-busy-exit22", 22);
+        assert!(!is_busy(&u).await);
+        assert_eq!(busy_failures_for("tst-busy-exit22"), 0);
+    }
+
+    #[tokio::test]
+    async fn busy_probe_spawn_failure_is_idle_and_counted() {
+        let cfg = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "tst-busy-unrunnable"
+            busy_cmd = ["gpu-arbiter-definitely-not-a-real-binary"]
+            "#,
+        )
+        .unwrap();
+        let u = &cfg.resolved_units()[0];
+        assert!(!is_busy(u).await);
+        let mine: Vec<_> = hook_failures()
+            .into_iter()
+            .filter(|((name, _, _), _)| name == "tst-busy-unrunnable")
+            .collect();
+        assert_eq!(mine.len(), 1, "{mine:?}");
+        assert_eq!(mine[0].0.1, Hook::Busy);
+        assert_eq!(mine[0].0.2, HookFailure::Unrunnable);
+        assert_eq!(mine[0].1, 1);
     }
 
     #[test]

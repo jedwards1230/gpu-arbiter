@@ -216,7 +216,9 @@ pub struct ManagedUnit {
     /// preempts another, and a game still evicts them all.
     #[serde(default = "default_unit_priority")]
     pub priority: u8,
-    /// Optional probe for "this tenant currently has work". **Exit 0 = busy.**
+    /// Optional probe for "this tenant currently has work". **Exit 0 = busy,
+    /// exit 1 = idle.** Any other exit code also reads as idle (debug-logged
+    /// only) so a `curl -sf` probe, which reports idle as exit 22, keeps working.
     ///
     /// This is what lets a tenant *preempt* lower tiers rather than merely
     /// surviving them. Without it a unit is only ever a preemption target, never
@@ -225,9 +227,11 @@ pub struct ManagedUnit {
     ///
     /// Parsed as a shell-free argv exactly like the other `*_cmd` fields, and
     /// run on every reconcile pass, so it must be cheap and must not block. A
-    /// probe that fails to spawn, times out, or exits non-zero reads as **not
-    /// busy** — the conservative direction, since a broken probe should not be
-    /// able to evict a lower tier on a false pretext.
+    /// probe that fails to spawn, times out, or is killed by a signal reads as
+    /// **not busy** — the conservative direction, since a broken probe should
+    /// not be able to evict a lower tier on a false pretext — and only those
+    /// genuine failures are counted in `gpu_arbiter_hook_failures_total`. See
+    /// [`crate::units::BusyReply`].
     #[serde(default)]
     pub busy_cmd: Option<ArgvCmd>,
     /// Optional **cooperative** GPU release, tried before any stop.

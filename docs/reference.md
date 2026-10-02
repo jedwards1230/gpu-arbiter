@@ -157,7 +157,7 @@ across a restart:
 | `gpu_arbiter_unit_restarts_total{unit}` | Cumulative successful managed-unit starts driven by the daemon (eager restore or manual start) |
 | `gpu_arbiter_proc_events_dropped_total` | Cumulative `cn_proc` drop occurrences: kernel `ENOBUFS` overflow plus full-trigger-channel drops |
 | `gpu_arbiter_reconcile_passes_total{trigger}` | Cumulative reconcile passes, `trigger` ∈ `proc_event`\|`timer`\|`manual`\|`startup` |
-| `gpu_arbiter_hook_failures_total{unit,hook,outcome}` | Cumulative tenant-hook failures, `hook` ∈ `busy`\|`yield`\|`resume`, `outcome` ∈ `nonzero` (ran, exited non-zero) \| `unrunnable` (could not spawn, or timed out). A hook failing on every call is otherwise invisible: `up` stays 1 and `degraded` stays false. |
+| `gpu_arbiter_hook_failures_total{unit,hook,outcome}` | Cumulative tenant-hook failures, `hook` ∈ `busy`\|`yield`\|`resume`, `outcome` ∈ `nonzero` (ran, exited non-zero — for `busy` only a signal death, since any exit code is a busy/idle reply) \| `unrunnable` (could not spawn, or timed out). A hook failing on every call is otherwise invisible: `up` stays 1 and `degraded` stays false. |
 
 ## Command-line usage
 
@@ -277,7 +277,7 @@ gaming ends. Each entry:
 | `unit` | _(required)_ | systemd unit the daemon owns (or a free-form label when command overrides are set) |
 | `eager_restart` | `true` | Restart this unit when gaming ends |
 | `priority` | `50` | Tier on the [priority ladder](#priority-ladder-and-cooperative-eviction). A demand at `P` preempts every unit with `priority < P`; the comparison is strict, so equal tiers coexist |
-| `busy_cmd` | _(none)_ | Probe for "this tenant has work right now" — **exit 0 = busy**. Required for a unit to *preempt* lower tiers, and required for `yield_cmd` to work at all |
+| `busy_cmd` | _(none)_ | Probe for "this tenant has work right now" — **exit 0 = busy, exit 1 = idle** (other codes also read idle; see [the contract](#priority-ladder-and-cooperative-eviction)). Required for a unit to *preempt* lower tiers, and required for `yield_cmd` to work at all |
 | `yield_cmd` | _(none)_ | Cooperative release: ask the tenant to drop the GPU while staying alive, tried before any stop. **Ignored unless `busy_cmd` is also set** |
 | `resume_cmd` | _(none)_ | Undo for `yield_cmd`, run on the restore path before any start. Must be idempotent |
 | `yield_timeout_s` | _(none)_ | Per-unit cooperative-release budget before escalating to the stop path; falls back to the top-level `yield_timeout_s` |
@@ -329,9 +329,19 @@ priority = 25              # background batch work — yields to everyone
 `busy_cmd` exits 0 ("I have work right now"). Without a `busy_cmd` a unit is a
 preemption target only, never a source — the right default, since a
 merely-running server holding an idle model should not evict anything. The probe
-runs on every reconcile pass, so it must be cheap and non-blocking; one that
-fails to spawn, times out, or exits non-zero reads as **not busy**, so a broken
-probe can never evict a lower tier on a false pretext.
+runs on every reconcile pass, so it must be cheap and non-blocking.
+
+The exit-code contract:
+
+| Exit | Reads as | Logged / counted |
+|---|---|---|
+| `0` | busy | silent |
+| `1` | idle (the canonical reply) | silent |
+| any other code | idle — kept for `curl -sf` probes, which say "idle" with exit 22 (HTTP error) or 7 (refused) | debug log only |
+| spawn failure, timeout, killed by a signal | idle | WARN + `gpu_arbiter_hook_failures_total{hook="busy"}` |
+
+Every failure reads as **not busy**, so a broken probe can never evict a lower
+tier on a false pretext.
 
 Inter-tenant preemption deliberately does **not** move `state` to `gaming` or
 `evicting` — those words are the `/status` contract for "a game owns the GPU,

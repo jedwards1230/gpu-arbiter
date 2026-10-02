@@ -482,7 +482,8 @@ pub fn render_metrics(
         "gpu_arbiter_hook_failures_total",
         &format!(
             "Cumulative tenant-hook failures by hook (busy|yield|resume) and outcome \
-             (nonzero = ran and exited non-zero; unrunnable = could not be spawned or timed out). \
+             (nonzero = ran and exited non-zero, or for busy was killed by a signal; \
+             unrunnable = could not be spawned or timed out). \
              {MONOTONIC_NOTE}"
         ),
     );

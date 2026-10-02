@@ -133,7 +133,8 @@
 # --- the priority ladder & cooperative eviction -------------------------------
 #
 # `priority` (default 50) sets a tenant's tier; a demand at P preempts every
-# unit with priority < P. `busy_cmd` (exit 0 = busy) is required for a unit to
+# unit with priority < P. `busy_cmd` (exit 0 = busy, exit 1 = idle; any other
+# code also reads idle, so `curl -sf` probes work) is required for a unit to
 # preempt anything — without it, a unit can only be preempted, never preempt.
 # `yield_cmd`/`resume_cmd` add a cooperative release stage ahead of the stop
 # path: the daemon asks the tenant to drop the GPU while staying alive, then
@@ -145,7 +146,7 @@
 #unit = "asr.service"
 #priority = 25                                  # below the default 50: yields to other tenants
 #eager_restart = true
-#busy_cmd = ["curl", "-sf", "http://127.0.0.1:9000/busy"]   # exit 0 = has work
+#busy_cmd = ["curl", "-sf", "http://127.0.0.1:9000/busy"]   # exit 0 = has work; HTTP error = idle
 #yield_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/release"]
 #resume_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/acquire"]
 #yield_timeout_s = 10                           # overrides the top-level default

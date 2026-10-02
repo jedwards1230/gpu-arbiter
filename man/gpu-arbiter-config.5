@@ -274,7 +274,10 @@ below.
 .B busy_cmd
 String or array of strings. Default: none.
 Probe for "this tenant has work right now" \(em
-.B exit 0 means busy.
+.B exit 0 means busy, exit 1 means idle.
+Any other exit code also reads as idle (logged at debug level only), so a
+.B curl \-sf
+probe that signals idle with an HTTP error status (curl exit 22) keeps working.
 This is what lets a tenant
 .I preempt
 lower tiers rather than merely surviving them; without it a unit is a
@@ -282,10 +285,13 @@ preemption target only, never a source (the right default, since a
 merely\-running server holding an idle model should not evict anything). Run on
 .B every
 reconcile pass, so it must be cheap and must not block. A probe that fails to
-spawn, times out, or exits non\-zero reads as
+spawn, times out, or is killed by a signal also reads as
 .BR "not busy" ,
 the conservative direction \(em a broken probe must not be able to evict a
-lower tier on a false pretext.
+lower tier on a false pretext. Only those genuine failures are logged as
+warnings and counted in
+.BR gpu_arbiter_hook_failures_total ;
+an idle reply never is.
 .TP
 .B yield_cmd
 String or array of strings. Default: none.

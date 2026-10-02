@@ -104,7 +104,7 @@ is a **parse error**, not a silent no-op, so `--check-config` is trustworthy.
 [[managed_units]]
 unit = "ollama.service"
 priority = 50
-busy_cmd = ["sh", "-c", "ollama ps | grep -q ."]    # a busy_cmd is what lets a unit preempt
+busy_cmd = ["sh", "-c", "ollama ps | tail -n +2 | grep -q ."]  # exit 0 = busy, 1 = idle; lets a unit preempt
 
 [[managed_units]]
 unit = "asr.service"
