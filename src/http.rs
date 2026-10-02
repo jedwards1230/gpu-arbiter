@@ -2042,12 +2042,22 @@ mod tests {
         );
 
         // No staging directory should be left behind in the parent either.
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.file_name())
-            .filter(|name| name != "gpu-arbiter.sock")
-            .collect();
+        // Polled, not read once: `bind_uds` renames the socket into place
+        // BEFORE it removes the staging directory, so the socket becoming
+        // visible above does not mean cleanup has run yet. A single read here
+        // raced that window and failed intermittently under parallel load.
+        let leftovers = loop {
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.file_name())
+                .filter(|name| name != "gpu-arbiter.sock")
+                .collect();
+            if leftovers.is_empty() || tokio::time::Instant::now() >= deadline {
+                break leftovers;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
         assert!(
             leftovers.is_empty(),
             "staging directory left behind in socket dir: {leftovers:?}"
