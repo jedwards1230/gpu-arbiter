@@ -756,18 +756,23 @@ async fn try_yield(u: &ManagedUnit, cfg: &Config) -> YieldOutcome {
 /// Let `u` use the GPU again after a cooperative yield — the undo for
 /// [`ManagedUnit::yield_cmd`].
 ///
-/// Best-effort and expected to be idempotent: the restore path runs it
-/// unconditionally rather than tracking which units were yielded versus stopped,
-/// because that state would have to survive a daemon restart to be trustworthy.
-/// A no-op resume on a unit that was never yielded is cheap; a desynced ledger
-/// that leaves a tenant paused forever is not.
-pub async fn resume(u: &ManagedUnit) {
+/// Edge-triggered by the caller: the restore path runs it once when a unit
+/// leaves preemption (after any eviction attempt, yielded or stopped) and once
+/// per unit at daemon startup — see [`crate::state::ArbiterState::needs_resume`].
+/// It must still be idempotent, because the startup resume runs on units that
+/// were never yielded.
+///
+/// Returns `true` when there is nothing left to do (the resume succeeded, or
+/// the unit has no `resume_cmd`), and `false` when it failed, so the caller
+/// can retry on the next pass rather than leave the tenant parked.
+pub async fn resume(u: &ManagedUnit) -> bool {
     let Some(cmd) = u.resume_cmd.as_ref() else {
-        return;
+        return true;
     };
     match run_argv("resume", &u.unit, &cmd.0, "").await {
         Ok(out) if out.status.success() => {
             tracing::debug!(unit = %u.unit, "tenant resumed");
+            true
         }
         Ok(out) => {
             record_hook_failure(&u.unit, Hook::Resume, HookFailure::NonZero);
@@ -775,12 +780,14 @@ pub async fn resume(u: &ManagedUnit) {
                 unit = %u.unit,
                 code = ?out.status.code(),
                 stderr = %stderr_excerpt(&out.stderr),
-                "resume_cmd exited non-zero"
+                "resume_cmd exited non-zero; will retry next pass"
             );
+            false
         }
         Err(e) => {
             record_hook_failure(&u.unit, Hook::Resume, HookFailure::Unrunnable);
-            tracing::warn!(unit = %u.unit, error = %e, "resume_cmd could not be run");
+            tracing::warn!(unit = %u.unit, error = %e, "resume_cmd could not be run; will retry next pass");
+            false
         }
     }
 }

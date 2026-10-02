@@ -380,7 +380,13 @@ pub async fn reconcile(
             // whether the eviction itself succeeds (a failed eviction is still an
             // explicit "keep this off" signal; the daemon must not paper over it
             // by restarting the unit on the next pass).
-            write_state(state).held.insert(unit.clone());
+            {
+                let mut guard = write_state(state);
+                guard.held.insert(unit.clone());
+                // A manual stop may yield rather than stop; either way the
+                // unit needs a resume once it is allowed to run again.
+                guard.needs_resume.insert(unit.clone());
+            }
             let result = units::evict_by_name(cfg, backend, &unit).await;
             // Record before the reply match below consumes `result` — a
             // manual stop is still an eviction event and must be counted like
@@ -569,7 +575,10 @@ pub async fn reconcile(
         }
     }
 
-    let held = { read_state(state).held.clone() };
+    let (held, needs_resume) = {
+        let guard = read_state(state);
+        (guard.held.clone(), guard.needs_resume.clone())
+    };
     let eager_targets = ensure_running_targets(desired, cfg, &held, &preempted);
     if !eager_targets.is_empty() {
         // Only units NOT already running are actual start candidates
@@ -579,19 +588,22 @@ pub async fn reconcile(
         // silently coerced.
         let mut to_start = Vec::new();
         for u in eager_targets {
-            // Undo any cooperative yield first, for EVERY eligible unit — not
-            // just the stopped ones. A unit that released the GPU via
-            // `yield_cmd` is still *running*, so it never reaches `to_start`,
-            // and gating the resume on "needs starting" would leave it paused
-            // forever: alive, healthy by every check here, and quietly not doing
-            // any work.
+            // Undo any cooperative yield first — for every eligible unit that
+            // owes one, not just the stopped ones. A unit that released the GPU
+            // via `yield_cmd` is still *running*, so it never reaches
+            // `to_start`, and gating the resume on "needs starting" would leave
+            // it paused forever: alive, healthy by every check here, and quietly
+            // not doing any work.
             //
-            // Safe to run unconditionally because `resume_cmd` is required to be
-            // idempotent, which is also why the daemon tracks no
-            // yielded-vs-stopped ledger — such state would have to survive a
-            // daemon restart to be trustworthy, and a desynced ledger fails in
-            // exactly the silent way described above.
-            units::resume(u).await;
+            // Edge-triggered via `needs_resume` (see its docs): a unit owes a
+            // resume after any eviction attempt and once at daemon startup, so
+            // `resume_cmd` runs on the way out of a yield instead of every 2 s
+            // pass. Running it every pass made it a second writer that could
+            // clobber state the tenant's own coordinator had set since. A
+            // failed resume stays owed and is retried next pass.
+            if needs_resume.contains(&u.unit) && units::resume(u).await {
+                write_state(state).needs_resume.remove(&u.unit);
+            }
 
             let confirmed_running = units::is_running(u)
                 .await
@@ -674,6 +686,12 @@ async fn evict_units(
             // One lock for both the outcome counter and the duration samples,
             // rather than reacquiring per metric.
             let mut guard = write_state(state);
+            // Any eviction attempt may have sent `yield_cmd` (or stopped a
+            // tenant whose park flag outlives the process), so the unit owes a
+            // resume the next time it is eligible to run. Recorded for every
+            // outcome, errors included: an extra idempotent resume is cheap, a
+            // missed one leaves the tenant parked.
+            guard.needs_resume.insert(u.unit.clone());
             if let Some(outcome) = units::eviction_metric_outcome(&result) {
                 guard.metrics.record_eviction(&u.unit, outcome);
             }
@@ -1734,6 +1752,144 @@ mod tests {
             marker = crate::testutil::toml_path(marker),
         )))
         .unwrap()
+    }
+
+    // ── edge-triggered resume ──────────────────────────────────────────────
+    //
+    // `resume_cmd` touches a marker file, so each assertion reads "did a resume
+    // fire during this pass" — the marker is removed between passes.
+
+    async fn pass(state: &Arc<RwLock<ArbiterState>>, cfg: &Config, trigger: ReconcileTrigger) {
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(state, cfg, &presence, trigger, GpuBackend::default())
+            .await
+            .unwrap();
+    }
+
+    /// Did `marker` get touched since the last call? Consumes the marker.
+    fn take_marker(marker: &std::path::Path) -> bool {
+        let fired = marker.exists();
+        let _ = std::fs::remove_file(marker);
+        fired
+    }
+
+    #[tokio::test]
+    async fn resume_runs_once_at_startup_then_not_on_steady_passes() {
+        let marker = marker_path("resume-startup");
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = "true"
+            resume_cmd = ["touch", "{marker}"]
+            "#,
+            marker = crate::testutil::toml_path(&marker),
+        )))
+        .unwrap();
+        let state = shared(ArbiterState::with_config(&cfg));
+
+        pass(&state, &cfg, ReconcileTrigger::Startup).await;
+        assert!(take_marker(&marker), "startup must resume every unit once");
+        assert!(read_state(&state).needs_resume.is_empty());
+
+        for _ in 0..3 {
+            pass(&state, &cfg, ReconcileTrigger::Timer).await;
+            assert!(
+                !take_marker(&marker),
+                "a steady pass must not re-run resume_cmd"
+            );
+        }
+    }
+
+    /// Two-tier ladder: `high` (75) and an eager `low` (25) that yields
+    /// cooperatively. `high_busy` decides whether `high` demands the GPU.
+    fn yield_ladder_cfg(marker: &std::path::Path, high_busy: bool) -> Config {
+        let busy = if high_busy { "true" } else { "false" };
+        Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "high.service"
+            priority = 75
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = "true"
+            busy_cmd = "{busy}"
+
+            [[managed_units]]
+            unit = "low.service"
+            priority = 25
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = "true"
+            busy_cmd = "false"
+            yield_cmd = ["true"]
+            resume_cmd = ["touch", "{marker}"]
+            "#,
+            marker = crate::testutil::toml_path(marker),
+        )))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resume_runs_once_after_a_yield() {
+        let marker = marker_path("resume-yield");
+        let busy = yield_ladder_cfg(&marker, true);
+        let idle = yield_ladder_cfg(&marker, false);
+        // `new()`, not `with_config`: no startup resume owed, so every marker
+        // below is caused by the yield alone.
+        let state = shared(ArbiterState::new());
+
+        // `high` is busy → `low` is preempted and yields. No resume while it
+        // stays preempted, however many passes go by.
+        for _ in 0..2 {
+            pass(&state, &busy, ReconcileTrigger::Timer).await;
+            assert!(!take_marker(&marker), "no resume while still preempted");
+        }
+        assert!(
+            read_state(&state).metrics.evictions["low.service"].yielded >= 1,
+            "fixture must actually yield"
+        );
+        assert!(read_state(&state).needs_resume.contains("low.service"));
+
+        // Demand ends → exactly one resume on the way out of the yield.
+        pass(&state, &idle, ReconcileTrigger::Timer).await;
+        assert!(take_marker(&marker), "leaving preemption must resume");
+        assert!(read_state(&state).needs_resume.is_empty());
+
+        pass(&state, &idle, ReconcileTrigger::Timer).await;
+        assert!(!take_marker(&marker), "only once per yield");
+    }
+
+    #[tokio::test]
+    async fn failed_resume_is_retried_until_it_succeeds() {
+        // A resume that fails stays owed, so the tenant is not left parked.
+        let unit = "tst-resume-retry.service";
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "{unit}"
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = "true"
+            resume_cmd = ["false"]
+            "#
+        )))
+        .unwrap();
+        let state = shared(ArbiterState::with_config(&cfg));
+        let failures = || -> u64 {
+            units::hook_failures()
+                .into_iter()
+                .filter(|((u, h, _), _)| u == unit && *h == units::Hook::Resume)
+                .map(|(_, n)| n)
+                .sum()
+        };
+        pass(&state, &cfg, ReconcileTrigger::Startup).await;
+        assert_eq!(failures(), 1);
+        pass(&state, &cfg, ReconcileTrigger::Timer).await;
+        assert_eq!(failures(), 2, "a failed resume must be retried");
+        assert!(read_state(&state).needs_resume.contains(unit));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

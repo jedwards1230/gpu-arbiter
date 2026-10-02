@@ -291,7 +291,7 @@ gaming ends. Each entry:
 | `priority` | `50` | Tier on the [priority ladder](#priority-ladder-and-cooperative-eviction). A demand at `P` preempts every unit with `priority < P`; the comparison is strict, so equal tiers coexist |
 | `busy_cmd` | _(none)_ | Probe for "this tenant has work right now" — **exit 0 = busy, exit 1 = idle** (other codes also read idle; see [the contract](#priority-ladder-and-cooperative-eviction)). Required for a unit to *preempt* lower tiers, and required for `yield_cmd` to work at all |
 | `yield_cmd` | _(none)_ | Cooperative release: ask the tenant to drop the GPU while staying alive, tried before any stop. **Ignored unless `busy_cmd` is also set** |
-| `resume_cmd` | _(none)_ | Undo for `yield_cmd`, run on the restore path before any start. Must be idempotent |
+| `resume_cmd` | _(none)_ | Undo for `yield_cmd`, run on the restore path before any start — once after each eviction attempt and once per unit at daemon startup, never on steady-state passes. Must be idempotent |
 | `yield_timeout_s` | _(none)_ | Per-unit cooperative-release budget before escalating to the stop path; falls back to the top-level `yield_timeout_s` |
 | `vram_match` | _(none)_ | **Fallback** substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution. A systemd-supervised unit is attributed automatically via cgroup PID resolution with no config needed; `vram_match` is consulted whenever cgroup resolution doesn't produce a match for that poll — always the case for command-driven (`*_cmd`) units and non-systemd hosts, and occasionally for a systemd unit too (see [VRAM attribution](#vram-attribution)) |
 | `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (queries `GET {ollama_url}/api/ps`); any other value reports no models and suppresses the name heuristic |
@@ -385,11 +385,16 @@ against a higher tier; it just falls through to stage 2.
 > budget: waiting cannot produce information it is structurally unable to
 > observe. Always configure the two together.
 
-`resume_cmd` is the undo, run on the restore path before any start. It must be
-**idempotent** — the daemon deliberately does not track whether a given unit was
-yielded or stopped, because that state would have to survive a daemon restart to
-be trustworthy; running an idempotent resume unconditionally is cheaper and
-cannot desync.
+`resume_cmd` is the undo, run on the restore path before any start. It is
+**edge-triggered**: it runs once when a unit becomes eligible to run again after
+an eviction attempt (yielded, stopped, or errored), and once per unit when the
+daemon starts. It does not run on steady-state passes. A failed resume is
+retried on the next pass until it succeeds.
+
+The resume ledger is in memory only. The startup resume is what makes that
+safe: a daemon that restarted while a tenant was yielded cannot know it was, so
+it resumes every unit once. `resume_cmd` must therefore be **idempotent**, since
+the startup resume also reaches units that were never yielded.
 
 Tune the two budgets from
 `gpu_arbiter_eviction_duration_seconds{stage="yield"|"stop"}` rather than by

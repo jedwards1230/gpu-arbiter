@@ -300,6 +300,19 @@ pub struct ArbiterState {
     /// re-derives everything from observed truth rather than trusting a stale
     /// hold from a prior run.
     pub held: HashSet<String>,
+    /// Units whose `resume_cmd` must run the next time they are eligible to run
+    /// again (the ensure-running post-step). A unit enters this set whenever
+    /// an eviction is attempted on it, whether it was yielded, stopped, or the
+    /// attempt errored, and leaves it once its resume succeeds. That makes
+    /// `resume_cmd` edge-triggered: it fires on the way **out** of a yield,
+    /// not on every reconcile pass.
+    ///
+    /// [`ArbiterState::with_config`] seeds it with **every** configured unit, so
+    /// a freshly started daemon resumes each unit once. That is what keeps the
+    /// set safe to hold in memory only: a daemon that restarted while a tenant
+    /// was yielded cannot know that it was, so it resumes everything once
+    /// rather than leave a tenant parked forever.
+    pub needs_resume: HashSet<String>,
     /// `true` if the most recent eviction pass had at least one unit fail —
     /// feeds [`StatusSnapshot::degraded`].
     pub degraded: bool,
@@ -564,6 +577,7 @@ impl Default for ArbiterState {
             since: SystemTime::now(),
             presence: Presence::default(),
             held: HashSet::new(),
+            needs_resume: HashSet::new(),
             degraded: false,
             metrics: Metrics::default(),
         }
@@ -578,13 +592,15 @@ impl ArbiterState {
     }
 
     /// Construct the daemon's initial state for `cfg`: [`ArbiterState::new`]
-    /// plus every configured unit's eviction metrics pre-seeded at zero (see
-    /// [`Metrics::seed_unit`]). What `main` uses at startup.
+    /// plus, for every configured unit, its eviction metrics pre-seeded at
+    /// zero (see [`Metrics::seed_unit`]) and a pending startup resume (see
+    /// [`ArbiterState::needs_resume`]). What `main` uses at startup.
     #[must_use]
     pub fn with_config(cfg: &crate::config::Config) -> Self {
         let mut s = Self::new();
         for u in cfg.resolved_units() {
             s.metrics.seed_unit(&u.unit);
+            s.needs_resume.insert(u.unit.clone());
         }
         s
     }

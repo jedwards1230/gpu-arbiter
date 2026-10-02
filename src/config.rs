@@ -261,11 +261,12 @@ pub struct ManagedUnit {
     pub yield_cmd: Option<ArgvCmd>,
     /// Undo for [`ManagedUnit::yield_cmd`] — lets the tenant use the GPU again.
     ///
-    /// Run on the restore path **before** any start, and expected to be
-    /// idempotent: the arbiter deliberately does not track whether a given unit
-    /// was yielded or stopped, because that state would have to survive a daemon
-    /// restart to be trustworthy. Running an idempotent resume unconditionally
-    /// is cheaper and cannot desync.
+    /// Run on the restore path **before** any start, and only on an edge: once
+    /// when the unit becomes eligible to run again after an eviction attempt
+    /// (yielded or stopped), and once per unit when the daemon starts. A failed
+    /// resume is retried on the next pass. It must be idempotent, because the
+    /// startup resume also runs on units that were never yielded — that is what
+    /// keeps a daemon restart from leaving a yielded tenant parked forever.
     #[serde(default)]
     pub resume_cmd: Option<ArgvCmd>,
     /// How long to wait for a cooperative release before escalating to the stop
