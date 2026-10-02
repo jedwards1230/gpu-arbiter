@@ -309,7 +309,9 @@ active claims, a per\-managed\-unit array (a tristate
 flag \(em true/false/null, the last meaning the daemon couldn't confirm either
 way \(em reported
 .B models[]
-list, attributed VRAM, and whether the unit is manually
+list plus a
+.B models_error
+string when that query failed, attributed VRAM, and whether the unit is manually
 .BR held ),
 total GPU memory, and a top\-level
 .B degraded

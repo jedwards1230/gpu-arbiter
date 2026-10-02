@@ -179,9 +179,18 @@ pub struct UnitStatus {
     /// `*_cmd` binary) — "couldn't tell", which must render distinctly from a
     /// confirmed `false` ("stopped"). Serializes as JSON `null` when unknown.
     pub running: Option<bool>,
-    /// Loaded model names (best-effort; Ollama-only — empty for other units, or
-    /// when not running / unknown).
+    /// Loaded model names (best-effort; empty for units with no introspection
+    /// backend, or when not running / unknown). An empty list is only ever a
+    /// real "no models loaded" answer when [`UnitStatus::models_error`] is
+    /// `None`.
     pub models: Vec<String>,
+    /// Why the model query failed, when it did (e.g. the Ollama API at
+    /// `ollama_url` refused the connection). `None` — and omitted from the JSON
+    /// — when the query succeeded or was not attempted. Exists so a failed
+    /// query is never indistinguishable from an idle tenant with no models
+    /// loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_error: Option<String>,
     /// VRAM attributed to this unit in MiB (best-effort; `None` when unknown).
     /// Attributed primarily via cgroup PID resolution (works for any
     /// systemd-supervised unit with no config needed), falling back to the
@@ -795,6 +804,7 @@ mod tests {
             unit: "ollama.service".into(),
             running: None,
             models: vec![],
+            models_error: None,
             vram_mb: None,
             held: false,
         };
@@ -812,6 +822,7 @@ mod tests {
             unit: "ollama.service".into(),
             running: Some(true),
             models: vec![],
+            models_error: None,
             vram_mb: Some(21000),
             held: true,
         }];
@@ -835,6 +846,7 @@ mod tests {
                 unit: "vllm.service".into(),
                 running: Some(true),
                 models: vec![],
+                models_error: None,
                 vram_mb: Some(8000),
                 held: false,
             },
@@ -842,6 +854,7 @@ mod tests {
                 unit: "ollama.service".into(),
                 running: Some(true),
                 models: vec!["qwen3:30b".into()],
+                models_error: None,
                 vram_mb: Some(21000),
                 held: false,
             },

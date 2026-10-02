@@ -107,7 +107,8 @@
 # If `managed_units` is omitted entirely, it defaults to a single entry —
 # unit = "ollama.service", eager_restart = true, vram_match = "ollama",
 # kind = "ollama" — so an unconfigured daemon evicts Ollama and reports its
-# loaded models via `ollama ps` with zero setup.
+# loaded models via its HTTP API (GET http://127.0.0.1:11434/api/ps) with zero
+# setup — no `ollama` CLI needed on the daemon's PATH.
 #
 # Tenant 1 — Ollama, driven by systemd (the default supervisor). VRAM
 # attribution for a systemd unit is automatic via cgroup PID resolution — no
@@ -121,7 +122,8 @@
 #eager_restart = true           # restart this unit when gaming ends
 #vram_match = "ollama"          # FALLBACK substring for /status VRAM attribution (optional; cgroup wins when it applies)
 #kind = "ollama"                # introspection backend for /status models[] (optional; only "ollama" recognized)
-#introspect_cmd = "ollama ps"   # explicit model-list command, overrides kind (optional)
+#ollama_url = "http://127.0.0.1:11434"  # Ollama API queried for models[] (optional; default shown; http:// only)
+#introspect_cmd = "vllm-cli list-models"  # explicit model-list command, overrides kind (optional)
 
 # Tenant 2 — a second GPU server, also systemd-driven:
 #[[managed_units]]

@@ -417,7 +417,10 @@ where
 /// or an unknown/malformed key), or if it can't be read for a reason other
 /// than "not found".
 pub fn check_config(path: &str) -> Result<String, ConfigError> {
+    use std::fmt::Write as _;
+
     let cfg = Config::load(path)?;
+    let mut out = format!("OK: {path}");
 
     // A `yield_cmd` with no `busy_cmd` parses fine but is inert: release is
     // unobservable, so the daemon skips the cooperative stage and stops the unit
@@ -431,15 +434,41 @@ pub fn check_config(path: &str) -> Result<String, ConfigError> {
         .map(|u| u.unit.as_str())
         .collect();
     if !inert.is_empty() {
-        return Ok(format!(
-            "OK: {path}\nWARNING: yield_cmd without busy_cmd on: {}. \
+        // Writing to a String is infallible.
+        let _ = write!(
+            out,
+            "\nWARNING: yield_cmd without busy_cmd on: {}. \
              Cooperative release cannot be verified without a busy probe, so these units \
              will skip the yield stage and be stopped instead.",
             inert.join(", ")
-        ));
+        );
     }
 
-    Ok(format!("OK: {path}"))
+    // The daemon has no TLS stack, so anything but a plain http:// ollama_url
+    // can never succeed. It still parses (the URL is only used for /status
+    // models[]), but every query would fail into models_error.
+    let bad_url: Vec<String> = cfg
+        .resolved_units()
+        .iter()
+        .filter_map(|u| {
+            u.ollama_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty() && !s.trim().starts_with("http://"))
+                .map(|s| format!("{} ({s})", u.unit))
+        })
+        .collect();
+    if !bad_url.is_empty() {
+        // Writing to a String is infallible.
+        let _ = write!(
+            out,
+            "\nWARNING: ollama_url is not a plain http:// URL on: {}. \
+             The daemon has no TLS support, so model queries for these units will fail \
+             and report models_error.",
+            bad_url.join(", ")
+        );
+    }
+
+    Ok(out)
 }
 
 /// The `--help` text. A function (not a `const`) so the version is interpolated.

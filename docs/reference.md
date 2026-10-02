@@ -61,7 +61,8 @@ curl --unix-socket /run/gpu-arbiter/gpu-arbiter.sock -X POST http://localhost/un
   "claims": ["steam:440"],
   "units": [
     { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false },
-    { "unit": "vllm.service", "running": null, "models": [], "held": true }
+    { "unit": "vllm.service", "running": null, "models": [], "held": true },
+    { "unit": "ollama-b", "running": true, "models": [], "models_error": "GET http://127.0.0.1:11500/api/ps: Connection refused", "held": false }
   ],
   "gpu_vram_used_mb": 21500,
   "gpu_vram_total_mb": 32768,
@@ -80,7 +81,11 @@ consumers treat `evicting` as busy).
 Per-unit `running` is a **tristate**: `true`/`false` are confirmed
 running/stopped, and `null` means the daemon's `is-active` check itself failed
 (a wedged supervisor, a missing `*_cmd` binary) — "couldn't tell", not a
-confirmed answer. `held` is `true` while an operator has manually stopped that
+confirmed answer. `models_error` is present only when the unit's model query
+failed (for an Ollama unit: the `GET {ollama_url}/api/ps` request) — so an
+empty `models` list without it is a real "nothing loaded", never a silent
+failure. A failing query is logged at WARN when it starts failing and at INFO
+when it recovers. `held` is `true` while an operator has manually stopped that
 unit and it hasn't been manually started again (see below). Top-level
 `degraded` is `true` when the most recent eviction had at least one unit fail
 to evict — gaming still won the GPU unconditionally, but a tenant may still be
@@ -289,8 +294,9 @@ gaming ends. Each entry:
 | `resume_cmd` | _(none)_ | Undo for `yield_cmd`, run on the restore path before any start. Must be idempotent |
 | `yield_timeout_s` | _(none)_ | Per-unit cooperative-release budget before escalating to the stop path; falls back to the top-level `yield_timeout_s` |
 | `vram_match` | _(none)_ | **Fallback** substring (case-insensitive) matched against `nvidia-smi` compute-proc names for `/status` VRAM attribution. A systemd-supervised unit is attributed automatically via cgroup PID resolution with no config needed; `vram_match` is consulted whenever cgroup resolution doesn't produce a match for that poll — always the case for command-driven (`*_cmd`) units and non-systemd hosts, and occasionally for a systemd unit too (see [VRAM attribution](#vram-attribution)) |
-| `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (runs `ollama ps`); any other value reports no models and suppresses the name heuristic |
+| `kind` | _(none)_ | Introspection backend for the `/status` `models[]` list. Only `"ollama"` is recognized (queries `GET {ollama_url}/api/ps`); any other value reports no models and suppresses the name heuristic |
 | `introspect_cmd` | _(none)_ | Explicit command (shell-free argv) whose stdout lists loaded model/process names, one per line. Takes precedence over `kind` and the name heuristic |
+| `ollama_url` | `http://127.0.0.1:11434` | Base URL of the Ollama HTTP API, used when the unit introspects as Ollama. Queried directly (no `ollama` CLI needed, proxy env vars ignored). Plain `http://` only — the daemon has no TLS; `--check-config` warns otherwise. A failed query sets `units[].models_error`. Daemons up to v0.12.x reject the key as unknown (`deny_unknown_fields`) |
 | `stop_cmd` | _(none)_ | Override: command to stop/evict the tenant (`None` → `systemctl stop`) |
 | `start_cmd` | _(none)_ | Override: command to start the tenant (`None` → `systemctl start`) |
 | `is_active_cmd` | _(none)_ | Override: command whose **exit 0 = running** (`None` → `systemctl is-active`) |
@@ -299,7 +305,7 @@ gaming ends. Each entry:
 If `managed_units` is omitted entirely, it defaults to a single entry —
 `unit = "ollama.service"`, `eager_restart = true`, `vram_match = "ollama"`,
 `kind = "ollama"` — so an unconfigured daemon evicts Ollama, attributes its
-VRAM, and introspects its loaded models (`ollama ps`) with zero setup. An
+VRAM, and introspects its loaded models (`GET /api/ps` on `ollama_url`) with zero setup. An
 explicit `managed_units = []` disables eviction entirely.
 
 ### Priority ladder and cooperative eviction

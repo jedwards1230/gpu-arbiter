@@ -101,6 +101,10 @@ fn default_yield_timeout_s() -> u64 {
     3
 }
 
+/// Default base URL for [`Introspection::Ollama`] when a unit sets no
+/// [`ManagedUnit::ollama_url`] — Ollama's own default listen address.
+pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+
 /// Maximum accepted length (in bytes) of an [`ManagedUnit::introspect_cmd`]. A
 /// value longer than this is treated as **unset** (resolution falls through to the
 /// next precedence level, just like a blank string), never run.
@@ -120,7 +124,8 @@ pub enum Introspection {
     /// Run the given argv (whitespace-split, shell-free); each non-empty trimmed
     /// stdout line is a reported name. Carries the raw command string.
     Command(String),
-    /// Run `ollama ps` and parse it with the Ollama table parser.
+    /// Query the Ollama HTTP API (`GET {ollama_url}/api/ps`) for loaded models.
+    /// See [`ManagedUnit::ollama_url`].
     Ollama,
     /// No introspection — report an empty `models[]`.
     None,
@@ -178,7 +183,7 @@ pub enum GpuBackendKind {
 /// eager_restart = true     # restart this unit when gaming ends
 /// vram_match = "ollama"    # substring for /status VRAM attribution (optional)
 /// kind = "ollama"          # introspection backend for /status models[] (optional)
-/// introspect_cmd = "ollama ps"  # explicit model-list command (optional, overrides kind)
+/// ollama_url = "http://127.0.0.1:11434"  # Ollama API for models[] (optional; this is the default)
 /// ```
 ///
 /// Or, command-driven (`OpenRC` example):
@@ -285,7 +290,7 @@ pub struct ManagedUnit {
     #[serde(default)]
     pub vram_match: Option<String>,
     /// Introspection backend selector for the `/status` `models[]` list. The only
-    /// recognized value is `"ollama"` (→ run `ollama ps`). Any other value (and,
+    /// recognized value is `"ollama"` (→ `GET {ollama_url}/api/ps`). Any other value (and,
     /// when both are unset, a `unit` name that doesn't contain `ollama`) reports no
     /// models. Ignored when `introspect_cmd` is set. `None` falls back to the
     /// back-compat name heuristic (a `unit` containing `ollama` is treated as
@@ -305,6 +310,18 @@ pub struct ManagedUnit {
     /// the OS argv limit.
     #[serde(default)]
     pub introspect_cmd: Option<String>,
+    /// Base URL of the Ollama HTTP API, used when this unit's introspection
+    /// resolves to Ollama (see [`ManagedUnit::introspection`]). `None` →
+    /// [`DEFAULT_OLLAMA_URL`] (`http://127.0.0.1:11434`).
+    ///
+    /// The daemon queries `GET {ollama_url}/api/ps` directly instead of
+    /// shelling out to `ollama ps`: the CLI is frequently not on the service
+    /// account's `PATH` (a Windows service running as `LocalSystem` almost
+    /// never has it), and a failed spawn used to read as an empty model list.
+    /// Plain `http://` only — the daemon carries no TLS stack. Proxy
+    /// environment variables are ignored.
+    #[serde(default)]
+    pub ollama_url: Option<String>,
     /// Override: argv to stop/evict the tenant. `None` → `systemctl stop`.
     #[serde(default)]
     pub stop_cmd: Option<ArgvCmd>,
@@ -324,6 +341,17 @@ pub struct ManagedUnit {
 }
 
 impl ManagedUnit {
+    /// The Ollama API base URL for this unit: [`ManagedUnit::ollama_url`], or
+    /// [`DEFAULT_OLLAMA_URL`] when unset or blank.
+    #[must_use]
+    pub fn ollama_base_url(&self) -> &str {
+        self.ollama_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_OLLAMA_URL)
+    }
+
     /// Resolve which introspection backend supplies this unit's `/status`
     /// `models[]` list. Pure — unit-tested. Precedence:
     ///
@@ -429,7 +457,7 @@ pub struct Config {
     /// off (see [`Config::resolved_units`]). When omitted from the config
     /// file entirely, defaults to a single Ollama entry (see
     /// `default_managed_units`), so a zero-config daemon still evicts,
-    /// attributes VRAM for, and introspects (`ollama ps`) Ollama.
+    /// attributes VRAM for, and introspects (`GET /api/ps`) Ollama.
     #[serde(default = "default_managed_units")]
     pub managed_units: Vec<ManagedUnit>,
     /// Seconds to wait for a graceful teardown before SIGKILL escalation.
@@ -579,6 +607,7 @@ fn default_managed_units() -> Vec<ManagedUnit> {
         vram_match: Some("ollama".to_string()),
         kind: Some("ollama".to_string()),
         introspect_cmd: None,
+        ollama_url: None,
         stop_cmd: None,
         start_cmd: None,
         is_active_cmd: None,
@@ -1118,6 +1147,34 @@ match = "Heroic"
             "error should name the first key misplaced into the trailing \
              [[managed_units]] table (asr-runner.service), not silently apply \
              defaults or attribute to a different unit: {err}"
+        );
+    }
+
+    #[test]
+    fn ollama_url_parses_and_defaults() {
+        let c = Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "a"
+            ollama_url = "http://10.0.0.5:11500/"
+
+            [[managed_units]]
+            unit = "b"
+
+            [[managed_units]]
+            unit = "c"
+            ollama_url = "   "
+            "#,
+        )
+        .unwrap();
+        let u = c.resolved_units();
+        assert_eq!(u[0].ollama_base_url(), "http://10.0.0.5:11500/");
+        assert_eq!(u[1].ollama_base_url(), DEFAULT_OLLAMA_URL);
+        assert_eq!(u[2].ollama_base_url(), DEFAULT_OLLAMA_URL);
+        // The zero-config default unit uses the default too.
+        assert_eq!(
+            Config::default().resolved_units()[0].ollama_base_url(),
+            DEFAULT_OLLAMA_URL
         );
     }
 }

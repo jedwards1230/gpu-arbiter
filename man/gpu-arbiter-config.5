@@ -403,9 +403,11 @@ String. Default: none. Introspection backend selector for the
 .B models[]
 list. The only recognized value is
 .BR """ollama""" ,
-which runs
-.B "ollama ps"
-and parses its table for loaded model names. Any other non\-empty value reports
+which queries the Ollama HTTP API
+.RB ( "GET {ollama_url}/api/ps" ;
+see
+.BR ollama_url )
+for loaded model names. Any other non\-empty value reports
 .B no
 models and
 .B suppresses
@@ -417,8 +419,7 @@ on a unit named
 .I ollama.service
 will
 .B not
-run
-.BR "ollama ps" .
+query Ollama.
 The name\-based heuristic applies
 .B only
 when
@@ -488,6 +489,29 @@ since this query runs on every reconcile pass's
 .I /status
 refresh and must stay fast); a custom introspection command that runs longer
 is killed and silently yields an empty list, so keep it fast.
+.TP
+.B ollama_url
+String. Default:
+.BR http://127.0.0.1:11434 .
+Base URL of the Ollama HTTP API, used when the unit introspects as Ollama (see
+.B kind
+and INTROSPECTION RESOLUTION). The daemon queries
+.B "GET {ollama_url}/api/ps"
+directly rather than running the
+.B ollama
+CLI, which is often not on a service account's
+.BR PATH ;
+proxy environment variables are ignored. Plain
+.B http://
+only \(em the daemon carries no TLS stack, and
+.B \-\-check\-config
+warns about any other scheme. Bounded to 2 seconds. A failed query (refused,
+non\-2xx, unparseable body, timeout) is reported in the unit's
+.I /status
+.B models_error
+field rather than as an empty
+.B models[]
+list. Daemons older than this key reject it as unknown.
 .SH THE PRIORITY LADDER
 Gaming\-beats\-everything is the floor, not the whole model. Tenants also rank
 against
@@ -573,8 +597,8 @@ else
 .B kind
 ==
 .B """ollama"""
-\(rA run
-.BR "ollama ps" .
+\(rA query
+.BR "GET {ollama_url}/api/ps" .
 .IP 3. 4
 else
 .B kind
@@ -597,12 +621,12 @@ unset) \(rA name heuristic: if the
 .B unit
 name contains
 .I ollama
-(case\-insensitive), run
-.BR "ollama ps" ;
+(case\-insensitive), query
+.BR "GET {ollama_url}/api/ps" ;
 otherwise report no models.
 .PP
 An Ollama\-kinded or Ollama\-named unit therefore introspects via
-.B "ollama ps"
+.B "GET {ollama_url}/api/ps"
 by default (steps 2 and 4), any other tenant can report its own model/process
 list via
 .B introspect_cmd

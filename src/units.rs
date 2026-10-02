@@ -359,13 +359,13 @@ fn stderr_excerpt(stderr: &[u8]) -> String {
 /// below any reasonable systemd transaction timeout.
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Hard ceiling on the `/status` refresh path's model-introspection shell-outs
-/// (`ollama ps` / a configured `introspect_cmd`) — tighter than
+/// Hard ceiling on the `/status` refresh path's model introspection (the
+/// Ollama `/api/ps` query / a configured `introspect_cmd`) — tighter than
 /// [`SYSTEMCTL_TIMEOUT`]. These run on every reconcile pass's
 /// `refresh_substate`, which the reconcile task must return from promptly to
 /// react to the next trigger (a game launch); the doc on
 /// [`loaded_models`] already commits to "fast on the /status refresh path", and
-/// 10s wasn't honoring that. 2s is generous for a healthy `ollama ps`/custom
+/// 10s wasn't honoring that. 2s is generous for a healthy Ollama API/custom
 /// script (typically tens of ms) while still bounding the worst case tightly.
 const INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -500,21 +500,90 @@ pub fn eviction_step(reading: UnitVramReading, elapsed: Duration, cfg: &Config) 
     }
 }
 
-/// Parse `ollama ps` table output into the list of loaded model names. Pure.
+/// Why a `/status` `models[]` query failed. Rendered into
+/// [`crate::state::UnitStatus::models_error`].
+#[derive(Debug, thiserror::Error)]
+pub enum IntrospectError {
+    /// The HTTP request failed: connection refused, a non-2xx status, an
+    /// unsupported URL (e.g. `https://` — the daemon has no TLS), or ureq's own
+    /// timeout. Stringified because `ureq::Error` is not worth carrying across
+    /// the `spawn_blocking` boundary for a value that is only ever displayed.
+    #[error("GET {url}: {detail}")]
+    Request {
+        /// The URL queried.
+        url: String,
+        /// The failure, as reported by the HTTP client.
+        detail: String,
+    },
+    /// The request succeeded but the body was not the expected JSON shape.
+    #[error("GET {url}: unexpected response body: {source}")]
+    Parse {
+        /// The URL queried.
+        url: String,
+        /// The JSON decode failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The query did not finish within [`INTROSPECTION_TIMEOUT`].
+    #[error("GET {url}: timed out after {elapsed:?}")]
+    Timeout {
+        /// The URL queried.
+        url: String,
+        /// The bound that elapsed.
+        elapsed: Duration,
+    },
+    /// The blocking HTTP task panicked or was cancelled.
+    #[error("GET {url}: query task failed: {detail}")]
+    Task {
+        /// The URL queried.
+        url: String,
+        /// The join failure.
+        detail: String,
+    },
+}
+
+/// The subset of Ollama's `GET /api/ps` response the daemon reads.
+#[derive(Debug, serde::Deserialize)]
+struct OllamaPsResponse {
+    /// Loaded models. Ollama sends `[]` when none are loaded; a missing key or
+    /// `null` is read the same way.
+    #[serde(default)]
+    models: Option<Vec<OllamaPsModel>>,
+}
+
+/// One loaded model in an `/api/ps` response.
+#[derive(Debug, serde::Deserialize)]
+struct OllamaPsModel {
+    /// The model tag (`"qwen3:30b"`).
+    #[serde(default)]
+    name: Option<String>,
+    /// Same tag under the newer key; used when `name` is absent.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Parse an Ollama `GET /api/ps` JSON body into loaded model names. Pure —
+/// unit-tested. `{"models":[]}` is a genuine empty list; a body that is not
+/// JSON of that shape is an error, never an empty list.
 ///
-/// `ollama ps` prints a header row (`NAME  ID  SIZE  PROCESSOR  UNTIL`) followed
-/// by one row per loaded model; the model name is the first whitespace-delimited
-/// column. A header-only table (no models loaded) yields an empty vec.
-pub fn parse_ollama_ps(out: &str) -> Vec<String> {
-    out.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        // Drop exactly the header row (the first non-empty line). `skip(1)` is
-        // unambiguous — `skip_while`-on-"NAME" would also swallow a model that
-        // happened to be named `NAME`.
-        .skip(1)
-        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
-        .collect()
+/// # Errors
+///
+/// Returns the JSON decode error when `body` is not an `/api/ps` response.
+pub fn parse_ollama_api_ps(body: &str) -> Result<Vec<String>, serde_json::Error> {
+    let resp: OllamaPsResponse = serde_json::from_str(body)?;
+    Ok(resp
+        .models
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| m.name.or(m.model))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect())
+}
+
+/// `{base}/api/ps`, tolerating a trailing slash on `base`.
+fn ollama_ps_url(base: &str) -> String {
+    format!("{}/api/ps", base.trim_end_matches('/'))
 }
 
 /// Run `systemctl <action> <unit>`; map a non-zero exit / spawn failure into a
@@ -814,27 +883,33 @@ pub async fn is_busy(u: &ManagedUnit) -> bool {
     }
 }
 
-/// Best-effort list of loaded model/process names for a managed unit (for the
-/// `/status` `models[]` field).
+/// List the loaded model/process names for a managed unit (for the `/status`
+/// `models[]` field).
 ///
 /// Generic over the tenant: the backend is resolved purely from the unit's config
 /// (see [`ManagedUnit::introspection`]):
 ///
 /// - [`Introspection::Command`] → run the configured `introspect_cmd` as a
 ///   shell-free argv and turn each non-empty trimmed stdout line into a name.
-/// - [`Introspection::Ollama`] → run `ollama ps` and parse it with
-///   [`parse_ollama_ps`] — the default for an `ollama`-kinded or
-///   `ollama`-named unit.
-/// - [`Introspection::None`] → empty vec (no model reporting for this unit).
+///   Best-effort: a missing binary or non-zero exit yields `Ok(vec![])`.
+/// - [`Introspection::Ollama`] → `GET {ollama_url}/api/ps` — the default for an
+///   `ollama`-kinded or `ollama`-named unit. A failed query is an `Err`, so it
+///   can be reported distinctly from "no models loaded".
+/// - [`Introspection::None`] → `Ok(vec![])` (no model reporting for this unit).
 ///
-/// Best-effort + bounded throughout: a missing binary, failed/empty query,
-/// non-zero exit, or non-systemd host yields an empty vec — **never** an error or
-/// panic (purely informational, must not break a `/status` response).
-pub async fn loaded_models(unit: &ManagedUnit) -> Vec<String> {
+/// Bounded by [`INTROSPECTION_TIMEOUT`] and never panics — it is purely
+/// informational and must not break a `/status` response.
+///
+/// # Errors
+///
+/// Returns [`IntrospectError`] when the Ollama API query fails.
+pub async fn loaded_models(unit: &ManagedUnit) -> Result<Vec<String>, IntrospectError> {
     match unit.introspection() {
-        Introspection::Command(cmd) => run_introspect_cmd(&cmd).await,
-        Introspection::Ollama => ollama_loaded_models().await,
-        Introspection::None => Vec::new(),
+        Introspection::Command(cmd) => Ok(run_introspect_cmd(&cmd).await),
+        Introspection::Ollama => {
+            ollama_loaded_models(unit.ollama_base_url(), INTROSPECTION_TIMEOUT).await
+        }
+        Introspection::None => Ok(Vec::new()),
     }
 }
 
@@ -870,21 +945,52 @@ pub fn parse_model_lines(out: &str) -> Vec<String> {
         .collect()
 }
 
-/// Best-effort list of loaded Ollama model names via `ollama ps`.
+/// Loaded Ollama model names via the HTTP API (`GET {base_url}/api/ps`).
 ///
-/// Returns an empty vec when Ollama is not running, the `ollama` CLI is absent,
-/// or the query fails — never an error. Used by [`loaded_models`] for the Ollama
-/// introspection backend.
-async fn ollama_loaded_models() -> Vec<String> {
-    let fut = tokio::process::Command::new("ollama").arg("ps").output();
-    // Best-effort + bounded: a hung `ollama ps` must not stall the
-    // reconcile — 2s, tighter than the control-verb SYSTEMCTL_TIMEOUT.
-    match tokio::time::timeout(INTROSPECTION_TIMEOUT, fut).await {
-        Ok(Ok(out)) if out.status.success() => {
-            parse_ollama_ps(&String::from_utf8_lossy(&out.stdout))
+/// Replaces a bare `ollama ps` shell-out, which depended on the CLI being on
+/// the daemon's `PATH`. It usually is not for a Windows service running as
+/// `LocalSystem`, and the failed spawn was silently reported as `models: []`.
+/// The CLI is itself only a client of this same endpoint, so on Linux the
+/// answer is unchanged.
+///
+/// `ureq` is synchronous, so the request runs on the blocking pool; it is
+/// bounded twice: ureq's own global timeout, and a `tokio` timeout as a
+/// backstop so the reconcile task can never wait longer than `timeout` plus a
+/// small margin.
+async fn ollama_loaded_models(
+    base_url: &str,
+    timeout: Duration,
+) -> Result<Vec<String>, IntrospectError> {
+    let url = ollama_ps_url(base_url);
+    let req_url = url.clone();
+    let fetch = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            // A local tenant query must not be routed through an HTTP(S)_PROXY
+            // the service environment happens to carry.
+            .proxy(None)
+            .build()
+            .into();
+        let mut resp = agent.get(&req_url).call().map_err(|e| e.to_string())?;
+        resp.body_mut().read_to_string().map_err(|e| e.to_string())
+    });
+    let body = match tokio::time::timeout(timeout + Duration::from_millis(500), fetch).await {
+        Ok(Ok(Ok(body))) => body,
+        Ok(Ok(Err(detail))) => return Err(IntrospectError::Request { url, detail }),
+        Ok(Err(join)) => {
+            return Err(IntrospectError::Task {
+                url,
+                detail: join.to_string(),
+            });
         }
-        _ => Vec::new(),
-    }
+        Err(_) => {
+            return Err(IntrospectError::Timeout {
+                url,
+                elapsed: timeout,
+            });
+        }
+    };
+    parse_ollama_api_ps(&body).map_err(|source| IntrospectError::Parse { url, source })
 }
 
 /// Resolve `unit` (a name) against `cfg.resolved_units()`. Used by the
@@ -1862,25 +1968,178 @@ mod tests {
     }
 
     #[test]
-    fn parse_ollama_ps_extracts_model_names() {
-        let out = "\
-NAME          ID              SIZE     PROCESSOR    UNTIL
-qwen3:30b     abc123          21 GB    100% GPU     4 minutes from now
-llama3:8b     def456          5 GB     100% GPU     2 minutes from now
-";
-        assert_eq!(parse_ollama_ps(out), vec!["qwen3:30b", "llama3:8b"]);
+    fn parse_ollama_api_ps_extracts_model_names() {
+        // Trimmed from a real Ollama `/api/ps` response.
+        let body = r#"{"models":[
+            {"name":"qwen3:30b","model":"qwen3:30b","size":21000000000,"size_vram":21000000000},
+            {"model":"llama3:8b","size_vram":5000000000}
+        ]}"#;
+        assert_eq!(
+            parse_ollama_api_ps(body).unwrap(),
+            vec!["qwen3:30b", "llama3:8b"]
+        );
     }
 
     #[test]
-    fn parse_ollama_ps_header_only_is_empty() {
-        let out = "NAME    ID    SIZE    PROCESSOR    UNTIL\n";
-        assert!(parse_ollama_ps(out).is_empty());
+    fn parse_ollama_api_ps_empty_list_is_ok_empty() {
+        assert!(parse_ollama_api_ps(r#"{"models":[]}"#).unwrap().is_empty());
+        assert!(
+            parse_ollama_api_ps(r#"{"models":null}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_ollama_api_ps("{}").unwrap().is_empty());
     }
 
     #[test]
-    fn parse_ollama_ps_empty_is_empty() {
-        assert!(parse_ollama_ps("").is_empty());
-        assert!(parse_ollama_ps("\n\n").is_empty());
+    fn parse_ollama_api_ps_garbage_is_an_error_not_empty() {
+        assert!(parse_ollama_api_ps("").is_err());
+        assert!(parse_ollama_api_ps("NAME  ID  SIZE").is_err());
+        assert!(parse_ollama_api_ps(r#"{"models":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn ollama_ps_url_tolerates_trailing_slash() {
+        assert_eq!(
+            ollama_ps_url("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434/api/ps"
+        );
+        assert_eq!(
+            ollama_ps_url("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434/api/ps"
+        );
+    }
+
+    /// A one-shot HTTP server on an ephemeral loopback port: accepts a single
+    /// connection, records the request line, and replies with `response`
+    /// verbatim. Returns the base URL and a handle yielding the request line.
+    ///
+    /// Plain `std::net` on its own thread, not tokio: tokio's `io-util`
+    /// feature only reaches the Linux build transitively, so a tokio-based
+    /// mock would not compile for the Windows CI job.
+    fn mock_http_once(response: String) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut req = Vec::new();
+            // Read until the end of the request head.
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(response.as_bytes()).unwrap();
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            String::from_utf8_lossy(&req)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_reports_loaded_models() {
+        let (base, server) = mock_http_once(http_response(
+            "200 OK",
+            r#"{"models":[{"name":"qwen3:30b","model":"qwen3:30b"}]}"#,
+        ));
+        let models = ollama_loaded_models(&base, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(models, vec!["qwen3:30b"]);
+        assert_eq!(server.join().unwrap(), "GET /api/ps HTTP/1.1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_no_models_is_ok_empty() {
+        let (base, server) = mock_http_once(http_response("200 OK", r#"{"models":[]}"#));
+        let models = ollama_loaded_models(&format!("{base}/"), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(models.is_empty());
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_error_status_is_an_error() {
+        let (base, server) = mock_http_once(http_response("500 Internal Server Error", "{}"));
+        let err = ollama_loaded_models(&base, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntrospectError::Request { .. }), "{err:?}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_non_json_body_is_a_parse_error() {
+        let (base, server) = mock_http_once(http_response("200 OK", "NAME ID SIZE"));
+        let err = ollama_loaded_models(&base, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntrospectError::Parse { .. }), "{err:?}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_connection_refused_is_an_error_not_empty() {
+        // Bind then drop: the port is free, so nothing is listening.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let err = ollama_loaded_models(&format!("http://{addr}"), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntrospectError::Request { .. }), "{err:?}");
+        assert!(err.to_string().contains("/api/ps"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_hung_server_times_out() {
+        // Accepts and then never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(sock);
+        });
+        let started = std::time::Instant::now();
+        let err = ollama_loaded_models(&format!("http://{addr}"), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IntrospectError::Request { .. } | IntrospectError::Timeout { .. }
+            ),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "not bounded");
+        hold.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ollama_http_https_url_is_an_error() {
+        // No TLS stack: an https URL must surface as an error, not as [].
+        let err = ollama_loaded_models("https://127.0.0.1:1", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IntrospectError::Request { .. }), "{err:?}");
     }
 
     /// A bare systemd-driven managed unit (no command overrides) — the default
@@ -1897,6 +2156,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             vram_match: None,
             kind: None,
             introspect_cmd: None,
+            ollama_url: None,
             stop_cmd: None,
             start_cmd: None,
             is_active_cmd: None,
@@ -1925,6 +2185,7 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             vram_match: None,
             kind: kind.map(str::to_string),
             introspect_cmd: introspect_cmd.map(str::to_string),
+            ollama_url: None,
             stop_cmd: None,
             start_cmd: None,
             is_active_cmd: None,
@@ -2014,19 +2275,30 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
         assert!(parse_model_lines("\n  \n").is_empty());
     }
 
-    #[tokio::test]
-    async fn loaded_models_never_errors_without_backends() {
-        // loaded_models is best-effort across all backends: no `ollama` binary, a
-        // missing introspect_cmd binary, or a None unit → empty vec, no panic.
-        let _ = loaded_models(&unit("ollama.service", Some("ollama"), None)).await;
-        let _ = loaded_models(&unit(
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loaded_models_reports_ollama_failure_distinctly() {
+        // Nothing listens on the dropped port: the Ollama backend must say so
+        // rather than reporting an empty model list.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let mut u = unit("ollama.service", Some("ollama"), None);
+        u.ollama_url = Some(format!("http://{addr}"));
+        assert!(loaded_models(&u).await.is_err());
+
+        // The command backend stays best-effort: a missing binary is `Ok([])`.
+        let cmd = loaded_models(&unit(
             "x.service",
             None,
             Some("definitely-not-a-real-binary-xyz"),
         ))
-        .await;
-        let none = loaded_models(&unit("x.service", None, None)).await;
-        assert!(none.is_empty()); // Introspection::None → always empty
+        .await
+        .unwrap();
+        assert!(cmd.is_empty());
+        // Introspection::None → always Ok(empty).
+        let none = loaded_models(&unit("x.service", None, None)).await.unwrap();
+        assert!(none.is_empty());
     }
 
     // ── Supervisor resolution (pure decision) ──────────────────────────────
@@ -2241,6 +2513,42 @@ llama3:8b     def456          5 GB     100% GPU     2 minutes from now
             out.contains("WARNING") && out.contains("fake.service"),
             "expected a warning naming the unit, got: {out}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_warns_on_non_http_ollama_url() {
+        let dir = std::env::temp_dir().join(format!(
+            "ga-ollamaurl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[managed_units]]
+            unit = "ok.service"
+            ollama_url = "http://127.0.0.1:11434"
+
+            [[managed_units]]
+            unit = "tls.service"
+            ollama_url = "https://ollama.example"
+            "#,
+        )
+        .unwrap();
+
+        let out = crate::cli::check_config(path.to_str().unwrap()).unwrap();
+        assert!(out.starts_with("OK:"), "still a valid config: {out}");
+        assert!(
+            out.contains("WARNING: ollama_url") && out.contains("tls.service"),
+            "expected an ollama_url warning naming the unit, got: {out}"
+        );
+        assert!(!out.contains("ok.service"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

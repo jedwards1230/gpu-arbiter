@@ -830,8 +830,18 @@ async fn refresh_substate(
         Err(_) => None,
     };
     // Snapshot the held set so /status can tell an operator *why* a stopped unit
-    // isn't restarting (see ArbiterState::held / ensure_running_targets).
-    let held = { read_state(state).held.clone() };
+    // isn't restarting (see ArbiterState::held / ensure_running_targets). The
+    // previous pass's model-query errors ride along so a failing query is
+    // logged on its transitions, not on every 2 s pass.
+    let (held, prior_models_errors) = {
+        let guard = read_state(state);
+        let prior: std::collections::HashMap<String, Option<String>> = guard
+            .units
+            .iter()
+            .map(|u| (u.unit.clone(), u.models_error.clone()))
+            .collect();
+        (guard.held.clone(), prior)
+    };
 
     // Each unit's substate is queried CONCURRENTLY, not serially: a serial
     // wedged is_running/loaded_models on one unit would block every unit
@@ -846,6 +856,7 @@ async fn refresh_substate(
     let unit_futures = cfg.resolved_units().iter().map(|u| {
         let compute = &compute;
         let held = &held;
+        let prior_models_errors = &prior_models_errors;
         async move {
             // Tristate: a failed is-active check is "couldn't tell", not
             // a confirmed `false` — logged here (the one place this query
@@ -862,11 +873,30 @@ async fn refresh_substate(
             // fallback) is resolved from the unit's config. Only queried when
             // confirmed running (an unknown state gets no models, same as a
             // confirmed-stopped one).
-            let models = if running == Some(true) {
-                units::loaded_models(u).await
+            //
+            // A failed query is reported in `models_error`, never as a silent
+            // empty list — an unreachable Ollama must not look like an idle one.
+            let (models, models_error) = if running == Some(true) {
+                match units::loaded_models(u).await {
+                    Ok(m) => (m, None),
+                    Err(e) => (Vec::new(), Some(e.to_string())),
+                }
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
+            let prior_error = prior_models_errors.get(&u.unit).cloned().flatten();
+            match (&prior_error, &models_error) {
+                (None, Some(e)) => {
+                    tracing::warn!(unit = %u.unit, error = %e, "/status refresh: model query failed; reporting models_error");
+                }
+                (Some(_), None) if running == Some(true) => {
+                    tracing::info!(unit = %u.unit, "/status refresh: model query recovered");
+                }
+                (Some(_), Some(e)) => {
+                    tracing::debug!(unit = %u.unit, error = %e, "/status refresh: model query still failing");
+                }
+                _ => {}
+            }
             // Attribute VRAM — likewise only when confirmed running.
             // Precedence: cgroup unit match first (can't be fooled by a
             // wrapper binary), falling back to the unit's configured
@@ -883,6 +913,7 @@ async fn refresh_substate(
                 unit: u.unit.clone(),
                 running,
                 models,
+                models_error,
                 vram_mb,
                 held: held.contains(&u.unit),
             }
@@ -1703,6 +1734,45 @@ mod tests {
             marker = crate::testutil::toml_path(marker),
         )))
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_reports_models_error_when_ollama_api_is_down() {
+        // A running Ollama-kinded unit whose API refuses connections must show
+        // `models_error` in /status, not a silent empty `models`.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "ollama-test"
+            kind = "ollama"
+            ollama_url = "http://{addr}"
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = "true"
+            "#
+        )))
+        .unwrap();
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile(
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        let guard = read_state(&state);
+        let u = &guard.units[0];
+        assert_eq!(u.running, Some(true));
+        assert!(u.models.is_empty());
+        let err = u.models_error.as_deref().expect("models_error must be set");
+        assert!(err.contains("/api/ps"), "{err}");
     }
 
     #[tokio::test]
