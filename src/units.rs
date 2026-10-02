@@ -2544,10 +2544,25 @@ mod tests {
             r#"
             [[managed_units]]
             unit = "ok.service"
+            kind = "ollama"
             ollama_url = "http://127.0.0.1:11434"
 
             [[managed_units]]
             unit = "tls.service"
+            kind = "ollama"
+            ollama_url = "https://ollama.example"
+
+            # Same bad URL, but this unit's introspection is not Ollama: the
+            # introspect_cmd override wins, so the URL is never used.
+            [[managed_units]]
+            unit = "cmd-override.service"
+            kind = "ollama"
+            introspect_cmd = "vllm-cli list-models"
+            ollama_url = "https://ollama.example"
+
+            # Same bad URL on a unit with no Ollama introspection at all.
+            [[managed_units]]
+            unit = "plain.service"
             ollama_url = "https://ollama.example"
             "#,
         )
@@ -2559,7 +2574,38 @@ mod tests {
             out.contains("WARNING: ollama_url") && out.contains("tls.service"),
             "expected an ollama_url warning naming the unit, got: {out}"
         );
-        assert!(!out.contains("ok.service"), "{out}");
+        for unused in ["ok.service", "cmd-override.service", "plain.service"] {
+            assert!(!out.contains(unused), "must not warn about {unused}: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_config_no_ollama_url_warning_when_url_is_unused() {
+        // Only units whose introspection resolves to Ollama are checked; with
+        // none of those, there is no warning at all.
+        let dir = std::env::temp_dir().join(format!(
+            "ga-ollamaurl-unused-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[managed_units]]
+            unit = "vllm.service"
+            kind = "vllm"
+            ollama_url = "https://ollama.example"
+            "#,
+        )
+        .unwrap();
+        let out = crate::cli::check_config(path.to_str().unwrap()).unwrap();
+        assert!(!out.contains("WARNING"), "unexpected warning: {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

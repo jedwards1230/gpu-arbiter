@@ -446,10 +446,14 @@ pub fn check_config(path: &str) -> Result<String, ConfigError> {
 
     // The daemon has no TLS stack, so anything but a plain http:// ollama_url
     // can never succeed. It still parses (the URL is only used for /status
-    // models[]), but every query would fail into models_error.
+    // models[]), but every query would fail into models_error. Only units
+    // whose introspection actually resolves to Ollama are checked: with an
+    // `introspect_cmd` override or a non-Ollama `kind`, the URL is never used
+    // and warning about it would be wrong.
     let bad_url: Vec<String> = cfg
         .resolved_units()
         .iter()
+        .filter(|u| u.introspection() == crate::config::Introspection::Ollama)
         .filter_map(|u| {
             u.ollama_url
                 .as_deref()
