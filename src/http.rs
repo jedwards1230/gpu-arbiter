@@ -1695,6 +1695,45 @@ mod tests {
         ));
     }
 
+    /// A configured unit's eviction series exist at 0 before any eviction has
+    /// happened, with the same label sets a real eviction produces — so
+    /// `absent()` alerts and dashboards work from daemon start.
+    #[test]
+    fn render_metrics_exposes_seeded_eviction_series_before_any_eviction() {
+        let cfg = crate::config::Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "comfyui"
+            "#,
+        )
+        .unwrap();
+        let metrics = crate::state::ArbiterState::with_config(&cfg).metrics;
+        let out = render_metrics(&empty_snapshot(), &metrics, 0, 0, 600, 0);
+        for outcome in ["graceful", "sigkill", "yielded", "error"] {
+            let line =
+                format!("gpu_arbiter_evictions_total{{unit=\"comfyui\",outcome=\"{outcome}\"}} 0");
+            assert!(out.contains(&line), "missing `{line}` in:\n{out}");
+        }
+        for stage in ["yield", "stop", "total"] {
+            for line in [
+                format!(
+                    "gpu_arbiter_eviction_duration_seconds_bucket{{unit=\"comfyui\",stage=\"{stage}\",le=\"0.1\"}} 0"
+                ),
+                format!(
+                    "gpu_arbiter_eviction_duration_seconds_bucket{{unit=\"comfyui\",stage=\"{stage}\",le=\"+Inf\"}} 0"
+                ),
+                format!(
+                    "gpu_arbiter_eviction_duration_seconds_count{{unit=\"comfyui\",stage=\"{stage}\"}} 0"
+                ),
+                format!(
+                    "gpu_arbiter_eviction_duration_seconds_sum{{unit=\"comfyui\",stage=\"{stage}\"}} 0"
+                ),
+            ] {
+                assert!(out.contains(&line), "missing `{line}` in:\n{out}");
+            }
+        }
+    }
+
     /// A hook that fails must produce a real, well-formed
     /// `gpu_arbiter_hook_failures_total` series — the whole point is that it's
     /// alertable, which it is not if the line never renders.

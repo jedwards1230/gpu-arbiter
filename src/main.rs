@@ -367,7 +367,7 @@ mod daemon {
         );
 
         // 2. Shared state + the trigger channel.
-        let state = Arc::new(RwLock::new(ArbiterState::new()));
+        let state = Arc::new(RwLock::new(ArbiterState::with_config(&cfg)));
         let (triggers_tx, triggers_rx) = mpsc::channel::<ReconcileTrigger>(TRIGGER_CHANNEL_DEPTH);
 
         // 2b. Local-presence monitor. Seed `last_input` to NOW (the startup bias)

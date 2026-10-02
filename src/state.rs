@@ -400,7 +400,38 @@ impl DurationHistogram {
     }
 }
 
+impl EvictionStage {
+    /// Every stage, in exposition order — the label values a unit's
+    /// `gpu_arbiter_eviction_duration_seconds` series are pre-seeded with.
+    pub const ALL: [EvictionStage; 3] = [
+        EvictionStage::Yield,
+        EvictionStage::Stop,
+        EvictionStage::Total,
+    ];
+}
+
 impl Metrics {
+    /// Pre-seed every per-unit eviction series for `unit` at zero: all four
+    /// `gpu_arbiter_evictions_total{outcome}` buckets and the
+    /// `gpu_arbiter_eviction_duration_seconds{stage}` histogram for each
+    /// [`EvictionStage`].
+    ///
+    /// Without this a series only appears after the unit's first eviction, so
+    /// `absent()` alerts fire on a perfectly healthy host and `increase()` over
+    /// a window containing that first eviction under-counts it, because
+    /// Prometheus has no prior sample to diff against. The label sets are the
+    /// exact ones a real observation produces, so a seeded series and a
+    /// recorded one are the same time series. Idempotent: an existing count is
+    /// left untouched.
+    pub fn seed_unit(&mut self, unit: &str) {
+        self.evictions.entry(unit.to_string()).or_default();
+        for stage in EvictionStage::ALL {
+            self.eviction_durations
+                .entry((unit.to_string(), stage))
+                .or_default();
+        }
+    }
+
     /// Record one eviction attempt's outcome for `unit`. Callers get `outcome`
     /// from [`crate::units::eviction_metric_outcome`], which already excludes
     /// the "nothing to evict" case — every call here represents a real
@@ -535,6 +566,18 @@ impl ArbiterState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct the daemon's initial state for `cfg`: [`ArbiterState::new`]
+    /// plus every configured unit's eviction metrics pre-seeded at zero (see
+    /// [`Metrics::seed_unit`]). What `main` uses at startup.
+    #[must_use]
+    pub fn with_config(cfg: &crate::config::Config) -> Self {
+        let mut s = Self::new();
+        for u in cfg.resolved_units() {
+            s.metrics.seed_unit(&u.unit);
+        }
+        s
     }
 
     /// Resolve the externally-visible state from the observed claim set. Pure
@@ -984,5 +1027,44 @@ mod tests {
     #[test]
     fn reconcile_trigger_label_covers_startup() {
         assert_eq!(ReconcileTrigger::Startup.label(), "startup");
+    }
+
+    #[test]
+    fn with_config_seeds_every_unit_eviction_series_at_zero() {
+        let cfg = crate::config::Config::from_toml(
+            r#"
+            [[managed_units]]
+            unit = "a.service"
+
+            [[managed_units]]
+            unit = "b.service"
+            "#,
+        )
+        .unwrap();
+        let s = ArbiterState::with_config(&cfg);
+        for unit in ["a.service", "b.service"] {
+            let c = s.metrics.evictions[unit];
+            assert_eq!((c.yielded, c.graceful, c.sigkill, c.error), (0, 0, 0, 0));
+            for stage in EvictionStage::ALL {
+                let h = &s.metrics.eviction_durations[&(unit.to_string(), stage)];
+                assert_eq!(h.count, 0);
+                assert!(h.sum.abs() < f64::EPSILON);
+            }
+        }
+        assert_eq!(s.metrics.evictions.len(), 2);
+        assert_eq!(s.metrics.eviction_durations.len(), 6);
+    }
+
+    #[test]
+    fn seed_unit_never_resets_existing_counts() {
+        let mut m = Metrics::default();
+        m.record_eviction("u", crate::units::EvictionMetricOutcome::Sigkill);
+        m.record_eviction_duration("u", EvictionStage::Total, 1.5);
+        m.seed_unit("u");
+        assert_eq!(m.evictions["u"].sigkill, 1);
+        assert_eq!(
+            m.eviction_durations[&("u".to_string(), EvictionStage::Total)].count,
+            1
+        );
     }
 }

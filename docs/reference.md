@@ -148,7 +148,14 @@ It also exposes four **counters** — durable eviction/restart/reconcile history
 that outlives journald's short retention on the deployment host. Monotonic for
 the daemon's process lifetime; a restart resets them to 0, so alert/dashboard
 queries should use `rate()`/`increase()` rather than comparing raw values
-across a restart:
+across a restart.
+
+The per-unit eviction series (`gpu_arbiter_evictions_total` for every
+`outcome`, and `gpu_arbiter_eviction_duration_seconds` for every `stage`) are
+**pre-seeded at 0 for every configured unit at startup**, so they exist before
+the first eviction. `absent()` alerts and dashboards therefore work on a fresh
+daemon, and `increase()` does not miss the first eviction for lack of a prior
+sample.
 
 | Metric | Meaning |
 |---|---|

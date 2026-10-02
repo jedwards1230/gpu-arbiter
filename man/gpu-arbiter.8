@@ -316,7 +316,13 @@ total GPU memory, and a top\-level
 flag (see DETECTION AND EVICTION MODEL).
 .TP
 .B GET /metrics
-Prometheus text\-format exposition.
+Prometheus text\-format exposition. The per\-unit eviction series
+.RB ( gpu_arbiter_evictions_total
+for every outcome,
+.B gpu_arbiter_eviction_duration_seconds
+for every stage) are pre\-seeded at 0 for each configured unit at startup, so
+they exist before the first eviction. The full metric list is in
+.IR docs/reference.md .
 .TP
 .B GET /healthz
 Liveness probe.
