@@ -545,10 +545,11 @@ pub enum IntrospectError {
 /// The subset of Ollama's `GET /api/ps` response the daemon reads.
 #[derive(Debug, serde::Deserialize)]
 struct OllamaPsResponse {
-    /// Loaded models. Ollama sends `[]` when none are loaded; a missing key or
-    /// `null` is read the same way.
-    #[serde(default)]
-    models: Option<Vec<OllamaPsModel>>,
+    /// Loaded models. Ollama sends `[]` when none are loaded. Required and
+    /// non-null on purpose: a missing key or `null` means the response is not
+    /// what we asked for, and reading it as "no models" would hide that behind
+    /// an idle-looking status.
+    models: Vec<OllamaPsModel>,
 }
 
 /// One loaded model in an `/api/ps` response.
@@ -563,8 +564,9 @@ struct OllamaPsModel {
 }
 
 /// Parse an Ollama `GET /api/ps` JSON body into loaded model names. Pure —
-/// unit-tested. `{"models":[]}` is a genuine empty list; a body that is not
-/// JSON of that shape is an error, never an empty list.
+/// unit-tested. `{"models":[]}` is the only genuine empty list; a body that is
+/// not JSON of that shape — including a missing or `null` `models` — is an
+/// error, never an empty list.
 ///
 /// # Errors
 ///
@@ -573,7 +575,6 @@ pub fn parse_ollama_api_ps(body: &str) -> Result<Vec<String>, serde_json::Error>
     let resp: OllamaPsResponse = serde_json::from_str(body)?;
     Ok(resp
         .models
-        .unwrap_or_default()
         .into_iter()
         .filter_map(|m| m.name.or(m.model))
         .map(|n| n.trim().to_string())
@@ -1990,12 +1991,15 @@ mod tests {
     #[test]
     fn parse_ollama_api_ps_empty_list_is_ok_empty() {
         assert!(parse_ollama_api_ps(r#"{"models":[]}"#).unwrap().is_empty());
-        assert!(
-            parse_ollama_api_ps(r#"{"models":null}"#)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(parse_ollama_api_ps("{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_ollama_api_ps_missing_or_null_models_is_an_error() {
+        // A 200 with the wrong shape must surface as models_error, not read as
+        // "nothing loaded" — only an explicit `[]` is a genuine empty list.
+        assert!(parse_ollama_api_ps("{}").is_err());
+        assert!(parse_ollama_api_ps(r#"{"models":null}"#).is_err());
+        assert!(parse_ollama_api_ps(r#"{"status":"ok"}"#).is_err());
     }
 
     #[test]
