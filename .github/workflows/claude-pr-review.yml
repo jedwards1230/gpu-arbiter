@@ -21,6 +21,8 @@ jobs:
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }} # preferred (subscription)
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      LITELLM_CI_KEY: ${{ secrets.LITELLM_CI_KEY }}
+      LENS_TRACING_KEY: ${{ secrets.LENS_TRACING_KEY }}
     with:
       draft_on_blocking: true
       extra_plugins: |
