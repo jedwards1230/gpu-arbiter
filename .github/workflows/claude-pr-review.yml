@@ -28,7 +28,6 @@ jobs:
       LITELLM_CI_BASE_URL: ${{ secrets.LITELLM_CI_BASE_URL }}
       LENS_CI_OTLP_ENDPOINT: ${{ secrets.LENS_CI_OTLP_ENDPOINT }}
     with:
-      draft_on_blocking: true
       extra_plugins: |
         rust-quality@jedwards1230-plugins
       focus: |
