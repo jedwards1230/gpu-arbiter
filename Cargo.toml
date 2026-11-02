@@ -80,7 +80,7 @@ tokio-stream = "0.1"
 # Windows process enumeration backing `reconcile::observe`. `system` alone
 # exposes the process list needed for a service binary running as LocalSystem.
 [target.'cfg(target_os = "windows")'.dependencies]
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 # `ServiceExt::oneshot` drives an axum `Router` directly against a built
