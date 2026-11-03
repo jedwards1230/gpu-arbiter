@@ -366,16 +366,16 @@ pub async fn reconcile(
                             // Already running — typically a manual stop that
                             // *yielded* (the tenant parked, the process stayed
                             // up). Nothing was started, so no restart is
-                            // counted; instead the unit owes its `resume_cmd`.
-                            // Forcing `needs_resume` here (rather than relying
-                            // on the stop having set it) lets this same pass's
-                            // resume step below un-park it; that step clears
-                            // the flag on success, so it fires exactly once.
+                            // counted. The resume is NOT forced here: the stop
+                            // already recorded it in `needs_resume`, and the
+                            // resume step below runs it now that the hold is
+                            // gone (then clears it, so it fires once). A unit
+                            // that was never evicted owes nothing, and gets no
+                            // `resume_cmd` against its healthy tenant.
                             tracing::info!(
                                 unit = %unit,
-                                "manual unit start: already running; hold cleared, resume scheduled"
+                                "manual unit start: already running; start_cmd skipped, hold cleared"
                             );
-                            guard.needs_resume.insert(unit.clone());
                         }
                         drop(guard);
                         let _ = reply.send(Ok(()));
@@ -695,7 +695,11 @@ pub async fn reconcile(
 /// the hold, which in turn keeps `resume_cmd` from ever running.
 ///
 /// Uses the same `is_running` probe, with the same "unsure ⇒ attempt the
-/// start" default, as the ensure-running post-step.
+/// start" default, as the ensure-running post-step. Because "unsure" can mean a
+/// running unit (a probe that timed out), a failed start is followed by one more
+/// probe: if the unit is up after all, the start failure was the
+/// already-running refusal and the result is `Ok(false)`, not an error that
+/// would keep the hold.
 async fn manual_start(cfg: &Config, unit: &str) -> Result<bool, units::UnitError> {
     let u = units::resolve_unit(cfg, unit)?;
     let running = units::is_running(u)
@@ -707,7 +711,17 @@ async fn manual_start(cfg: &Config, unit: &str) -> Result<bool, units::UnitError
     if running {
         return Ok(false);
     }
-    units::start(u).await.map(|()| true)
+    match units::start(u).await {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            if matches!(units::is_running(u).await, Ok(true)) {
+                tracing::warn!(unit = %u.unit, error = %e, "manual start: start_cmd failed but the unit is running; treating as already running");
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Evict every managed unit, in order, for an `available → gaming` transition.
@@ -1924,6 +1938,74 @@ mod tests {
         pass(&state, &cfg, ReconcileTrigger::Timer).await;
         assert!(!take_marker(&resume_marker), "resume_cmd runs exactly once");
         assert!(!take_marker(&start_marker));
+    }
+
+    #[tokio::test]
+    async fn manual_start_on_running_never_evicted_unit_runs_no_resume() {
+        // Edge-triggered resume: a unit that was never evicted owes no resume,
+        // so a manual start on it must run neither start_cmd nor resume_cmd.
+        let start_marker = marker_path("never-evicted-start");
+        let resume_marker = marker_path("never-evicted-resume");
+        let cfg = yielding_cfg(&start_marker, &resume_marker);
+        let state = shared(ArbiterState::new());
+
+        assert_eq!(manual(&state, &cfg, true).await, Ok(()));
+        assert!(!take_marker(&start_marker), "start_cmd must not run");
+        assert!(
+            !take_marker(&resume_marker),
+            "nothing owed, nothing resumed"
+        );
+        assert!(read_state(&state).needs_resume.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_start_failing_on_a_unit_that_is_up_is_not_an_error() {
+        // The first probe says stopped (or could not tell), start_cmd fails the
+        // way sc.exe does on a running service, and the unit is in fact up: the
+        // re-probe turns that into "already running", clearing the hold.
+        // The marker is interpolated into `sh -c` / `cmd /c` command strings, so
+        // strip the `ThreadId(N)` parentheses both shells would parse.
+        let marker = std::path::PathBuf::from(
+            marker_path("start-fails-but-up")
+                .display()
+                .to_string()
+                .replace(['(', ')'], "-"),
+        );
+        let path = crate::testutil::toml_path(&marker);
+        let (start_argv, active_argv) = if cfg!(windows) {
+            (
+                format!(r#"["cmd", "/c", "type nul > {path} & exit 1"]"#),
+                format!(r#"["cmd", "/c", "if exist {path} (exit 0) else (exit 1)"]"#),
+            )
+        } else {
+            (
+                format!(r#"["sh", "-c", "touch {path}; exit 1"]"#),
+                format!(r#"["test", "-e", "{path}"]"#),
+            )
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = {start_argv}
+            stop_cmd = ["true"]
+            is_active_cmd = {active_argv}
+            "#
+        )))
+        .unwrap();
+        let mut initial = ArbiterState::new();
+        initial.held.insert("fake.service".to_string());
+        let state = shared(initial);
+
+        assert_eq!(manual(&state, &cfg, true).await, Ok(()));
+        assert!(!read_state(&state).held.contains("fake.service"));
+        assert!(
+            !read_state(&state)
+                .metrics
+                .unit_restarts
+                .contains_key("fake.service")
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[tokio::test]

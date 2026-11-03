@@ -115,12 +115,14 @@ unit is not started and any hold stays in place; retry once `/status` reports
 `POST /units/{unit}/start` on a unit that is **already running** does not run
 `start_cmd`. This is the normal case after a stop that *yielded* (a unit with a
 `yield_cmd` parks its work but keeps its process up, so `/status` shows it
-`running: true, held: true`). The start clears the hold, skips `start_cmd`
-(which is not idempotent everywhere: Windows `sc.exe start` fails with error
-1056 on a running service), and owes the unit one `resume_cmd`. That resume runs
-in the same reconcile pass when the GPU is free and nothing preempts the unit,
-or later once it is; either way it runs once. The reply is `200`. A unit that is
-stopped, or whose `is_active` probe fails, is started as before. When a start
+`running: true, held: true`). The start clears the hold and skips `start_cmd`,
+which is not idempotent everywhere: Windows `sc.exe start` fails with error 1056
+on a running service. The reply is `200`. The `resume_cmd` the stop left owed
+then runs once: in the same reconcile pass when the GPU is free and nothing
+preempts the unit, or later once that is true. A running unit that was never
+evicted owes no resume and gets none. A unit that is stopped, or whose
+`is_active` probe fails, is started as before; if that start fails but a second
+probe finds the unit running, it is treated as already running. When a start
 does fail (`500`), the hold stays and the daemon log carries the command's exit
 code and a bounded excerpt of both its stderr and its stdout.
 
