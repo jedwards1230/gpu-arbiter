@@ -111,7 +111,10 @@ pub enum ReconcileTrigger {
     /// into a live game, the same invariant startup reconciliation enforces.
     /// On a successful start, clears any manual hold on `unit` (see
     /// [`ArbiterState::held`]) so the ensure-running post-step resumes
-    /// managing it. The handler awaits `reply` for the outcome.
+    /// managing it. A unit that is **already running** (e.g. after a manual
+    /// stop that yielded) is not started again: the hold is cleared and the
+    /// unit is marked as owing a resume ([`ArbiterState::needs_resume`]), and
+    /// the reply is `Ok`. The handler awaits `reply` for the outcome.
     ManualStart {
         /// The managed unit to start (already validated by the HTTP handler
         /// against [`crate::config::Config::resolved_units`]).

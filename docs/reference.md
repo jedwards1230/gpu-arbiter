@@ -112,6 +112,18 @@ alongside the game until the game exited. On rejection nothing changes: the
 unit is not started and any hold stays in place; retry once `/status` reports
 `available`.
 
+`POST /units/{unit}/start` on a unit that is **already running** does not run
+`start_cmd`. This is the normal case after a stop that *yielded* (a unit with a
+`yield_cmd` parks its work but keeps its process up, so `/status` shows it
+`running: true, held: true`). The start clears the hold, skips `start_cmd`
+(which is not idempotent everywhere: Windows `sc.exe start` fails with error
+1056 on a running service), and owes the unit one `resume_cmd`. That resume runs
+in the same reconcile pass when the GPU is free and nothing preempts the unit,
+or later once it is; either way it runs once. The reply is `200`. A unit that is
+stopped, or whose `is_active` probe fails, is started as before. When a start
+does fail (`500`), the hold stays and the daemon log carries the command's exit
+code and a bounded excerpt of both its stderr and its stdout.
+
 `local_input_last_unix` / `physical_input_devices` / `input_monitor_up` report
 **local human presence**: the daemon watches *physical* input devices (keyboard /
 mouse / gamepad) and tracks input recency. Virtual devices injected by
@@ -166,7 +178,7 @@ sample.
 |---|---|
 | `gpu_arbiter_evictions_total{unit,outcome}` | Cumulative eviction attempts, `outcome` ∈ `yielded`\|`graceful`\|`sigkill`\|`error`. `yielded` means the tenant released the GPU cooperatively and was never stopped. A no-op (the unit wasn't running) is not counted. |
 | `gpu_arbiter_eviction_duration_seconds{unit,stage}` | **Histogram** of eviction wall-clock, `stage` ∈ `yield`\|`stop`\|`total`. Exists so `yield_timeout_s` and `eviction_timeout_s` can be set from observed cost rather than guessed — the stage split is what shows whether the cooperative stage is paying for itself or just adding latency ahead of an inevitable stop. No-op evictions are excluded. |
-| `gpu_arbiter_unit_restarts_total{unit}` | Cumulative successful managed-unit starts driven by the daemon (eager restore or manual start) |
+| `gpu_arbiter_unit_restarts_total{unit}` | Cumulative successful managed-unit starts driven by the daemon (eager restore or manual start; a manual start of an already-running unit runs no start and is not counted) |
 | `gpu_arbiter_proc_events_dropped_total` | Cumulative `cn_proc` drop occurrences: kernel `ENOBUFS` overflow plus full-trigger-channel drops |
 | `gpu_arbiter_reconcile_passes_total{trigger}` | Cumulative reconcile passes, `trigger` ∈ `proc_event`\|`timer`\|`manual`\|`startup` |
 | `gpu_arbiter_hook_failures_total{unit,hook,outcome}` | Cumulative tenant-hook failures, `hook` ∈ `busy`\|`yield`\|`resume`, `outcome` ∈ `nonzero` (ran, exited non-zero — for `busy` only a signal death, since any exit code is a busy/idle reply) \| `unrunnable` (could not spawn, or timed out). A hook failing on every call is otherwise invisible: `up` stays 1 and `degraded` stays false. |

@@ -60,7 +60,8 @@ pub enum UnitError {
         action: &'static str,
         /// The unit name.
         unit: String,
-        /// Failure detail (trimmed stderr, or why nothing ran).
+        /// Failure detail (exit code plus bounded stderr/stdout, or why nothing
+        /// ran).
         detail: String,
     },
     /// A process-control invocation exceeded `SYSTEMCTL_TIMEOUT`. A wedged
@@ -341,6 +342,53 @@ fn stderr_excerpt(stderr: &[u8]) -> String {
         format!("{truncated}… (truncated)")
     } else {
         line.to_string()
+    }
+}
+
+/// Bounded failure detail for a control command that exited non-zero, for
+/// [`UnitError::Exit`]: the exit code plus whatever it printed on **both**
+/// streams. stdout matters as much as stderr here — Windows `sc.exe` reports
+/// failures (e.g. `FAILED 1056: An instance of the service is already
+/// running`) on stdout and leaves stderr empty, which used to make the logged
+/// error blank.
+///
+/// Each stream's non-empty lines are trimmed and joined with ` | ` onto one line
+/// (no newline can forge a log record), and capped at [`OUTPUT_EXCERPT_MAX`]
+/// chars per stream.
+fn exit_detail(out: &std::process::Output) -> String {
+    let code = out
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |c| c.to_string());
+    let mut parts = vec![format!("exit {code}")];
+    for (name, bytes) in [("stderr", &out.stderr), ("stdout", &out.stdout)] {
+        if let Some(text) = output_excerpt(bytes) {
+            parts.push(format!("{name}: {text}"));
+        }
+    }
+    parts.join("; ")
+}
+
+/// Per-stream character cap for [`exit_detail`].
+const OUTPUT_EXCERPT_MAX: usize = 300;
+
+/// All non-empty trimmed lines of `bytes` joined with ` | `, capped at
+/// [`OUTPUT_EXCERPT_MAX`] chars; `None` if there are none.
+fn output_excerpt(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if joined.is_empty() {
+        None
+    } else if joined.chars().count() > OUTPUT_EXCERPT_MAX {
+        let truncated: String = joined.chars().take(OUTPUT_EXCERPT_MAX).collect();
+        Some(format!("{truncated}… (truncated)"))
+    } else {
+        Some(joined)
     }
 }
 
@@ -1002,8 +1050,8 @@ async fn ollama_loaded_models(
 }
 
 /// Resolve `unit` (a name) against `cfg.resolved_units()`. Used by the
-/// name-only entry points ([`start_by_name`]/[`evict_by_name`]) the reconcile
-/// task drives a `ManualStart`/`ManualStop` trigger through — the HTTP handler
+/// name-only entry points ([`start_by_name`]/[`evict_by_name`]) and by the
+/// reconcile task's `ManualStart`/`ManualStop` handling — the HTTP handler
 /// only has a `String`, not an already-borrowed `&ManagedUnit`, by the time it
 /// crosses the trigger channel.
 ///
@@ -1012,7 +1060,7 @@ async fn ollama_loaded_models(
 /// the daemon has no config-reload path (no SIGHUP) that could change
 /// `resolved_units()` out from under a live `Arc<Config>`. Still a typed error,
 /// not a panic or silent no-op, in case that invariant is ever broken.
-fn resolve_unit<'c>(cfg: &'c Config, unit: &str) -> Result<&'c ManagedUnit, UnitError> {
+pub(crate) fn resolve_unit<'c>(cfg: &'c Config, unit: &str) -> Result<&'c ManagedUnit, UnitError> {
     cfg.resolved_units()
         .iter()
         .find(|u| u.unit == unit)
@@ -1065,7 +1113,7 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
         Err(UnitError::Exit {
             action: "start",
             unit: u.unit.clone(),
-            detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            detail: exit_detail(&out),
         })
     }
 }
@@ -1239,7 +1287,7 @@ async fn evict_inner(
         return Err(UnitError::Exit {
             action: "stop",
             unit: u.unit.clone(),
-            detail: String::from_utf8_lossy(&stop.stderr).trim().to_string(),
+            detail: exit_detail(&stop),
         });
     }
 
@@ -1464,7 +1512,7 @@ async fn kill_unit(sup: &Supervisor, unit: &str) -> Result<(), UnitError> {
         Err(UnitError::Exit {
             action: "kill",
             unit: unit.to_string(),
-            detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            detail: exit_detail(&out),
         })
     }
 }
@@ -2400,6 +2448,61 @@ mod tests {
         u.stop_cmd = Some(crate::config::ArgvCmd(vec!["true".to_string()]));
         let r = is_running(&u).await;
         assert!(matches!(r, Err(UnitError::Exit { .. })));
+    }
+
+    #[test]
+    fn output_excerpt_joins_lines_and_bounds() {
+        // sc.exe-shaped multi-line stdout collapses onto one log-safe line.
+        assert_eq!(
+            output_excerpt(
+                b"[SC] StartService FAILED 1056:\r\n\r\nAn instance of the service is already running.\r\n"
+            )
+            .as_deref(),
+            Some("[SC] StartService FAILED 1056: | An instance of the service is already running.")
+        );
+        assert_eq!(output_excerpt(b""), None);
+        assert_eq!(output_excerpt(b"  \n \n"), None);
+        let got = output_excerpt("y\n".repeat(10_000).as_bytes()).unwrap();
+        assert!(got.ends_with("… (truncated)"), "got: {got}");
+        assert!(
+            got.chars().count() < 400,
+            "not bounded: {}",
+            got.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn start_failure_detail_includes_stdout() {
+        // sc.exe writes its failure reason to stdout and nothing to stderr; the
+        // error detail used to carry stderr only, so the log line was blank.
+        let start_argv = if cfg!(windows) {
+            r#"["cmd", "/c", "echo FAILED 1056 already running & exit 1"]"#
+        } else {
+            r#"["sh", "-c", "echo FAILED 1056 already running; exit 1"]"#
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = {start_argv}
+            stop_cmd = ["true"]
+            is_active_cmd = "false"
+            "#
+        )))
+        .unwrap();
+        let err = start(&cfg.resolved_units()[0]).await.unwrap_err();
+        let UnitError::Exit { detail, .. } = &err else {
+            panic!("expected Exit, got {err:?}");
+        };
+        assert!(detail.contains("exit 1"), "detail: {detail}");
+        assert!(
+            detail.contains("stdout: FAILED 1056 already running"),
+            "detail: {detail}"
+        );
+        assert!(
+            !detail.contains("stderr:"),
+            "empty stderr omitted: {detail}"
+        );
     }
 
     // ── name-only resolution (start_by_name / evict_by_name) ───────────────

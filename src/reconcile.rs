@@ -350,24 +350,38 @@ pub async fn reconcile(
                 );
                 let _ = reply.send(Err(ManualActionError::GpuHeldByGame));
             } else {
-                match units::start_by_name(cfg, &unit).await {
-                    Ok(()) => {
-                        tracing::info!(unit = %unit, "manual unit start");
-                        // Clear the hold (if any) on a successful start: the operator
-                        // is bringing the unit back, so the ensure-running post-step
+                match manual_start(cfg, &unit).await {
+                    Ok(started) => {
+                        // Clear the hold (if any) on success: the operator is
+                        // bringing the unit back, so the ensure-running post-step
                         // should resume managing it. A failed start leaves any
                         // existing hold in place — nothing changed. One lock
-                        // acquisition for both mutations: the restart counter rides
-                        // along with the hold-clear.
-                        {
-                            let mut guard = write_state(state);
-                            guard.held.remove(&unit);
+                        // acquisition for every mutation.
+                        let mut guard = write_state(state);
+                        guard.held.remove(&unit);
+                        if started {
+                            tracing::info!(unit = %unit, "manual unit start");
                             guard.metrics.record_unit_restart(&unit);
+                        } else {
+                            // Already running — typically a manual stop that
+                            // *yielded* (the tenant parked, the process stayed
+                            // up). Nothing was started, so no restart is
+                            // counted; instead the unit owes its `resume_cmd`.
+                            // Forcing `needs_resume` here (rather than relying
+                            // on the stop having set it) lets this same pass's
+                            // resume step below un-park it; that step clears
+                            // the flag on success, so it fires exactly once.
+                            tracing::info!(
+                                unit = %unit,
+                                "manual unit start: already running; hold cleared, resume scheduled"
+                            );
+                            guard.needs_resume.insert(unit.clone());
                         }
+                        drop(guard);
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
-                        tracing::warn!(unit = %unit, error = %e, "manual unit start failed");
+                        tracing::warn!(unit = %unit, error = %e, "manual unit start failed (still held)");
                         let _ = reply.send(Err(ManualActionError::Failed));
                     }
                 }
@@ -667,6 +681,33 @@ pub async fn reconcile(
 
     refresh_substate(state, cfg, presence, backend).await;
     Ok(())
+}
+
+/// The unit-facing half of a `ManualStart`: start `unit` unless it is already
+/// running. Returns `Ok(true)` if `start_cmd` ran, `Ok(false)` if the unit was
+/// already up and was left alone.
+///
+/// The already-running check matters for a unit with a `yield_cmd`: a manual
+/// stop of such a unit may *yield* (the tenant parks, its process stays up), so
+/// the unit is still running when the operator starts it again. Running
+/// `start_cmd` anyway is not idempotent everywhere — Windows `sc.exe start`
+/// exits non-zero (error 1056) on a running service — and a failed start keeps
+/// the hold, which in turn keeps `resume_cmd` from ever running.
+///
+/// Uses the same `is_running` probe, with the same "unsure ⇒ attempt the
+/// start" default, as the ensure-running post-step.
+async fn manual_start(cfg: &Config, unit: &str) -> Result<bool, units::UnitError> {
+    let u = units::resolve_unit(cfg, unit)?;
+    let running = units::is_running(u)
+        .await
+        .inspect_err(|e| {
+            tracing::warn!(unit = %u.unit, error = %e, "manual start: is_running check failed; attempting start");
+        })
+        .unwrap_or(false);
+    if running {
+        return Ok(false);
+    }
+    units::start(u).await.map(|()| true)
 }
 
 /// Evict every managed unit, in order, for an `available → gaming` transition.
@@ -1345,11 +1386,12 @@ mod tests {
     #[tokio::test]
     async fn manual_start_records_unit_restart_metric() {
         let marker = marker_path("metrics-manual-start");
-        // is_active_cmd = true: the unit reports running immediately after the
-        // manual start, so the ensure-running post-step that runs later in the
-        // same pass sees it already up and does NOT start it a second time —
-        // isolates this test to the ManualStart handler's own increment.
-        let cfg = ensure_cfg(true, &marker, true);
+        // Stopped (so the manual start really runs start_cmd) and non-eager, so
+        // the ensure-running post-step later in the same pass never starts it a
+        // second time — isolates this test to the ManualStart handler's own
+        // increment. (A running unit is not restarted at all; see
+        // `manual_start_after_yielding_stop_resumes_without_start_cmd`.)
+        let cfg = ensure_cfg(false, &marker, false);
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -1800,6 +1842,144 @@ mod tests {
         let fired = marker.exists();
         let _ = std::fs::remove_file(marker);
         fired
+    }
+
+    async fn manual(
+        state: &Arc<RwLock<ArbiterState>>,
+        cfg: &Config,
+        start: bool,
+    ) -> Result<(), ManualActionError> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let unit = "fake.service".to_string();
+        let trigger = if start {
+            ReconcileTrigger::ManualStart { unit, reply }
+        } else {
+            ReconcileTrigger::ManualStop { unit, reply }
+        };
+        pass(state, cfg, trigger).await;
+        rx.await.unwrap()
+    }
+
+    /// A running unit that yields cooperatively on a manual stop. `start_cmd`
+    /// and `resume_cmd` touch separate markers.
+    fn yielding_cfg(start_marker: &std::path::Path, resume_marker: &std::path::Path) -> Config {
+        Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["touch", "{start}"]
+            stop_cmd = ["true"]
+            is_active_cmd = "true"
+            busy_cmd = "false"
+            yield_cmd = ["true"]
+            resume_cmd = ["touch", "{resume}"]
+            "#,
+            start = crate::testutil::toml_path(start_marker),
+            resume = crate::testutil::toml_path(resume_marker),
+        )))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn manual_start_after_yielding_stop_resumes_without_start_cmd() {
+        // v0.13.0 bug: a manual stop that yielded left the unit running+held;
+        // the following manual start ran start_cmd anyway (sc.exe: error 1056,
+        // HTTP 500), kept the hold, and resume_cmd never ran — parked forever.
+        let start_marker = marker_path("yield-start-start");
+        let resume_marker = marker_path("yield-start-resume");
+        let cfg = yielding_cfg(&start_marker, &resume_marker);
+        let state = shared(ArbiterState::new());
+
+        assert_eq!(manual(&state, &cfg, false).await, Ok(()));
+        {
+            let g = read_state(&state);
+            assert!(
+                g.metrics.evictions["fake.service"].yielded >= 1,
+                "fixture must yield"
+            );
+            assert!(g.held.contains("fake.service"));
+            assert_eq!(g.units[0].running, Some(true), "a yield leaves it running");
+        }
+        assert!(!take_marker(&resume_marker), "no resume while held");
+
+        assert_eq!(manual(&state, &cfg, true).await, Ok(()));
+        assert!(
+            !take_marker(&start_marker),
+            "start_cmd must not run on an already-running unit"
+        );
+        assert!(
+            take_marker(&resume_marker),
+            "the start pass must run resume_cmd"
+        );
+        {
+            let g = read_state(&state);
+            assert!(!g.held.contains("fake.service"), "hold cleared");
+            assert!(g.needs_resume.is_empty(), "resume no longer owed");
+            assert!(
+                !g.metrics.unit_restarts.contains_key("fake.service"),
+                "nothing was restarted"
+            );
+        }
+
+        pass(&state, &cfg, ReconcileTrigger::Timer).await;
+        assert!(!take_marker(&resume_marker), "resume_cmd runs exactly once");
+        assert!(!take_marker(&start_marker));
+    }
+
+    #[tokio::test]
+    async fn manual_start_on_stopped_unit_runs_start_cmd() {
+        let marker = marker_path("manual-start-stopped");
+        let cfg = ensure_cfg(false, &marker, false);
+        let mut initial = ArbiterState::new();
+        initial.held.insert("fake.service".to_string());
+        let state = shared(initial);
+
+        assert_eq!(manual(&state, &cfg, true).await, Ok(()));
+        assert!(take_marker(&marker), "a stopped unit must still be started");
+        let g = read_state(&state);
+        assert!(!g.held.contains("fake.service"));
+        assert_eq!(g.metrics.unit_restarts["fake.service"], 1);
+    }
+
+    #[tokio::test]
+    async fn manual_start_failure_keeps_hold_and_reports_stdout() {
+        // A start_cmd that fails sc.exe-style: reason on stdout, nothing on
+        // stderr, non-zero exit.
+        let start_argv = if cfg!(windows) {
+            r#"["cmd", "/c", "echo FAILED 1053 did not respond & exit 1"]"#
+        } else {
+            r#"["sh", "-c", "echo FAILED 1053 did not respond; exit 1"]"#
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = {start_argv}
+            stop_cmd = ["true"]
+            is_active_cmd = "false"
+            "#
+        )))
+        .unwrap();
+        let mut initial = ArbiterState::new();
+        initial.held.insert("fake.service".to_string());
+        let state = shared(initial);
+
+        // HTTP maps `Failed` to 500.
+        assert_eq!(
+            manual(&state, &cfg, true).await,
+            Err(ManualActionError::Failed)
+        );
+        assert!(
+            read_state(&state).held.contains("fake.service"),
+            "a failed start keeps the hold"
+        );
+        // The logged error now carries the stdout reason.
+        let err = manual_start(&cfg, "fake.service").await.unwrap_err();
+        let detail = err.to_string();
+        assert!(
+            detail.contains("stdout: FAILED 1053 did not respond"),
+            "{detail}"
+        );
     }
 
     #[tokio::test]

@@ -356,6 +356,16 @@ pass; it would sit on the GPU alongside the game. On rejection nothing
 changes: the unit is not started and any hold stays in place \(em retry once
 the state is
 .IR available .
+.B start
+on a unit that is already running (typically after a
+.B stop
+that yielded rather than stopped) skips
+.BR start_cmd ,
+clears the hold, and runs the unit's
+.B resume_cmd
+once, as soon as the GPU is free for it; it replies 200. A failed start
+replies 500 and keeps the hold; the daemon log carries the command's exit code
+and bounded stderr and stdout.
 Example, on the unix socket:
 .RS
 .nf
