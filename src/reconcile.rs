@@ -4256,4 +4256,156 @@ mod tests {
         assert_eq!(g.state, State::Gaming, "the pass still ran");
         assert!(!run_a.exists(), "and evicted the running unit");
     }
+
+    /// Clean scans, except that call number `fail_at` (0-based) errors.
+    struct ErrAtObserver {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_at: usize,
+    }
+
+    impl Observer for ErrAtObserver {
+        fn now(&self) -> Instant {
+            Instant::now() + FAKE_CLOCK_LEAD
+        }
+
+        async fn observe(&self) -> Result<ProcSnapshot, ReconcileError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == self.fail_at {
+                return Err(ReconcileError::Io(std::io::Error::other("scan failed")));
+            }
+            Ok(ProcSnapshot::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_after_the_first_of_two_resumes_skips_the_second() {
+        // Both units are already up, so nothing starts; scans: top (clean),
+        // before resume #1 (clean), before resume #2 (a game).
+        let run_a = marker_path("two-resumes-a-run");
+        let run_b = marker_path("two-resumes-b-run");
+        let res_a = marker_path("two-resumes-a-resume");
+        let res_b = marker_path("two-resumes-b-resume");
+        std::fs::write(&run_a, b"").unwrap();
+        std::fs::write(&run_b, b"").unwrap();
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "a.service"
+            {a}
+            resume_cmd = ["touch", "{ra}"]
+
+            [[managed_units]]
+            unit = "b.service"
+            {b}
+            resume_cmd = ["touch", "{rb}"]
+            "#,
+            a = crate::testutil::stateful_unit_cmds(&run_a),
+            b = crate::testutil::stateful_unit_cmds(&run_b),
+            ra = crate::testutil::toml_path(&res_a),
+            rb = crate::testutil::toml_path(&res_b),
+        )))
+        .unwrap();
+        let state = shared(ArbiterState::with_config(&cfg));
+
+        pass_scripted(&state, &cfg, &[false, false, true], 0).await;
+        assert!(take_marker(&res_a), "the first resume ran");
+        assert!(!take_marker(&res_b), "the second resume must not run");
+        {
+            let g = read_state(&state);
+            assert!(!g.needs_resume.contains("a.service"));
+            assert!(g.needs_resume.contains("b.service"), "still owed");
+        }
+        for p in [&run_a, &run_b] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[tokio::test]
+    async fn start_loop_rescan_error_fails_closed() {
+        // The top scan is clean, the re-scan before the start errors: the pass
+        // reports the error and starts nothing.
+        let run = marker_path("rescan-err-start-run");
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            {cmds}
+            "#,
+            cmds = crate::testutil::stateful_unit_cmds(&run),
+        )))
+        .unwrap();
+        let state = shared(ArbiterState::new());
+        let presence = crate::presence::PresenceMonitor::new(0);
+        let result = reconcile_with(
+            &ErrAtObserver {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_at: 1,
+            },
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await;
+        assert!(result.is_err(), "the scan error is reported");
+        assert!(!run.exists(), "no start without a successful re-scan");
+        assert!(
+            !read_state(&state)
+                .metrics
+                .unit_restarts
+                .contains_key("fake.service")
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_manual_start_clears_the_hold_exactly_once() {
+        let run = marker_path("manual-clear-once-run");
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            eager_restart = false
+            {cmds}
+            "#,
+            cmds = crate::testutil::stateful_unit_cmds(&run),
+        )))
+        .unwrap();
+        let mut initial = ArbiterState::new();
+        initial.held.insert("fake.service".to_string());
+        let state = shared(initial);
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile_with(
+            &ScriptedObserver::new(&[], Duration::ZERO),
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "fake.service".to_string(),
+                reply,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.await.unwrap(), Ok(()));
+        assert!(run.exists(), "started");
+        {
+            let g = read_state(&state);
+            assert!(!g.held.contains("fake.service"), "hold cleared");
+            assert_eq!(g.metrics.unit_restarts["fake.service"], 1, "one start");
+            assert!(!g.units[0].held);
+        }
+        // Later passes neither re-hold nor re-start it.
+        for _ in 0..2 {
+            pass_scripted(&state, &cfg, &[], 0).await;
+        }
+        let g = read_state(&state);
+        assert!(!g.held.contains("fake.service"));
+        assert_eq!(g.metrics.unit_restarts["fake.service"], 1);
+        drop(g);
+        let _ = std::fs::remove_file(&run);
+    }
 }
