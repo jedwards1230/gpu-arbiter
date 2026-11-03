@@ -60,7 +60,8 @@ curl --unix-socket /run/gpu-arbiter/gpu-arbiter.sock -X POST http://localhost/un
   "state": "gaming",
   "claims": ["steam:440"],
   "units": [
-    { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false },
+    { "unit": "ollama.service", "running": true, "models": ["qwen3:30b"], "vram_mb": 21000, "held": false,
+      "last_eviction": { "mode": "hard_stop", "outcome": "graceful", "at": "2026-06-07T19:58:12Z" } },
     { "unit": "vllm.service", "running": null, "models": [], "held": true },
     { "unit": "ollama-b", "running": true, "models": [], "models_error": "GET http://127.0.0.1:11500/api/ps: Connection refused", "held": false }
   ],
@@ -76,7 +77,9 @@ curl --unix-socket /run/gpu-arbiter/gpu-arbiter.sock -X POST http://localhost/un
 
 `units` is the per-managed-unit array, in eviction order. `state` is
 `gaming` | `available` | `evicting` (the transient kill window — remote
-consumers treat `evicting` as busy).
+consumers treat `evicting` as busy). `state` stays `gaming` through the
+[game-exit grace](#game-edge-gaming-invariant-and-exit-grace) after the last
+game exits, so `claims` can briefly be empty while `state` is still `gaming`.
 
 Per-unit `running` is a **tristate**: `true`/`false` are confirmed
 running/stopped, and `null` means the daemon's `is-active` check itself failed
@@ -89,11 +92,19 @@ when it recovers. `held` is `true` while an operator has manually stopped that
 unit and it hasn't been manually started again (see below). Top-level
 `degraded` is `true` when the most recent eviction had at least one unit fail
 to evict — gaming still won the GPU unconditionally, but a tenant may still be
-holding VRAM.
+holding VRAM. `last_eviction` (omitted until the unit's first one) records the
+unit's most recent eviction that actually did something: `mode` is `hard_stop`
+(a game, the gaming invariant, a manual stop) or `yield_first` (tenant
+preemption), `outcome` is the `gpu_arbiter_evictions_total` label, and `at` is
+when it finished. Like holds, it is in memory only.
 
 ### Manual start/stop and holds
 
-`POST /units/{unit}/stop` **holds** the unit down: without a hold, the
+`POST /units/{unit}/stop` **hard-stops** the unit: `stop_cmd`, wait for it
+to reach not-running, kill on `eviction_timeout_s`. It never uses the unit's
+`yield_cmd` — an operator stop means "off the GPU", and a parked tenant keeps
+its process and its CUDA context resident. It also **holds** the unit down:
+without a hold, the
 ensure-running self-heal step would restart the unit on the very next
 reconcile pass (even the periodic backstop timer), making a manual stop a
 self-reverting no-op. A held unit stays down across game launches/exits until
@@ -105,23 +116,28 @@ run). `/status` surfaces the hold per-unit via `units[].held`.
 `POST /units/{unit}/start` is **rejected with `409 Conflict` while a game
 holds the GPU** (state `gaming` or `evicting`): the
 never-start-a-managed-unit-into-a-live-game invariant that startup
-reconciliation enforces applies to operators too. Eviction is edge-triggered
-(it fires on the available → gaming *transition*), so a unit started mid-game
-would **not** be re-evicted by the next pass — it would sit on the GPU
-alongside the game until the game exited. On rejection nothing changes: the
+reconciliation enforces applies to operators too; a unit started mid-game
+would only be stopped again by the next pass's
+[gaming invariant](#game-edge-gaming-invariant-and-exit-grace). The rejection
+also applies during the exit grace, while `state` is still `gaming`. On
+rejection nothing changes: the
 unit is not started and any hold stays in place; retry once `/status` reports
 `available`.
 
+A manual start of a held, stopped unit runs `start_cmd`, clears the hold, and
+then runs the `resume_cmd` the stop left owed, in the same reconcile pass
+(provided nothing preempts the unit). `resume_cmd` clears any park flag left
+over from an earlier tenant-preemption yield, so it must be idempotent.
+
 `POST /units/{unit}/start` on a unit that is **already running** does not run
-`start_cmd`. This is the normal case after a stop that *yielded* (a unit with a
-`yield_cmd` parks its work but keeps its process up, so `/status` shows it
-`running: true, held: true`). The start clears the hold and skips `start_cmd`,
-which is not idempotent everywhere: Windows `sc.exe start` fails with error 1056
-on a running service. The reply is `200`. The `resume_cmd` the stop left owed
-then runs once: in the same reconcile pass when the GPU is free and nothing
-preempts the unit, or later once that is true. A running unit that was never
-evicted owes no resume and gets none. A unit that is stopped, or whose
-`is_active` probe fails, is started as before; if that start fails but a second
+`start_cmd`: the unit was started outside the daemon, or the stop that held it
+failed (`/status` shows `running: true, held: true`). The start clears the hold
+and skips `start_cmd`, which is not idempotent everywhere: Windows `sc.exe
+start` fails with error 1056 on a running service. The reply is `200`. Any
+resume the stop left owed then runs once: in the same reconcile pass when the
+GPU is free and nothing preempts the unit, or later once that is true. A
+running unit that was never evicted owes no resume and gets none. A unit whose
+`is_active` probe fails is started as before; if that start fails but a second
 probe finds the unit running, it is treated as already running. When a start
 does fail (`500`), the hold stays and the daemon log carries the command's exit
 code and a bounded excerpt of both its stderr and its stdout.
@@ -178,7 +194,7 @@ sample.
 
 | Metric | Meaning |
 |---|---|
-| `gpu_arbiter_evictions_total{unit,outcome}` | Cumulative eviction attempts, `outcome` ∈ `yielded`\|`graceful`\|`sigkill`\|`error`. `yielded` means the tenant released the GPU cooperatively and was never stopped. A no-op (the unit wasn't running) is not counted. |
+| `gpu_arbiter_evictions_total{unit,outcome}` | Cumulative eviction attempts, `outcome` ∈ `yielded`\|`graceful`\|`sigkill`\|`error`. `yielded` means the tenant released the GPU cooperatively and was never stopped; only tenant preemption yields, so a game eviction or a manual stop is always `graceful`, `sigkill` or `error`. A no-op (the unit wasn't running) is not counted. |
 | `gpu_arbiter_eviction_duration_seconds{unit,stage}` | **Histogram** of eviction wall-clock, `stage` ∈ `yield`\|`stop`\|`total`. Exists so `yield_timeout_s` and `eviction_timeout_s` can be set from observed cost rather than guessed — the stage split is what shows whether the cooperative stage is paying for itself or just adding latency ahead of an inevitable stop. No-op evictions are excluded. |
 | `gpu_arbiter_unit_restarts_total{unit}` | Cumulative successful managed-unit starts driven by the daemon (eager restore or manual start; a manual start of an already-running unit runs no start and is not counted) |
 | `gpu_arbiter_proc_events_dropped_total` | Cumulative `cn_proc` drop occurrences: kernel `ENOBUFS` overflow plus full-trigger-channel drops |
@@ -279,7 +295,8 @@ yields the defaults below.
 | `bind` | `"127.0.0.1"` | TCP bind address for the read-only surface (and, on Windows, the loopback-gated write routes); loopback by default — set to a LAN address (and firewall it yourself) to allow remote reads |
 | `socket_path` | `"/run/gpu-arbiter/gpu-arbiter.sock"` | Unix control socket path for the write path on Linux (mode `0600`, root-owned, inside a mode-`0700` root-owned parent directory); empty string disables it. Ignored on Windows |
 | `managed_units` | one Ollama entry | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
-| `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation |
+| `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation (`kill_cmd` for a command-driven unit). On Windows this is how long a stopped service gets to reach `STOPPED` |
+| `game_exit_grace_s` | `10` | Seconds the game-claim set must stay continuously empty before `gaming` ends; `0` = end it on the first clean pass (see [Game edge](#game-edge-gaming-invariant-and-exit-grace)). Rejected by daemons older than 0.14.0 |
 | `yield_timeout_s` | `3` | Default cooperative-release budget, for units that set `yield_cmd` but no per-unit `yield_timeout_s` (see [Priority ladder](#priority-ladder-and-cooperative-eviction)) |
 | `game_priority` | `100` | The priority a detected **game** claims at. Above every tenant's default (`50`), which is what makes gaming preempt everything |
 | `vram_free_threshold_mb` | `2000` | VRAM-used below this = GPU "freed" — applied to the evicting unit's own attributed VRAM when available, else total GPU VRAM (see [Eviction VRAM gating](#eviction-vram-gating)) |
@@ -289,6 +306,35 @@ yields the defaults below.
 | `presence_detection` | `true` | Watch physical input devices for local-presence reporting |
 | `presence_idle_threshold_s` | `600` | Physical-input silence after which `local_present = 0` |
 | `gpu_backend` | `"auto"` | GPU vendor backend: `"auto"` (nvidia-smi if present, else amdgpu sysfs, else nvidia), `"nvidia"`, or `"amd"` |
+
+### Game edge, gaming invariant, and exit grace
+
+When a game claim appears, every unit below `game_priority` is **hard-stopped**,
+in `managed_units` order: `stop_cmd` (or `systemctl stop`), then wait until the
+unit is not running (on Linux, until its VRAM drops below
+`vram_free_threshold_mb`), then SIGKILL / `kill_cmd` once `eviction_timeout_s`
+has passed. `yield_cmd` is never used for a game, and a unit that tenant
+preemption parked earlier is still running, so it is stopped like any other.
+"Evicted" for a game therefore means **not running**: the one postcondition the
+daemon can observe on every platform (WDDM reports no per-process VRAM, and a
+parked tenant keeps its CUDA context resident).
+
+**Gaming invariant.** Each steady `gaming` pass re-checks the units below
+`game_priority` and hard-stops any that is running again (a service manager
+restart, a start from outside the daemon), logging a warning. "Freed" is kept,
+not just reached once.
+
+**Exit grace.** `gaming` ends only after the claim set has been empty
+continuously for `game_exit_grace_s` (default `10`). Until then the state stays
+`gaming`: nothing is resumed, nothing is started, a manual start is still
+rejected with `409`, and the gaming invariant still applies. A claim
+reappearing resets the window. `0` ends gaming on the first clean pass, as
+before 0.14.0.
+
+**Eviction log.** Each eviction logs the unit, mode, outcome, and total VRAM before
+and after (`vram_before_mb` / `vram_after_mb`) at info level; on the game edge
+that total includes the game's own allocation, so it is a diagnostic, not a
+gate.
 
 ### Managed units
 
@@ -356,7 +402,11 @@ priority = 25              # background batch work — yields to everyone
 `busy_cmd` exits 0 ("I have work right now"). Without a `busy_cmd` a unit is a
 preemption target only, never a source — the right default, since a
 merely-running server holding an idle model should not evict anything. The probe
-runs on every reconcile pass, so it must be cheap and non-blocking.
+runs on every reconcile pass, so it must be cheap and non-blocking. It is
+**skipped** for a held unit and for a unit whose `is_active` check says it is
+stopped: neither can have work in flight, and a probe that reports busy when its
+service is unreachable would otherwise make a stopped tenant preempt the tiers
+below it. If the `is_active` check itself fails, the probe still runs.
 
 The exit-code contract:
 
@@ -377,8 +427,11 @@ would tell a remote AI-routing consumer the box is unavailable for AI work at
 exactly the moment it is doing AI work. Preemption is visible through
 `units[].running` instead.
 
-**Cooperative release.** When a unit sets `yield_cmd`, eviction runs in two
-stages instead of one:
+**Cooperative release.** Used **only for tenant-vs-tenant preemption** — a game
+launch and a manual stop always hard-stop (see
+[Game edge](#game-edge-gaming-invariant-and-exit-grace)). When a busy higher
+tier preempts a unit that sets `yield_cmd`, eviction runs in two stages instead
+of one:
 
 1. **Yield** — run `yield_cmd` and poll `busy_cmd` until the tenant reports not
    busy, up to `yield_timeout_s`. The tenant stays alive; it just parks its
@@ -392,6 +445,9 @@ Exit 0 from `yield_cmd` means "request accepted", **not** "the GPU is free" —
 which is why release is confirmed by polling `busy_cmd` rather than trusted. A
 tenant that ignores or mishandles the request therefore cannot hold the GPU
 against a higher tier; it just falls through to stage 2.
+
+`yield_cmd` is the knob: leave it unset and tenant preemption stops the unit
+too, exactly like a game does.
 
 > **`yield_cmd` without `busy_cmd` does nothing.** Release would be
 > unobservable, so the daemon logs a warning, skips the yield stage entirely,

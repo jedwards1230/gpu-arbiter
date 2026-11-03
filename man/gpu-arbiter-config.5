@@ -106,8 +106,11 @@ below.
 Integer (seconds). Default
 .BR 5 .
 How long to wait for a graceful teardown (VRAM drop below
-.BR vram_free_threshold_mb )
-before escalating to SIGKILL.
+.BR vram_free_threshold_mb ,
+or on Windows the service reaching STOPPED)
+before escalating to SIGKILL, or to
+.B kill_cmd
+for a command\-driven unit.
 .TP
 .B yield_timeout_s
 Integer (seconds). Default
@@ -141,6 +144,23 @@ claims at; higher wins. The default sits above every unit's default
 which is what makes gaming preempt everything. Lowering it below a tenant's
 priority would let that tenant survive a game launch \(em a real option (a
 tenant you never want interrupted), but a deliberate one.
+.TP
+.B game_exit_grace_s
+Integer (seconds). Default
+.BR 10 .
+How long the game\-claim set must stay
+.B continuously
+empty before
+.I gaming
+ends and tenants are resumed or restarted. Inside the window
+.I state
+stays
+.IR gaming ,
+nothing is resumed or started, and a claim reappearing resets it. Rides out
+launcher hand\-offs and single scans that miss the game, which otherwise
+restarted tenants only for the next pass to evict them again.
+.B 0
+ends gaming on the first clean pass. Daemons older than 0.14.0 reject the key.
 .TP
 .B vram_free_threshold_mb
 Integer (MiB). Default
@@ -296,8 +316,11 @@ an idle reply never is.
 .B yield_cmd
 String or array of strings. Default: none.
 .B Cooperative
-GPU release, tried before any stop: asks the tenant to let go of the GPU while
-staying alive. Exit 0 means "the request was accepted",
+GPU release, tried before any stop
+.B only
+when a busy higher\-tier tenant preempts this unit; a game launch and a manual
+stop always stop it. Asks the tenant to let go of the GPU while
+staying alive. Leave it unset to have tenant preemption stop the unit as well. Exit 0 means "the request was accepted",
 .B not
 "the GPU is free" \(em the daemon then polls
 .B busy_cmd
@@ -558,9 +581,15 @@ Preemption is visible through
 .I units[].running
 instead.
 .PP
-When a unit sets
+.B busy_cmd
+is not run for a held unit, or for one whose
+.B is_active
+check says it is stopped.
+.PP
+When a busy higher tier preempts a unit that sets
 .BR yield_cmd ,
-eviction runs in two stages rather than one:
+eviction runs in two stages rather than one (a game launch or a manual stop
+skips stage 1 and always stops the unit):
 .IP 1. 4
 .B Yield
 \(em run

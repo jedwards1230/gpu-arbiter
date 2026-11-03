@@ -72,7 +72,7 @@ delta-maintained, so the daemon self-heals across crashes and dropped events.
                               │              recompute claims
                               │                    │
                               ▼                    ▼
-                    gaming ──────────▶  evict tenants (yield → stop → SIGKILL)
+                    gaming ──────────▶  evict tenants (stop → SIGKILL)
                        ▲                           │
                        └──── available ◀───────────┘  restore tenants
 ```
@@ -164,6 +164,12 @@ A few decisions that are less obvious than they look:
 - **A zero VRAM reading is not trusted until a nonzero one is seen first.**
   Otherwise a typo'd `vram_match` reads as "already drained" and the daemon
   reports a completed eviction while the tenant still holds the card.
+- **A game gets a stopped tenant, never a parked one.** The cooperative
+  `yield_cmd` is only for one tenant preempting another. A parked tenant keeps
+  its process and its CUDA context, and on Windows nothing can see that, so a
+  game launch (and a manual stop) always stops the unit, re-stops one that comes
+  back mid-game, and waits `game_exit_grace_s` (default 10 s) of no game before
+  restoring anything.
 - **`yield_cmd` requires `busy_cmd`.** Without a probe, cooperative release is
   unobservable — the daemon would declare success on zero evidence. It refuses
   the stage instead of guessing.

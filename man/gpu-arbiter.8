@@ -212,8 +212,17 @@ claim (zero config, covers all Steam games). Non\-Steam launchers are matched by
 configured cmdline substrings
 .RI ( game_patterns ).
 .PP
-Eviction of each managed unit runs the same bounded loop, in the configured
-order: stop the unit via its supervisor
+On a game launch every unit below
+.B game_priority
+is
+.BR hard\-stopped ,
+in the configured order: its
+.B yield_cmd
+is never used, and a unit an earlier tenant preemption parked is still
+running, so it is stopped too. "Evicted" for a game means
+.BR "not running" ,
+the one postcondition observable on every platform. Each such eviction runs the
+same bounded loop: stop the unit via its supervisor
 .RB ( systemctl " stop, or the per-unit " stop_cmd " override),"
 then poll the GPU backend
 .RB ( nvidia-smi " or the " amdgpu " sysfs reader, per " gpu_backend )
@@ -229,6 +238,30 @@ evict, the daemon still hands the GPU to gaming, but marks the state
 until the next clean eviction pass or a clean return to
 .IR available ,
 so an operator can tell a wedged tenant apart from a fully\-reclaimed GPU.
+On Windows the wait is for the service to reach STOPPED, and
+.B eviction_timeout_s
+(default 5) is what bounds it before
+.B kill_cmd
+runs. A
+.B stop_cmd
+that fails outright with the unit still up is escalated to the kill as well,
+and still counted as an error.
+.PP
+While gaming, every steady pass re\-checks those units and hard\-stops any
+that is running again (a service manager restart, a start from outside the
+daemon), with a warning in the log.
+.B gaming
+ends only once no game has been seen for
+.B game_exit_grace_s
+seconds in a row (default 10;
+.B 0
+ends it on the first clean pass); until then nothing is resumed or started and
+.I state
+stays
+.IR gaming .
+Each eviction is logged at info level with the unit, its mode
+.RI ( hard_stop " or " yield_first ),
+the outcome, and total VRAM before and after.
 .PP
 A unit that configures
 .B yield_cmd
@@ -236,7 +269,10 @@ A unit that configures
 .BR busy_cmd ,
 which is required to observe release) gets a
 .B cooperative
-stage ahead of that loop: the daemon asks the tenant to drop the GPU while
+stage ahead of that loop
+.B only
+when a busy higher\-tier tenant preempts it (never for a game or a manual
+stop): the daemon asks the tenant to drop the GPU while
 staying alive and polls
 .B busy_cmd
 until it reports not busy, up to
@@ -244,7 +280,11 @@ until it reports not busy, up to
 On success the unit is never stopped \(em no in\-flight work is lost and there
 is no cold model reload afterwards. On timeout or failure it falls through to
 the stop loop above, so a tenant can never hold the GPU against a higher tier
-by ignoring the request.
+by ignoring the request. Leave
+.B yield_cmd
+unset to have tenant preemption stop the unit too.
+.B busy_cmd
+is not run for a held unit or one confirmed stopped.
 .PP
 Tenants also rank against
 .I each other
@@ -337,9 +377,9 @@ must be one of the configured managed units; an unknown unit is rejected with
 404. Routes through the same reconcile task that drives automatic
 eviction/restart (never a directly\-racing HTTP handler).
 .B stop
-additionally
+hard\-stops the unit (no cooperative yield) and additionally
 .B holds
-the unit down: without the hold, the ensure\-running self\-heal step would
+it down: without the hold, the ensure\-running self\-heal step would
 restart it on the very next reconcile pass (even the periodic backstop
 timer), making a manual stop a self\-reverting no\-op. A held unit stays down
 across game launches/exits until
@@ -350,21 +390,22 @@ is
 .B rejected with 409 Conflict
 while a game holds the GPU (state
 .IR gaming " or " evicting )
-\(em eviction is edge\-triggered (it fires on the available \(-> gaming
-transition), so a unit started mid\-game would NOT be re\-evicted by the next
-pass; it would sit on the GPU alongside the game. On rejection nothing
+\(em a unit started mid\-game would only be stopped again by the next pass's
+gaming invariant. On rejection nothing
 changes: the unit is not started and any hold stays in place \(em retry once
 the state is
 .IR available .
 .B start
-on a unit that is already running (typically after a
-.B stop
-that yielded rather than stopped) skips
-.BR start_cmd ,
-and clears the hold; the
+on a held, stopped unit starts it, clears the hold, and runs the
 .B resume_cmd
-that the stop left owed then runs once, as soon as the GPU is free for the
-unit. It replies 200. A failed start
+the stop left owed in the same pass.
+.B start
+on a unit that is already running (started outside the daemon, or one whose
+stop failed) skips
+.BR start_cmd ,
+and clears the hold; any owed
+.B resume_cmd
+then runs once, as soon as the GPU is free for the unit. It replies 200. A failed start
 replies 500 and keeps the hold; the daemon log carries the command's exit code
 and bounded stderr and stdout.
 Example, on the unix socket:

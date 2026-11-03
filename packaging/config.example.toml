@@ -35,7 +35,8 @@
 #socket_path = "/run/gpu-arbiter/gpu-arbiter.sock"
 
 # Seconds to wait for a graceful tenant teardown (VRAM dropping below
-# vram_free_threshold_mb) before escalating to SIGKILL.
+# vram_free_threshold_mb, or on Windows the service reaching STOPPED) before
+# escalating to SIGKILL / kill_cmd.
 #eviction_timeout_s = 5
 
 # VRAM-used (MiB) strictly below this value means the GPU is considered "freed"
@@ -60,6 +61,15 @@
 # survive a game launch — a real option (a tenant you never want interrupted),
 # but a deliberate one.
 #game_priority = 100
+
+# Seconds the game-claim set must stay CONTINUOUSLY empty before `gaming` ends
+# and tenants are resumed / restarted. A single pass that sees no game (a
+# launcher handing off to the game binary, a scan between two processes) no
+# longer restarts everything only for the next pass to evict it again. Inside
+# the window /status stays `gaming`; a claim reappearing resets it. 0 restores
+# the old immediate behavior. Needs gpu-arbiter >= 0.14.0 (older builds reject
+# the key).
+#game_exit_grace_s = 10
 
 # GPU vendor backend: "auto" (nvidia-smi if present, else amdgpu sysfs, else
 # nvidia), "nvidia", or "amd".
@@ -141,7 +151,10 @@
 # `yield_cmd`/`resume_cmd` add a cooperative release stage ahead of the stop
 # path: the daemon asks the tenant to drop the GPU while staying alive, then
 # polls busy_cmd until it agrees the GPU is free. yield_cmd is ignored unless
-# busy_cmd is also set. Tune both budgets from
+# busy_cmd is also set. The yield is used ONLY when a busy higher-tier tenant
+# preempts this one; a game launch and a manual stop always stop the unit
+# (a parked tenant keeps its CUDA context resident). Leave yield_cmd unset to
+# have tenant preemption stop the unit too. Tune both budgets from
 # gpu_arbiter_eviction_duration_seconds{stage=...}. Full treatment:
 # docs/reference.md#priority-ladder-and-cooperative-eviction.
 #[[managed_units]]
