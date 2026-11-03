@@ -146,7 +146,11 @@ nothing is resumed or started, and a claim reappearing resets it. Rides out
 launcher hand\-offs and single scans that miss the game, which otherwise
 restarted tenants only for the next pass to evict them again.
 .B 0
-ends gaming on the first clean pass. Daemons older than 0.14.0 reject the key.
+ends gaming on the first clean pass; at most
+.BR 3600 .
+The window is in memory only: a daemon restart inside it starts from
+.I available
+again. Daemons older than 0.14.0 reject the key.
 .TP
 .B vram_free_threshold_mb
 Integer (MiB). Default
@@ -311,9 +315,11 @@ Still parsed so an older config keeps loading; warned about at startup and by
 String or array of strings. Default: none. Idempotent "you may use the GPU
 again" hook.
 .B Edge\-triggered:
-it runs once when a unit the daemon stopped becomes eligible to run again
-(after the restore path has started it, if it does), and once per unit when
-the daemon starts \(em never on steady\-state passes. A failed run is retried
+it is owed after every eviction and once per unit when the daemon starts, and
+runs once the unit is eligible to run again
+.B and up
+(started by that pass, or confirmed running); a unit that stays down keeps it
+owed \(em never on steady\-state passes. A failed run is retried
 on the next pass. This applies whether or not the unit sets
 .BR eager_restart ,
 which only controls whether a stopped unit is started; it never starts a unit

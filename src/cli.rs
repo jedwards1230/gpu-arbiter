@@ -1058,6 +1058,11 @@ mod tests {
                 .unwrap()
                 .starts_with("OK: ")
         );
+        std::fs::write(&path, "game_exit_grace_s = 86400\n").unwrap();
+        assert!(matches!(
+            check_config(path.to_str().unwrap()).unwrap_err(),
+            ConfigError::Invalid(_)
+        ));
         std::fs::write(&path, "game_exit_grace_s = -5\n").unwrap();
         assert!(matches!(
             check_config(path.to_str().unwrap()).unwrap_err(),

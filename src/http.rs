@@ -1215,6 +1215,9 @@ async fn stop_validated(app: &AppState, unit: String) -> (StatusCode, String) {
 /// - `GpuHeldByGame` → `409 Conflict` — a manual start while a game holds
 ///   the GPU (state `gaming`/`evicting`) is rejected outright, never
 ///   attempted (any hold stays in place); the body says why.
+/// - `PreemptedByTenant` → `409 Conflict` — likewise, when a busy
+///   higher-priority tenant preempts the unit, so it would be stopped again
+///   in the same pass.
 /// - `Failed` → `500` — the unit action itself was attempted and failed;
 ///   the detail is logged, not echoed to the (untrusted enough to warrant no
 ///   detail) HTTP response body. A dropped reply channel (the reconcile task
@@ -1249,6 +1252,12 @@ async fn enqueue_and_await(
             StatusCode::CONFLICT,
             format!(
                 "{unit} {verb} rejected: a game currently holds the GPU (state gaming/evicting); retry once the GPU is available"
+            ),
+        ),
+        Ok(Err(ManualActionError::PreemptedByTenant)) => (
+            StatusCode::CONFLICT,
+            format!(
+                "{unit} {verb} rejected: a busy higher-priority tenant currently preempts this unit; retry once that tenant is idle"
             ),
         ),
         Ok(Err(ManualActionError::Failed)) => (

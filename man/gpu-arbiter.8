@@ -243,15 +243,22 @@ On Windows the wait is for the service to reach STOPPED, and
 runs. A
 .B stop_cmd
 that fails outright with the unit still up is escalated to the kill as well,
-and still counted as an error.
+and still counted as an error. On every platform the postcondition is
+.BR "not running" :
+a VRAM drop only counts once the unit is confirmed stopped, and a unit still
+running (or unconfirmed) 2 s after the kill is an eviction error, whatever the
+kill command's exit status.
 .PP
 While gaming, every steady pass re\-checks those units and stops any
 that is running again (a service manager restart, a start from outside the
-daemon), with a warning in the log.
+daemon), with a warning in the log at most once a minute per unit. An
+unknown run state counts as running. After a stop that needed the kill or
+failed, the unit is backed off (15 s, doubling to 120 s, reset when gaming
+ends) so a misbehaving unit cannot make every pass a full kill cycle.
 .B gaming
 ends only once no game has been seen for
 .B game_exit_grace_s
-seconds in a row (default 30;
+seconds in a row (default 30, at most 3600;
 .B 0
 ends it on the first clean pass); until then nothing is resumed or started and
 .I state
@@ -267,7 +274,9 @@ keys are deprecated since 0.14.0: they still parse, so an older config keeps
 loading, but they do nothing, and the daemon warns about them once at startup.
 .B resume_cmd
 runs once after the daemon brings a stopped unit back (and once per unit at
-startup) and must be idempotent; use it to clear tenant\-side park flags.
+startup) and must be idempotent; use it to clear tenant\-side park flags. It
+runs only once the unit is up (started by that pass, or confirmed running), and
+not in a pass whose pre\-start re\-scan saw a game; until then it stays owed.
 .B busy_cmd
 is not run for a held unit or one confirmed stopped.
 .PP
@@ -380,6 +389,8 @@ gaming invariant. On rejection nothing
 changes: the unit is not started and any hold stays in place \(em retry once
 the state is
 .IR available .
+It is likewise rejected with 409 while a busy higher\-priority tenant
+preempts the unit (the same pass would stop it again); the hold stays.
 .B start
 on a held, stopped unit starts it, clears the hold, and runs the
 .B resume_cmd

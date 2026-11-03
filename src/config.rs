@@ -98,6 +98,11 @@ fn default_game_priority() -> u8 {
 /// game — short enough that tenants come back promptly once gaming is over.
 pub const DEFAULT_GAME_EXIT_GRACE_S: u64 = 30;
 
+/// Upper bound for [`Config::game_exit_grace_s`]: one hour. A larger value is
+/// almost certainly a unit mistake (milliseconds, minutes) and would keep every
+/// tenant off the GPU long after the game ended, so it is rejected at load.
+pub const MAX_GAME_EXIT_GRACE_S: u64 = 3600;
+
 /// serde default for [`Config::game_exit_grace_s`].
 fn default_game_exit_grace_s() -> u64 {
     DEFAULT_GAME_EXIT_GRACE_S
@@ -473,7 +478,8 @@ pub struct Config {
     pub game_priority: u8,
 
     /// Seconds the game-claim set must stay **continuously empty** before
-    /// `gaming` ends. Defaults to [`DEFAULT_GAME_EXIT_GRACE_S`] (10).
+    /// `gaming` ends. Defaults to [`DEFAULT_GAME_EXIT_GRACE_S`] (30); at most
+    /// [`MAX_GAME_EXIT_GRACE_S`] (3600).
     ///
     /// Without a debounce, one reconcile pass that happened to see no game
     /// (a launcher handing off to the game binary, a scan between two
@@ -482,7 +488,9 @@ pub struct Config {
     /// the game again and evict them — a flap per gap. Inside the grace
     /// window the state stays `gaming` and nothing is resumed or started; a
     /// claim reappearing resets the window. `0` restores the immediate
-    /// behavior.
+    /// behavior. The window is in memory only: a daemon restart inside it
+    /// starts from `available` again (the startup pass then sees no game and
+    /// restores tenants at once).
     #[serde(default = "default_game_exit_grace_s")]
     pub game_exit_grace_s: u64,
 
@@ -586,6 +594,9 @@ pub enum ConfigError {
     /// The config file was not valid TOML / did not match the schema.
     #[error("parsing config: {0}")]
     Parse(#[from] toml::de::Error),
+    /// The config parsed but a value is out of range.
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 /// serde default for [`Config::managed_units`]: a single Ollama entry,
@@ -649,6 +660,12 @@ impl Config {
     /// the wrong type, or an unknown key is present (`deny_unknown_fields`).
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let cfg: Config = toml::from_str(s)?;
+        if cfg.game_exit_grace_s > MAX_GAME_EXIT_GRACE_S {
+            return Err(ConfigError::Invalid(format!(
+                "game_exit_grace_s = {} exceeds the maximum of {MAX_GAME_EXIT_GRACE_S} seconds",
+                cfg.game_exit_grace_s
+            )));
+        }
         Ok(cfg)
     }
 
@@ -1214,6 +1231,17 @@ match = "Heroic"
                 .game_exit_grace_s,
             30
         );
+        // Bounded: up to an hour, and no further.
+        assert_eq!(
+            Config::from_toml("game_exit_grace_s = 3600")
+                .unwrap()
+                .game_exit_grace_s,
+            3600
+        );
+        assert!(matches!(
+            Config::from_toml("game_exit_grace_s = 3601"),
+            Err(ConfigError::Invalid(_))
+        ));
         // Unsigned seconds only: a negative or a string is a parse error.
         assert!(Config::from_toml("game_exit_grace_s = -1").is_err());
         assert!(Config::from_toml(r#"game_exit_grace_s = "10s""#).is_err());

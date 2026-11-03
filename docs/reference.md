@@ -122,6 +122,11 @@ rejection nothing changes: the
 unit is not started and any hold stays in place; retry once `/status` reports
 `available`.
 
+A manual start is likewise **rejected with `409 Conflict`** while a busy
+higher-priority tenant preempts the unit — otherwise the same pass's tenant
+preemption would stop it again right after a `200`. The hold stays; retry once
+that tenant is idle.
+
 A manual start of a held, stopped unit runs `start_cmd`, clears the hold, and
 then runs the `resume_cmd` the stop left owed, in the same reconcile pass
 (provided nothing preempts the unit). `resume_cmd` is idempotent; it clears any
@@ -294,7 +299,7 @@ yields the defaults below.
 | `socket_path` | `"/run/gpu-arbiter/gpu-arbiter.sock"` | Unix control socket path for the write path on Linux (mode `0600`, root-owned, inside a mode-`0700` root-owned parent directory); empty string disables it. Ignored on Windows |
 | `managed_units` | one Ollama entry | Ordered `[[managed_units]]` list of GPU tenants to evict/restore (see below) |
 | `eviction_timeout_s` | `5` | Graceful teardown wait before SIGKILL escalation (`kill_cmd` for a command-driven unit). On Windows this is how long a stopped service gets to reach `STOPPED` |
-| `game_exit_grace_s` | `30` | Seconds the game-claim set must stay continuously empty before `gaming` ends; `0` = end it on the first clean pass (see [Game edge](#game-edge-gaming-invariant-and-exit-grace)). Rejected by daemons older than 0.14.0 |
+| `game_exit_grace_s` | `30` | Seconds (`0`–`3600`) the game-claim set must stay continuously empty before `gaming` ends; `0` = end it on the first clean pass (see [Game edge](#game-edge-gaming-invariant-and-exit-grace)). Rejected by daemons older than 0.14.0 |
 | `yield_timeout_s` | _(none)_ | **Deprecated, ignored** since 0.14.0 (the cooperative yield was retired). Still parsed so an older config loads; the daemon warns once at startup and `--check-config` lists it |
 | `game_priority` | `100` | The priority a detected **game** claims at. Above every tenant's default (`50`), which is what makes gaming preempt everything |
 | `vram_free_threshold_mb` | `2000` | VRAM-used below this = GPU "freed" — applied to the evicting unit's own attributed VRAM when available, else total GPU VRAM (see [Eviction VRAM gating](#eviction-vram-gating)) |
@@ -310,26 +315,37 @@ yields the defaults below.
 Every eviction **stops** the unit — a game, the gaming invariant, tenant
 preemption and a manual stop alike. When a game claim appears, every unit below
 `game_priority` is stopped, in `managed_units` order: `stop_cmd` (or `systemctl stop`), then wait until the
-unit is not running (on Linux, until its VRAM drops below
-`vram_free_threshold_mb`), then SIGKILL / `kill_cmd` once `eviction_timeout_s`
-has passed. "Evicted" therefore means **not running**: the one postcondition the
-daemon can observe on every platform (WDDM reports no per-process VRAM). Up to
+unit is not running, then SIGKILL / `kill_cmd` once `eviction_timeout_s` has
+passed. "Evicted" means **not running**, on every platform: on Linux a VRAM drop
+below `vram_free_threshold_mb` only counts once `is_active` also says stopped,
+and on Windows (WDDM reports no per-process VRAM) run state is the only signal.
+After the kill, run state is checked again (for up to 2 s): a unit that is still
+running, or whose state cannot be confirmed, is an eviction **error** (counted
+as `error`, `degraded` set) — not a `sigkill`. The kill command's own exit
+status does not decide this (`taskkill` exits 128 on an already-gone process). Up to
 0.13 a unit with `yield_cmd` was asked to park instead, which left its process
 and several GB of CUDA state resident; that path is gone.
 
 **Gaming invariant.** Each steady `gaming` pass re-checks the units below
 `game_priority` and stops any that is running again (a service manager
-restart, a start from outside the daemon), logging a warning. "Freed" is kept,
-not just reached once.
+restart, a start from outside the daemon), logging a warning at most once a
+minute per unit. "Freed" is kept, not just reached once. A unit whose run state
+cannot be determined counts as running, as in tenant preemption. After a stop
+that needed the kill or failed, that unit is left alone for a backoff of 15 s,
+doubling to 120 s, reset when gaming ends — so a wrong `is_active_cmd`, or a
+service manager restarting a killed wrapper, does not turn every pass into a
+full `eviction_timeout_s` + kill cycle.
 
 **Exit grace.** `gaming` ends only after the claim set has been empty
 continuously for `game_exit_grace_s` (default `30`). Until then the state stays
 `gaming`: nothing is resumed, nothing is started, a manual start is still
 rejected with `409`, and the gaming invariant still applies. A claim
 reappearing resets the window. `0` ends gaming on the first clean pass, as
-before 0.14.0.
+before 0.14.0; values above `3600` are rejected at load. The window is in memory
+only: a daemon restart inside it starts from `available` again, so the startup
+pass restores tenants at once if no game is running.
 
-**Eviction log.** Each eviction logs the unit, mode, outcome, and total VRAM before
+**Eviction log.** Each eviction logs the unit, reason, outcome, and total VRAM before
 and after (`vram_before_mb` / `vram_after_mb`) at info level; on the game edge
 that total includes the game's own allocation, so it is a diagnostic, not a
 gate.
@@ -434,10 +450,11 @@ CUDA state resident and could not be verified on Windows, so it was retired.
 keys.
 
 `resume_cmd` is an idempotent "you may use the GPU again" hook. It is
-**edge-triggered**: it runs once when a unit the arbiter stopped becomes
-eligible to run again — after the restore path has started it, if it does —
-and once per unit when the daemon starts. It does not run on steady-state
-passes. A failed run is retried on the next pass until it succeeds. "Eligible"
+**edge-triggered**: it is owed after every eviction and once per unit when the
+daemon starts, and runs once the unit is eligible **and up** — started by that
+pass, or confirmed running. A unit that stays down (a non-eager unit, say) keeps
+it owed until it is running again. No resume runs in a pass whose pre-start
+re-scan found a game. It does not run on steady-state passes. A failed run is retried on the next pass until it succeeds. "Eligible"
 means no game holds the GPU and the unit is neither held nor preempted; it does
 **not** depend on `eager_restart`, which only controls whether a stopped unit
 is started. It never starts a unit itself.

@@ -264,6 +264,13 @@ pub(crate) trait Observer: Sync {
     /// Take one snapshot. Called once at the top of a pass and once more as
     /// the TOCTOU re-scan before any eager start.
     async fn observe(&self) -> Result<ProcSnapshot, ReconcileError>;
+
+    /// The monotonic clock for this pass's time-based decisions (the
+    /// game-exit grace, the gaming-invariant backoff). Real time in the
+    /// daemon; tests move it forward instead of sleeping.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 /// The real observer: the platform process scan ([`observe`]).
@@ -386,6 +393,16 @@ pub(crate) async fn reconcile_with<O: Observer>(
                     "manual unit start rejected: a game holds the GPU"
                 );
                 let _ = reply.send(Err(ManualActionError::GpuHeldByGame));
+            } else if let Some(by) = preempting_tenant(state, cfg, &unit).await {
+                // Starting it would only have this same pass's tenant
+                // preemption stop it again: reply 200, then stop. Reject the
+                // same way as the gaming case instead, hold left in place.
+                tracing::info!(
+                    unit = %unit,
+                    by = %by,
+                    "manual unit start rejected: a busy higher-priority tenant preempts it"
+                );
+                let _ = reply.send(Err(ManualActionError::PreemptedByTenant));
             } else {
                 match manual_start(cfg, &unit).await {
                     Ok(started) => {
@@ -483,7 +500,7 @@ pub(crate) async fn reconcile_with<O: Observer>(
             from_claims,
             &mut guard.game_exit_pending_since,
             Duration::from_secs(cfg.game_exit_grace_s),
-            Instant::now(),
+            observer.now(),
         );
         match (pending_before, guard.game_exit_pending_since) {
             (None, Some(_)) => tracing::info!(
@@ -526,21 +543,7 @@ pub(crate) async fn reconcile_with<O: Observer>(
     //
     // The run states probed here are reused below (tenant preemption, the
     // gaming invariant) — they are taken before this pass acts on any unit.
-    let mut running_now: HashMap<&str, Option<bool>> = HashMap::new();
-    let mut busy: Vec<&ManagedUnit> = Vec::new();
-    for u in cfg.resolved_units() {
-        if u.busy_cmd.is_none() || held.contains(&u.unit) {
-            continue;
-        }
-        let running = units::is_running(u).await.ok();
-        running_now.insert(u.unit.as_str(), running);
-        if running == Some(false) {
-            continue;
-        }
-        if units::is_busy(u).await {
-            busy.push(u);
-        }
-    }
+    let (busy, running_now) = probe_busy(cfg, &held).await;
     let mut demand = effective_demand(&claims, cfg, &busy);
     if desired == State::Gaming {
         // Inside the exit grace the claim set is empty but the game still owns
@@ -581,7 +584,12 @@ pub(crate) async fn reconcile_with<O: Observer>(
             // leak: see `a_tenant_above_game_priority_survives_a_game`. Passing
             // `cfg.resolved_units()` instead would silently delete that ability.
             write_state(state).set_state(State::Evicting);
-            let any_eviction_failed = evict_units(state, cfg, backend, &preempted, "game").await;
+            let results = evict_units(state, cfg, backend, &preempted, "game").await;
+            // A unit whose stop needed the kill, or failed, starts the gaming
+            // invariant's backoff right away — otherwise the very next pass
+            // would repeat the whole stop → timeout → kill on it.
+            note_invariant_backoff(state, &preempted, &results, observer.now());
+            let any_eviction_failed = results.iter().any(Option::is_none);
             if any_eviction_failed {
                 // Visibility only — gaming still wins the GPU unconditionally
                 // below. A wedged tenant may still hold VRAM even though `state`
@@ -611,6 +619,8 @@ pub(crate) async fn reconcile_with<O: Observer>(
             let mut guard = write_state(state);
             guard.degraded = false;
             guard.set_state(State::Available);
+            guard.invariant_backoff.clear();
+            guard.invariant_warned.clear();
         }
         UnitAction::None => {
             // No transition needing a unit action: just settle the state
@@ -622,6 +632,8 @@ pub(crate) async fn reconcile_with<O: Observer>(
                 let mut guard = write_state(state);
                 if desired == State::Available {
                     guard.degraded = false;
+                    guard.invariant_backoff.clear();
+                    guard.invariant_warned.clear();
                 }
                 guard.set_state(desired);
             }
@@ -636,24 +648,52 @@ pub(crate) async fn reconcile_with<O: Observer>(
             // exit grace) re-checks the preempted units and stops any
             // that is running again. Reuses this pass's busy-stage probes;
             // other units cost one `is_running` each.
+            //
+            // A probe that fails counts as running (unsure ⇒ stop it), the
+            // same default as tenant preemption. A unit whose last stop needed
+            // the kill or failed is left alone until its backoff expires
+            // (15 s doubling to 120 s, reset when gaming ends): a wrong
+            // `is_active_cmd`, or a service manager restarting a killed
+            // wrapper, must not turn every pass into a full
+            // `eviction_timeout_s` + kill cycle. The WARN is rate-limited too.
             if current == State::Gaming && desired == State::Gaming {
+                let now = observer.now();
+                let backoff = read_state(state).invariant_backoff.clone();
                 let mut came_back: Vec<&ManagedUnit> = Vec::new();
                 for u in &preempted {
+                    if backoff.get(&u.unit).is_some_and(|b| now < b.until) {
+                        continue;
+                    }
                     let running = match running_now.get(u.unit.as_str()) {
                         Some(r) => *r,
                         None => units::is_running(u).await.ok(),
                     };
-                    if running == Some(true) {
+                    if running != Some(false) {
                         came_back.push(*u);
                     }
                 }
                 if !came_back.is_empty() {
-                    let names: Vec<&str> = came_back.iter().map(|u| u.unit.as_str()).collect();
-                    tracing::warn!(
-                        units = ?names,
-                        "gaming invariant: a preempted unit is running again during gaming; stopping it"
-                    );
-                    if evict_units(state, cfg, backend, &came_back, "gaming invariant").await {
+                    {
+                        let mut guard = write_state(state);
+                        for u in &came_back {
+                            let due = guard.invariant_warned.get(&u.unit).is_none_or(|t| {
+                                now.saturating_duration_since(*t) >= INVARIANT_WARN_EVERY
+                            });
+                            if due {
+                                guard.invariant_warned.insert(u.unit.clone(), now);
+                                tracing::warn!(
+                                    unit = %u.unit,
+                                    "gaming invariant: a preempted unit is running again (or its state is unknown) during gaming; stopping it"
+                                );
+                            } else {
+                                tracing::debug!(unit = %u.unit, "gaming invariant: stopping a preempted unit again");
+                            }
+                        }
+                    }
+                    let results =
+                        evict_units(state, cfg, backend, &came_back, "gaming invariant").await;
+                    note_invariant_backoff(state, &came_back, &results, now);
+                    if results.iter().any(Option::is_none) {
                         write_state(state).degraded = true;
                     }
                 }
@@ -733,6 +773,10 @@ pub(crate) async fn reconcile_with<O: Observer>(
         (guard.held.clone(), guard.needs_resume.clone())
     };
 
+    // Units this pass started, and whether the TOCTOU re-scan saw a game:
+    // both gate the resume step below.
+    let mut started: Vec<&str> = Vec::new();
+    let mut claim_mid_pass = false;
     let eager_targets = ensure_running_targets(desired, cfg, &held, &preempted);
     if !eager_targets.is_empty() {
         // Only units NOT already running are actual start candidates
@@ -782,24 +826,25 @@ pub(crate) async fn reconcile_with<O: Observer>(
                         // docs above), so one counter covers both triggers of an
                         // eager restart.
                         write_state(state).metrics.record_unit_restart(&u.unit);
+                        started.push(u.unit.as_str());
                     }
                 }
             } else {
+                claim_mid_pass = true;
                 tracing::warn!(
                     units = to_start.len(),
-                    "ensure-running: a claim appeared mid-pass; skipping eager start(s) this pass"
+                    "ensure-running: a claim appeared mid-pass; skipping eager start(s) and resumes this pass"
                 );
             }
         }
     }
 
-    // Owed resumes run AFTER the starts above, so a unit the arbiter just
-    // brought back hears "you may use the GPU" once it is up. This covers every
-    // unit allowed to hold the GPU again (see [`resume_targets`]), not just
-    // eager ones: `resume_cmd` is an idempotent hook, not a start, so running
-    // it for a non-eager unit (still stopped) never starts anything, and
-    // skipping it could leave a stale tenant-side park flag (e.g. one a 0.13
-    // cooperative yield set) in place for whenever that unit next starts.
+    // Owed resumes run AFTER the starts above, and only for a unit that is
+    // actually up — started by this pass, or confirmed running — so the
+    // tenant hears "you may use the GPU" when it can act on it. A unit that
+    // is not up keeps the resume owed until it is (a non-eager unit started
+    // later by an operator, say). When the TOCTOU re-scan saw a game, the GPU
+    // is not free after all, so no resume runs this pass.
     //
     // Edge-triggered via `needs_resume` (see its docs): a unit owes a resume
     // after any eviction attempt and once at daemon startup, so `resume_cmd`
@@ -807,9 +852,16 @@ pub(crate) async fn reconcile_with<O: Observer>(
     // made it a second writer that could clobber state the tenant's own
     // coordinator had set since. A failed resume stays owed and is retried
     // next pass.
-    for u in resume_targets(desired, cfg, &held, &preempted) {
-        if needs_resume.contains(&u.unit) && units::resume(u).await {
-            write_state(state).needs_resume.remove(&u.unit);
+    if !claim_mid_pass {
+        for u in resume_targets(desired, cfg, &held, &preempted) {
+            if !needs_resume.contains(&u.unit) {
+                continue;
+            }
+            let up = started.contains(&u.unit.as_str())
+                || matches!(units::is_running(u).await, Ok(true));
+            if up && units::resume(u).await {
+                write_state(state).needs_resume.remove(&u.unit);
+            }
         }
     }
 
@@ -874,15 +926,111 @@ async fn evict_units(
     backend: GpuBackend,
     targets: &[&ManagedUnit],
     reason: &'static str,
-) -> bool {
-    let mut any_failed = false;
+) -> Vec<Option<units::EvictionOutcome>> {
+    let mut results = Vec::with_capacity(targets.len());
     let mut vram = vram_used_mb(backend).await;
     for u in targets {
         let (result, vram_after) = evict_one(state, cfg, backend, u, reason, vram).await;
-        any_failed |= result.is_err();
+        results.push(result.ok());
         vram = vram_after;
     }
-    any_failed
+    results
+}
+
+/// Minimum spacing between gaming-invariant WARNs for one unit.
+const INVARIANT_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// First gaming-invariant backoff after a kill or a failed stop.
+const INVARIANT_BACKOFF_MIN: Duration = Duration::from_secs(15);
+
+/// Ceiling for the gaming-invariant backoff.
+const INVARIANT_BACKOFF_MAX: Duration = Duration::from_secs(120);
+
+/// The next gaming-invariant backoff interval after `prev`. **Pure** —
+/// unit-tested: 15 s, then doubling, capped at 120 s.
+fn next_invariant_backoff(prev: Option<Duration>) -> Duration {
+    prev.map_or(INVARIANT_BACKOFF_MIN, |d| {
+        (d * 2).min(INVARIANT_BACKOFF_MAX)
+    })
+}
+
+/// Update the gaming-invariant backoff from one batch of eviction results
+/// (`results[i]` is `targets[i]`'s outcome, `None` for an error). A stop that
+/// needed the kill, or failed, backs the unit off; a clean stop clears it.
+fn note_invariant_backoff(
+    state: &Arc<RwLock<ArbiterState>>,
+    targets: &[&ManagedUnit],
+    results: &[Option<units::EvictionOutcome>],
+    now: Instant,
+) {
+    let mut guard = write_state(state);
+    for (u, result) in targets.iter().zip(results) {
+        match result {
+            Some(units::EvictionOutcome::Freed | units::EvictionOutcome::AlreadyClear) => {
+                guard.invariant_backoff.remove(&u.unit);
+            }
+            Some(units::EvictionOutcome::Escalated) | None => {
+                let step =
+                    next_invariant_backoff(guard.invariant_backoff.get(&u.unit).map(|b| b.step));
+                tracing::info!(
+                    unit = %u.unit,
+                    backoff_s = step.as_secs(),
+                    "gaming invariant: the stop needed the kill or failed; backing off before stopping this unit again"
+                );
+                guard.invariant_backoff.insert(
+                    u.unit.clone(),
+                    crate::state::InvariantBackoff {
+                        until: now + step,
+                        step,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Probe which tenants currently have work. Skips a unit without `busy_cmd`,
+/// a held unit, and a unit `is_running` confirms stopped (a probe that "fails
+/// toward busy" when its service is down would otherwise invent demand).
+/// Returns the busy units and every run state it probed, so the caller can
+/// reuse them.
+async fn probe_busy<'c>(
+    cfg: &'c Config,
+    held: &std::collections::HashSet<String>,
+) -> (Vec<&'c ManagedUnit>, HashMap<&'c str, Option<bool>>) {
+    let mut running_now = HashMap::new();
+    let mut busy = Vec::new();
+    for u in cfg.resolved_units() {
+        if u.busy_cmd.is_none() || held.contains(&u.unit) {
+            continue;
+        }
+        let running = units::is_running(u).await.ok();
+        running_now.insert(u.unit.as_str(), running);
+        if running == Some(false) {
+            continue;
+        }
+        if units::is_busy(u).await {
+            busy.push(u);
+        }
+    }
+    (busy, running_now)
+}
+
+/// For a manual start: the busy higher-priority tenant that currently
+/// preempts `unit`, if any — the same ladder the pass applies, evaluated
+/// without a game (a game is checked separately and first).
+async fn preempting_tenant(
+    state: &Arc<RwLock<ArbiterState>>,
+    cfg: &Config,
+    unit: &str,
+) -> Option<String> {
+    let target = cfg.resolved_units().iter().find(|u| u.unit == unit)?;
+    let held = read_state(state).held.clone();
+    let (busy, _) = probe_busy(cfg, &held).await;
+    busy.iter()
+        .filter(|b| b.priority > target.priority)
+        .max_by_key(|b| b.priority)
+        .map(|b| b.unit.clone())
 }
 
 /// Total GPU VRAM in use (MiB), best effort: `None` when the query fails (no
@@ -1412,12 +1560,18 @@ mod tests {
         Arc::new(RwLock::new(state))
     }
 
-    /// A `game_exit_pending_since` far enough in the past that the default
-    /// `game_exit_grace_s` (30 s) has elapsed — for tests that model a game
-    /// that is already gone, not the debounce itself.
-    fn grace_elapsed() -> Option<Instant> {
-        Instant::now().checked_sub(Duration::from_secs(60))
+    /// A `game_exit_pending_since` such that the exit grace has elapsed by
+    /// the next pass — for tests that model a game that is already gone, not
+    /// the debounce itself. The test observers' clock runs
+    /// [`FAKE_CLOCK_LEAD`] ahead of real time, so "now" is already an hour
+    /// past it. (Subtracting from `Instant::now()` instead returns `None` on
+    /// a freshly booted host.)
+    fn grace_elapsed() -> Instant {
+        Instant::now()
     }
+
+    /// How far ahead of real time the test observers' clock runs.
+    const FAKE_CLOCK_LEAD: Duration = Duration::from_secs(3600);
 
     #[tokio::test]
     async fn reconcile_empty_observation_drives_available() {
@@ -1428,7 +1582,7 @@ mod tests {
         let mut s = ArbiterState::new();
         s.state = State::Gaming;
         // The game left long enough ago that the exit grace has elapsed.
-        s.game_exit_pending_since = grace_elapsed();
+        s.game_exit_pending_since = Some(grace_elapsed());
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
         reconcile_with(
@@ -1597,20 +1751,18 @@ mod tests {
 
     #[tokio::test]
     async fn manual_stop_trigger_evicts_unit_and_replies_ok() {
-        // is_active_cmd = true so evict() actually runs stop_cmd (not the
-        // already-clear fast path); stop_cmd here just touches a marker so the
-        // test can observe it ran.
+        // A running marker-backed unit: the stop deletes the marker, so the
+        // test can observe that it ran and that the unit really stopped.
         let marker = marker_path("manual-stop");
+        std::fs::write(&marker, b"").unwrap();
         let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             eviction_timeout_s = 0
             [[managed_units]]
             unit = "fake.service"
-            start_cmd = ["true"]
-            stop_cmd = ["touch", "{marker}"]
-            is_active_cmd = "true"
+            {cmds}
             "#,
-            marker = crate::testutil::toml_path(&marker),
+            cmds = crate::testutil::stateful_unit_cmds(&marker),
         )))
         .unwrap();
         let state = shared(ArbiterState::new());
@@ -1630,8 +1782,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reply_rx.await.unwrap(), Ok(()));
-        assert!(marker.exists(), "manual stop must actually evict the unit");
-        let _ = std::fs::remove_file(&marker);
+        assert!(!marker.exists(), "manual stop must actually stop the unit");
     }
 
     // ── metrics recording through the real reconcile() entry point ───────────
@@ -1668,17 +1819,28 @@ mod tests {
 
     #[tokio::test]
     async fn manual_stop_records_eviction_metric() {
+        // The stop does nothing, so the eviction escalates; the kill stops the
+        // unit, so the escalation is a confirmed `sigkill`.
         let marker = marker_path("metrics-manual-stop");
+        let killed = marker_path("metrics-manual-stop-killed");
+        std::fs::write(&marker, b"").unwrap();
+        let p = crate::testutil::toml_path(&marker);
+        let is_active = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "if exist {p} (exit 0) else (exit 1)"]"#)
+        } else {
+            format!(r#"["test", "-e", "{p}"]"#)
+        };
         let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             eviction_timeout_s = 0
             [[managed_units]]
             unit = "fake.service"
             start_cmd = ["true"]
-            stop_cmd = ["touch", "{marker}"]
-            is_active_cmd = "true"
+            stop_cmd = ["true"]
+            is_active_cmd = {is_active}
+            {kill}
             "#,
-            marker = crate::testutil::toml_path(&marker),
+            kill = crate::testutil::stateful_kill_cmd(&marker, &killed),
         )))
         .unwrap();
         let state = shared(ArbiterState::new());
@@ -1698,19 +1860,14 @@ mod tests {
         .await
         .unwrap();
         reply_rx.await.unwrap().unwrap();
-        // eviction_timeout_s = 0 means `eviction_step` escalates on its very
-        // first poll (elapsed >= 0 always holds); is_active_cmd = "true" is a
-        // static command that always reports running, so the post-escalate
-        // recheck also sees "still running" and drives the SIGKILL fallback
-        // (re-running stop_cmd, since no kill_cmd is configured) — the same
-        // shape as `units::evict_escalates_when_recheck_cannot_confirm_still_running`.
-        // Real outcome is Escalated, not Freed: a manual stop is still counted
-        // like any other eviction, just under the sigkill bucket here.
+        // eviction_timeout_s = 0 escalates on the first poll; the recheck sees
+        // the unit still up, kill_cmd stops it, and the post-kill re-check
+        // confirms it — a manual stop counted under the sigkill bucket.
         assert_eq!(
             read_state(&state).metrics.evictions["fake.service"].sigkill,
             1
         );
-        let _ = std::fs::remove_file(&marker);
+        assert!(take_marker(&killed));
     }
 
     #[tokio::test]
@@ -2406,7 +2563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_eager_unit_is_resumed_at_startup_but_never_started() {
+    async fn non_eager_stopped_unit_keeps_its_startup_resume_owed_and_is_never_started() {
         let resume_marker = marker_path("resume-noneager-startup");
         let start_marker = marker_path("start-noneager-startup");
         let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
@@ -2425,17 +2582,18 @@ mod tests {
         .unwrap();
         let state = shared(ArbiterState::with_config(&cfg));
 
+        // The unit is stopped: the startup resume stays owed rather than
+        // telling a tenant that is not running that it may use the GPU…
         pass(&state, &cfg, ReconcileTrigger::Startup).await;
-        assert!(
-            take_marker(&resume_marker),
-            "startup resume reaches non-eager units"
-        );
+        assert!(!take_marker(&resume_marker), "no resume for a stopped unit");
         assert!(
             !take_marker(&start_marker),
-            "resuming must never start a non-eager unit"
+            "an owed resume must never start a non-eager unit"
         );
+        assert!(read_state(&state).needs_resume.contains("fake.service"));
         pass(&state, &cfg, ReconcileTrigger::Timer).await;
         assert!(!take_marker(&resume_marker));
+        assert!(!take_marker(&start_marker));
     }
 
     #[test]
@@ -2722,7 +2880,7 @@ mod tests {
         let mut s = ArbiterState::new();
         s.state = State::Gaming;
         // The game left long enough ago that the exit grace has elapsed.
-        s.game_exit_pending_since = grace_elapsed();
+        s.game_exit_pending_since = Some(grace_elapsed());
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
         reconcile_with(
@@ -3106,6 +3264,8 @@ mod tests {
                 "test",
             )
             .await
+            .iter()
+            .any(Option::is_none)
         );
         // AlreadyClear isn't a real eviction — nothing recorded.
         assert!(read_state(&state).metrics.evictions.is_empty());
@@ -3134,6 +3294,8 @@ mod tests {
                 "test",
             )
             .await
+            .iter()
+            .any(Option::is_none)
         );
         // The failure is counted under the "error" bucket for that unit.
         assert_eq!(
@@ -3150,7 +3312,7 @@ mod tests {
         let mut s = ArbiterState::new();
         s.state = State::Gaming;
         // The game left long enough ago that the exit grace has elapsed.
-        s.game_exit_pending_since = grace_elapsed();
+        s.game_exit_pending_since = Some(grace_elapsed());
         s.degraded = true;
         let state = shared(s);
         let cfg = Config::default();
@@ -3233,6 +3395,10 @@ mod tests {
     }
 
     impl Observer for FakeObserver {
+        fn now(&self) -> Instant {
+            Instant::now() + FAKE_CLOCK_LEAD
+        }
+
         async fn observe(&self) -> Result<ProcSnapshot, ReconcileError> {
             let procs = if self.game {
                 vec![proc(4242, "reaper SteamLaunch AppId=440 -- /games/tf2")]
@@ -3436,9 +3602,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_eager_unit_is_resumed_after_preemption_but_not_started() {
+    async fn non_eager_unit_is_resumed_once_it_is_up_again() {
         // Review regression (v0.12): resume used to be reached only while
         // iterating the eager targets, so a non-eager unit kept its park flag.
+        // It is resumed — once it is running again.
         let l = ladder_with("tenant-noneager", true, false);
         let idle = l.with_high_busy(false);
         let state = shared(ArbiterState::new());
@@ -3447,11 +3614,19 @@ mod tests {
         assert!(!l.low_run.exists());
         assert!(!take_marker(&l.resumed), "no resume while still preempted");
 
+        // Demand ends: a non-eager unit is not started, so its resume stays
+        // owed…
         pass_seen(&state, &idle, false).await;
-        assert!(take_marker(&l.resumed), "a non-eager unit is resumed too");
-        assert!(!l.low_run.exists(), "but never started");
-        assert!(read_state(&state).needs_resume.is_empty());
+        assert!(!l.low_run.exists(), "never started by the daemon");
+        assert!(!take_marker(&l.resumed), "no resume while it is down");
+        assert!(read_state(&state).needs_resume.contains("low.service"));
 
+        // …until it is up (an operator starts it), then it runs exactly once.
+        std::fs::write(&l.low_run, b"").unwrap();
+        pass_seen(&state, &idle, false).await;
+        assert!(take_marker(&l.resumed_up), "resumed once it is up");
+        assert!(take_marker(&l.resumed));
+        assert!(read_state(&state).needs_resume.is_empty());
         pass_seen(&state, &idle, false).await;
         assert!(!take_marker(&l.resumed), "only once per eviction");
     }
@@ -3488,7 +3663,7 @@ mod tests {
         // A gap that outlasts the grace does end gaming: resume, then restart.
         pass_seen(&state, &l.cfg, false).await;
         assert_eq!(read_state(&state).state, State::Gaming);
-        write_state(&state).game_exit_pending_since = grace_elapsed();
+        write_state(&state).game_exit_pending_since = Some(grace_elapsed());
         pass_seen(&state, &l.cfg, false).await;
         {
             let g = read_state(&state);
@@ -3650,5 +3825,190 @@ mod tests {
             State::Available
         );
         assert_eq!(pending, None);
+    }
+
+    // ── scripted scans + clock: backoff, unsure probes, TOCTOU, 409 ─────────
+
+    /// Test observer whose scans answer from a script (a game present or not,
+    /// one entry per `observe` call; an empty script means no game) and whose
+    /// clock is `ahead` past the fake clock.
+    struct ScriptedObserver {
+        scans: std::sync::Mutex<std::collections::VecDeque<bool>>,
+        ahead: Duration,
+    }
+
+    impl ScriptedObserver {
+        fn new(scans: &[bool], ahead: Duration) -> Self {
+            Self {
+                scans: std::sync::Mutex::new(scans.iter().copied().collect()),
+                ahead,
+            }
+        }
+    }
+
+    impl Observer for ScriptedObserver {
+        fn now(&self) -> Instant {
+            Instant::now() + FAKE_CLOCK_LEAD + self.ahead
+        }
+
+        async fn observe(&self) -> Result<ProcSnapshot, ReconcileError> {
+            let game = self.scans.lock().unwrap().pop_front().unwrap_or(false);
+            FakeObserver { game }.observe().await
+        }
+    }
+
+    async fn pass_scripted(
+        state: &Arc<RwLock<ArbiterState>>,
+        cfg: &Config,
+        scans: &[bool],
+        ahead_s: u64,
+    ) {
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile_with(
+            &ScriptedObserver::new(scans, Duration::from_secs(ahead_s)),
+            state,
+            cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn invariant_backoff_doubles_to_a_cap() {
+        let mut d = next_invariant_backoff(None);
+        let mut seen = vec![d.as_secs()];
+        for _ in 0..5 {
+            d = next_invariant_backoff(Some(d));
+            seen.push(d.as_secs());
+        }
+        assert_eq!(seen, [15, 30, 60, 120, 120, 120]);
+    }
+
+    #[tokio::test]
+    async fn gaming_invariant_treats_an_unknown_state_as_running_and_backs_off() {
+        // `is_active_cmd` cannot be spawned, so every run-state probe fails:
+        // the invariant must count that as running (unsure ⇒ stop), but a
+        // failing eviction must not repeat on every pass.
+        let mut cfg = Config::from_toml(&crate::testutil::portable_toml(
+            r#"
+            eviction_timeout_s = 0
+
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = ["gpu-arbiter-test-no-such-binary"]
+            "#,
+        ))
+        .unwrap();
+        cfg.game_exit_grace_s = 0;
+        let state = shared(ArbiterState::new());
+        let errors = |state: &Arc<RwLock<ArbiterState>>| {
+            read_state(state).metrics.evictions["fake.service"].error
+        };
+
+        // The game edge: the eviction fails and starts a 15 s backoff.
+        pass_scripted(&state, &cfg, &[true], 0).await;
+        assert_eq!(errors(&state), 1);
+        assert!(read_state(&state).degraded);
+        // Inside the backoff: no attempt.
+        pass_scripted(&state, &cfg, &[true], 5).await;
+        assert_eq!(errors(&state), 1, "backed off for 15 s");
+        // After it: the unknown state counts as running and is stopped again,
+        // and the next backoff doubles.
+        pass_scripted(&state, &cfg, &[true], 16).await;
+        assert_eq!(errors(&state), 2, "an unknown run state is stopped");
+        assert_eq!(
+            read_state(&state).invariant_backoff["fake.service"].step,
+            Duration::from_secs(30)
+        );
+        pass_scripted(&state, &cfg, &[true], 40).await;
+        assert_eq!(errors(&state), 2, "backed off for 30 s");
+        // The game ends: the backoff resets.
+        pass_scripted(&state, &cfg, &[false], 41).await;
+        assert_eq!(read_state(&state).state, State::Available);
+        assert!(read_state(&state).invariant_backoff.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_on_the_toctou_rescan_skips_starts_and_resumes() {
+        // The top-of-pass scan is clean, but a game appears before the first
+        // eager start: nothing is started, no resume runs, and the resume
+        // stays owed for the next clean pass.
+        let run = marker_path("toctou-run");
+        let resume = marker_path("toctou-resume");
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            {cmds}
+            resume_cmd = ["touch", "{resume}"]
+            "#,
+            cmds = crate::testutil::stateful_unit_cmds(&run),
+            resume = crate::testutil::toml_path(&resume),
+        )))
+        .unwrap();
+        let state = shared(ArbiterState::with_config(&cfg));
+
+        pass_scripted(&state, &cfg, &[false, true], 0).await;
+        assert!(!run.exists(), "no start into a game seen mid-pass");
+        assert!(!take_marker(&resume), "no resume either");
+        assert!(read_state(&state).needs_resume.contains("fake.service"));
+
+        pass_scripted(&state, &cfg, &[false, false], 0).await;
+        assert!(run.exists(), "a clean pass starts it");
+        assert!(take_marker(&resume), "and then resumes it");
+        assert!(read_state(&state).needs_resume.is_empty());
+        let _ = std::fs::remove_file(&run);
+    }
+
+    #[tokio::test]
+    async fn manual_start_of_a_unit_a_busy_tenant_preempts_is_rejected() {
+        let l = ladder_with("manual-preempted", true, false);
+        std::fs::remove_file(&l.low_run).unwrap();
+        let mut initial = ArbiterState::new();
+        initial.held.insert("low.service".to_string());
+        let state = shared(initial);
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile_with(
+            &FakeObserver { game: false },
+            &state,
+            &l.cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "low.service".to_string(),
+                reply,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.await.unwrap(), Err(ManualActionError::PreemptedByTenant));
+        assert!(!l.low_run.exists(), "never started");
+        assert!(read_state(&state).held.contains("low.service"), "hold kept");
+
+        // Once the tenant above is idle, the same start goes through.
+        let idle = l.with_high_busy(false);
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        reconcile_with(
+            &FakeObserver { game: false },
+            &state,
+            &idle,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "low.service".to_string(),
+                reply,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.await.unwrap(), Ok(()));
+        assert!(l.low_run.exists());
     }
 }

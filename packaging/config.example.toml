@@ -61,6 +61,8 @@
 # the window /status stays `gaming`; a claim reappearing resets it. 0 restores
 # the old immediate behavior. Needs gpu-arbiter >= 0.14.0 (older builds reject
 # the key).
+# Range 0-3600. In memory only: a daemon restart inside the window starts
+# from `available` again.
 #game_exit_grace_s = 30
 
 # DEPRECATED (0.14.0): yield_timeout_s (top level and per unit) and yield_cmd

@@ -78,6 +78,11 @@ pub enum ManualActionError {
     /// operators too. Any manual hold on the unit is left in place. HTTP:
     /// `409 Conflict`.
     GpuHeldByGame,
+    /// A manual start was **rejected without being attempted** because a busy
+    /// higher-priority tenant currently preempts this unit: starting it would
+    /// only have it stopped again by the same pass's tenant preemption. Any
+    /// manual hold stays in place. HTTP: `409 Conflict`.
+    PreemptedByTenant,
 }
 
 /// Why a reconcile pass was triggered. Fed over the `mpsc` of triggers into the
@@ -215,6 +220,16 @@ pub struct UnitStatus {
     pub last_eviction: Option<LastEviction>,
 }
 
+/// One unit's gaming-invariant backoff: no stop before `until`, and the next
+/// failure waits `step` doubled (capped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvariantBackoff {
+    /// No invariant stop for this unit before this instant.
+    pub until: Instant,
+    /// The interval that produced `until`.
+    pub step: std::time::Duration,
+}
+
 /// One unit's most recent eviction, for `/status` `units[].last_eviction`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastEviction {
@@ -345,6 +360,13 @@ pub struct ArbiterState {
     /// Each unit's most recent effective eviction, copied into
     /// [`UnitStatus::last_eviction`] on every `/status` refresh.
     pub last_evictions: HashMap<String, LastEviction>,
+    /// Per-unit backoff for the gaming invariant: after a stop that needed the
+    /// kill or failed, the unit is not stopped again until `until`. Cleared
+    /// when gaming ends. See `crate::reconcile`'s gaming invariant.
+    pub invariant_backoff: HashMap<String, InvariantBackoff>,
+    /// When the gaming invariant last logged a WARN for each unit, so a unit
+    /// a service manager keeps restarting logs at most once a minute.
+    pub invariant_warned: HashMap<String, Instant>,
     /// `true` if the most recent eviction pass had at least one unit fail —
     /// feeds [`StatusSnapshot::degraded`].
     pub degraded: bool,
@@ -601,6 +623,8 @@ impl Default for ArbiterState {
             needs_resume: HashSet::new(),
             game_exit_pending_since: None,
             last_evictions: HashMap::new(),
+            invariant_backoff: HashMap::new(),
+            invariant_warned: HashMap::new(),
             degraded: false,
             metrics: Metrics::default(),
         }
