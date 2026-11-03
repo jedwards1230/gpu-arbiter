@@ -208,7 +208,8 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
 ///   attempts, `outcome` ∈ `yielded`/`graceful`/`sigkill`/`error`. A no-op
 ///   eviction (the unit wasn't running) is not counted — see
 ///   [`crate::units::eviction_metric_outcome`]. `yielded` means the tenant
-///   released the GPU cooperatively and was never stopped.
+///   released the GPU cooperatively and was never stopped — tenant preemption
+///   only; a game eviction or manual stop never yields.
 /// - `gpu_arbiter_eviction_duration_seconds{unit,stage}` — histogram of how
 ///   long evictions take, `stage` ∈ `yield`/`stop`/`total`. Exists so
 ///   `yield_timeout_s` and `eviction_timeout_s` can be set from observed cost
@@ -1095,10 +1096,10 @@ pub async fn healthz() -> &'static str {
 /// the Windows equivalent). A direct override: starts the unit now —
 /// **unless a game holds the GPU**. While the state is `gaming`/`evicting`
 /// the reconcile task rejects the start with `409 Conflict` (any manual hold
-/// stays in place) rather than starting a tenant into a live game: eviction
-/// is edge-triggered (it fires on the available → gaming *transition*), so a
-/// unit started mid-game would NOT be re-evicted by the next pass — it would
-/// sit on the GPU alongside the game. This endpoint cannot override gaming.
+/// stays in place) rather than starting a tenant into a live game: a unit
+/// started mid-game would sit on the GPU alongside the game until the next
+/// pass's gaming invariant stopped it again. This endpoint cannot override
+/// gaming.
 /// No peer/loopback check: a unix-socket peer carries no `SocketAddr`, and
 /// the socket file's permissions (mode `0600`, root-owned; see
 /// [`serve_uds`]) are the entire auth boundary for this transport.
@@ -1476,6 +1477,7 @@ mod tests {
                 models_error: None,
                 vram_mb: None,
                 held: false,
+                last_eviction: None,
             }],
             gpu_vram_used_mb: 21500,
             gpu_vram_total_mb: 32768,
@@ -1532,6 +1534,7 @@ mod tests {
                 models_error: None,
                 vram_mb: Some(21000),
                 held: false,
+                last_eviction: None,
             }],
             gpu_vram_used_mb: 21000,
             gpu_vram_total_mb: 32768,
@@ -1615,6 +1618,7 @@ mod tests {
                     models_error: None,
                     vram_mb: None,
                     held: true,
+                    last_eviction: None,
                 },
                 UnitStatus {
                     unit: "vllm.service".into(),
@@ -1623,6 +1627,7 @@ mod tests {
                     models_error: None,
                     vram_mb: None,
                     held: false,
+                    last_eviction: None,
                 },
             ],
             gpu_vram_used_mb: 0,

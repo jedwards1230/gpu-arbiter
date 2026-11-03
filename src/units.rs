@@ -146,7 +146,8 @@ pub enum EvictionOutcome {
     ///
     /// The best outcome available: no in-flight work is lost and there is no
     /// cold model reload when the tenant resumes. Only reachable for a unit that
-    /// configures `yield_cmd`.
+    /// configures `yield_cmd`, and only under [`EvictMode::YieldFirst`] (tenant
+    /// preemption) — a game or an operator stop never yields.
     Yielded,
     /// VRAM dropped below the free threshold within the timeout (graceful).
     Freed,
@@ -154,6 +155,41 @@ pub enum EvictionOutcome {
     Escalated,
     /// The unit was already stopped / not running; nothing to do.
     AlreadyClear,
+}
+
+/// How an eviction treats a unit that configures `yield_cmd`.
+///
+/// The cooperative yield exists for **tenant-vs-tenant** preemption, where a
+/// busy higher tier displaces a lower one: saving the lower tenant's in-flight
+/// work is worth a residual footprint. It is the wrong tool for a game or an
+/// operator hold. A parked tenant keeps its process, and with it its CUDA
+/// context, library workspaces and allocator remainder — several GB on a real
+/// `PyTorch` service — and on Windows nothing can verify the drop, since WDDM
+/// reports no per-process VRAM. "Freed" for a game must be a postcondition the
+/// daemon can observe, and the one reliable signal on every platform is the
+/// unit reaching not-running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictMode {
+    /// Skip `yield_cmd` entirely: `stop_cmd`, poll until not running (or the
+    /// VRAM gate opens), and kill on `eviction_timeout_s`. Used for the game
+    /// edge, the gaming invariant, and manual `POST /units/{unit}/stop`. A unit
+    /// a tenant preemption parked earlier is running, so it is stopped too.
+    HardStop,
+    /// Try `yield_cmd` first and stop only if the tenant does not release
+    /// within its yield budget. Used only for tenant-vs-tenant preemption. A
+    /// unit without `yield_cmd` behaves exactly as under [`EvictMode::HardStop`].
+    YieldFirst,
+}
+
+impl EvictMode {
+    /// Stable label for logs and `/status` (`"hard_stop"` / `"yield_first"`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            EvictMode::HardStop => "hard_stop",
+            EvictMode::YieldFirst => "yield_first",
+        }
+    }
 }
 
 /// The `outcome` label bucket for `gpu_arbiter_evictions_total{unit,outcome}`.
@@ -1091,8 +1127,9 @@ pub async fn evict_by_name(
     cfg: &Config,
     backend: GpuBackend,
     unit: &str,
+    mode: EvictMode,
 ) -> Result<EvictionOutcome, UnitError> {
-    evict(resolve_unit(cfg, unit)?, cfg, backend).await
+    evict(resolve_unit(cfg, unit)?, cfg, backend, mode).await
 }
 
 /// Start `u` (eager warm-up after a verified `gaming → available` transition),
@@ -1118,7 +1155,10 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
     }
 }
 
-/// Evict `unit` from the GPU: `systemctl stop`, then poll until the unit's own
+/// Evict `unit` from the GPU. Under [`EvictMode::YieldFirst`] a unit with a
+/// `yield_cmd` is first asked to release cooperatively (see `try_yield`); under
+/// [`EvictMode::HardStop`], and whenever that yield does not complete, it is
+/// stopped: `systemctl stop`, then poll until the unit's own
 /// VRAM drains below `vram_free_threshold_mb` (graceful) or
 /// `eviction_timeout_s` elapses. On timeout, re-check the unit: if it's
 /// already inactive the process is gone and its VRAM released (VRAM free *or
@@ -1162,6 +1202,7 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
 ///
 /// Returns:
 /// - [`EvictionOutcome::AlreadyClear`] if the unit wasn't running to begin with,
+/// - [`EvictionOutcome::Yielded`] if a [`EvictMode::YieldFirst`] yield released,
 /// - [`EvictionOutcome::Freed`] if VRAM drained gracefully within the timeout,
 /// - [`EvictionOutcome::Escalated`] if the timeout forced a SIGKILL.
 ///
@@ -1172,14 +1213,17 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
 ///
 /// Returns [`UnitError`] if the initial `is_running` check or the `stop`
 /// control command fails to spawn, times out, or (for `stop`) exits non-zero.
+/// A failed `stop` with the unit still up (or unknown) is escalated to the
+/// kill before the error is returned.
 /// A failed VRAM/attribution poll during the wait loop is handled internally
 /// (treated as "not yet free"), not propagated as an error.
 pub async fn evict(
     u: &ManagedUnit,
     cfg: &Config,
     backend: GpuBackend,
+    mode: EvictMode,
 ) -> Result<EvictionOutcome, UnitError> {
-    evict_timed(u, cfg, backend).await.0
+    evict_timed(u, cfg, backend, mode).await.0
 }
 
 /// Per-stage wall-clock of one eviction, in seconds.
@@ -1212,10 +1256,11 @@ pub async fn evict_timed(
     u: &ManagedUnit,
     cfg: &Config,
     backend: GpuBackend,
+    mode: EvictMode,
 ) -> (Result<EvictionOutcome, UnitError>, EvictionTimings) {
     let mut timings = EvictionTimings::default();
     let started = std::time::Instant::now();
-    let result = evict_inner(u, cfg, backend, &mut timings).await;
+    let result = evict_inner(u, cfg, backend, mode, &mut timings).await;
     timings.total_secs = started.elapsed().as_secs_f64();
     (result, timings)
 }
@@ -1224,6 +1269,7 @@ async fn evict_inner(
     u: &ManagedUnit,
     cfg: &Config,
     backend: GpuBackend,
+    mode: EvictMode,
     timings: &mut EvictionTimings,
 ) -> Result<EvictionOutcome, UnitError> {
     let sup = Supervisor::resolve(u);
@@ -1247,12 +1293,15 @@ async fn evict_inner(
     //
     // Ask the tenant to drop the GPU while staying alive. Strictly better than a
     // stop when it works: no in-flight work is lost and there is no cold model
-    // reload afterwards. Skipped entirely for a unit with no `yield_cmd`.
+    // reload afterwards. Skipped entirely for a unit with no `yield_cmd`, and
+    // under `EvictMode::HardStop` (a game or an operator hold), where a parked
+    // tenant's residual footprint is not acceptable and "freed" has to mean
+    // "not running" — see [`EvictMode`].
     //
     // The tenant cannot hold the GPU against a higher tier by ignoring this —
     // failure to release within the budget falls through to the stop path below,
     // and the budget is deliberately short (see `Config::yield_timeout_s`).
-    if u.yield_cmd.is_some() {
+    if mode == EvictMode::YieldFirst && u.yield_cmd.is_some() {
         let started = std::time::Instant::now();
         let yield_outcome = try_yield(u, cfg).await;
         timings.yield_secs = Some(started.elapsed().as_secs_f64());
@@ -1282,13 +1331,29 @@ async fn evict_inner(
     // Graceful teardown: SIGTERM frees the CUDA context in ~1s. An in-flight
     // request dying is accepted by design.
     let stop_started = std::time::Instant::now();
-    let stop = stop_unit(&sup, &u.unit).await?;
-    if !stop.status.success() {
-        return Err(UnitError::Exit {
+    let stop_err = match stop_unit(&sup, &u.unit).await {
+        Ok(stop) if stop.status.success() => None,
+        Ok(stop) => Some(UnitError::Exit {
             action: "stop",
             unit: u.unit.clone(),
             detail: exit_detail(&stop),
-        });
+        }),
+        Err(e) => Some(e),
+    };
+    if let Some(e) = stop_err {
+        // A stop that failed outright (non-zero exit, timeout, spawn failure)
+        // must not leave a live tenant on the GPU just because the polite path
+        // broke: e.g. `sc.exe stop` refusing a service wedged in START_PENDING
+        // (error 1061). Escalate to the kill if the unit is still up — or if
+        // that cannot be told — and still report the error, so the eviction is
+        // counted as `error` and the pass is marked degraded.
+        let still_running = is_running(u).await.unwrap_or(true);
+        if still_running {
+            tracing::warn!(unit = %u.unit, error = %e, "stop_cmd failed with the unit still up; escalating to kill");
+            let _ = kill_unit(&sup, &u.unit).await;
+        }
+        timings.stop_secs = Some(stop_started.elapsed().as_secs_f64());
+        return Err(e);
     }
 
     // Poll until this unit's own VRAM drops below the free threshold (or the
@@ -2552,9 +2617,14 @@ mod tests {
     #[tokio::test]
     async fn evict_by_name_unknown_unit_is_typed_error() {
         let cfg = Config::default();
-        let err = evict_by_name(&cfg, GpuBackend::default(), "not-a-real-unit")
-            .await
-            .unwrap_err();
+        let err = evict_by_name(
+            &cfg,
+            GpuBackend::default(),
+            "not-a-real-unit",
+            EvictMode::HardStop,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, UnitError::Exit { .. }));
     }
 
@@ -2587,7 +2657,9 @@ mod tests {
         let u = &cfg.resolved_units()[0];
         assert!(u.busy_cmd.is_none(), "fixture must omit busy_cmd");
 
-        let outcome = evict(u, &cfg, GpuBackend::default()).await.unwrap();
+        let outcome = evict(u, &cfg, GpuBackend::default(), EvictMode::YieldFirst)
+            .await
+            .unwrap();
         assert_ne!(
             outcome,
             EvictionOutcome::Yielded,
@@ -2724,9 +2796,14 @@ mod tests {
             "#,
         ))
         .unwrap();
-        let outcome = evict_by_name(&cfg, GpuBackend::default(), "fake.service")
-            .await
-            .unwrap();
+        let outcome = evict_by_name(
+            &cfg,
+            GpuBackend::default(),
+            "fake.service",
+            EvictMode::HardStop,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, EvictionOutcome::AlreadyClear);
     }
 
@@ -2783,9 +2860,14 @@ mod tests {
         ))
         .unwrap();
 
-        let outcome = evict(&cfg.managed_units[0], &cfg, GpuBackend::default())
-            .await
-            .unwrap();
+        let outcome = evict(
+            &cfg.managed_units[0],
+            &cfg,
+            GpuBackend::default(),
+            EvictMode::HardStop,
+        )
+        .await
+        .unwrap();
         // With eviction_timeout_s = 0 the very first poll escalates immediately
         // (no real GPU to read), the recheck can't confirm (the link is gone),
         // and the unsure-assume-still-running default drives the SIGKILL
@@ -2796,5 +2878,159 @@ mod tests {
             std::fs::symlink_metadata(&link).is_err(),
             "stop_cmd must have removed the link, or the recheck never failed"
         );
+    }
+
+    // ── eviction modes (HardStop vs YieldFirst) and kill escalation ─────────
+
+    /// A running, marker-backed unit with a working cooperative yield:
+    /// `yield_cmd` touches `yielded`, `busy_cmd` reports idle at once.
+    fn yielding_unit_cfg(run: &std::path::Path, yielded: &std::path::Path) -> Config {
+        Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            eviction_timeout_s = 0
+
+            [[managed_units]]
+            unit = "fake.service"
+            {cmds}
+            busy_cmd = "false"
+            yield_cmd = ["touch", "{yielded}"]
+            "#,
+            cmds = crate::testutil::stateful_unit_cmds(run),
+            yielded = crate::testutil::toml_path(yielded),
+        )))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hard_stop_skips_yield_cmd_and_stops_the_unit() {
+        let run = crate::testutil::temp_marker("hs-run");
+        let yielded = crate::testutil::temp_marker("hs-yield");
+        std::fs::write(&run, b"").unwrap();
+        let cfg = yielding_unit_cfg(&run, &yielded);
+
+        let outcome = evict(
+            &cfg.resolved_units()[0],
+            &cfg,
+            GpuBackend::default(),
+            EvictMode::HardStop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, EvictionOutcome::Freed);
+        assert!(!run.exists(), "the unit must really be stopped");
+        assert!(!yielded.exists(), "HardStop must never send yield_cmd");
+    }
+
+    #[tokio::test]
+    async fn yield_first_still_yields_and_leaves_the_unit_running() {
+        let run = crate::testutil::temp_marker("yf-run");
+        let yielded = crate::testutil::temp_marker("yf-yield");
+        std::fs::write(&run, b"").unwrap();
+        let cfg = yielding_unit_cfg(&run, &yielded);
+
+        let outcome = evict(
+            &cfg.resolved_units()[0],
+            &cfg,
+            GpuBackend::default(),
+            EvictMode::YieldFirst,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, EvictionOutcome::Yielded);
+        assert!(run.exists(), "a yield leaves the process up");
+        assert!(yielded.exists(), "yield_cmd must have run");
+        let _ = std::fs::remove_file(&run);
+        let _ = std::fs::remove_file(&yielded);
+    }
+
+    #[tokio::test]
+    async fn stop_that_does_not_stop_escalates_to_kill_cmd_after_eviction_timeout() {
+        // The Windows shape: `sc.exe stop` returns at once (STOP_PENDING) but
+        // the service never reaches STOPPED. The wait is `eviction_timeout_s`
+        // (here 1 s); after it the still-running recheck sends `kill_cmd`.
+        let run = crate::testutil::temp_marker("kill-run");
+        let killed = crate::testutil::temp_marker("kill-killed");
+        std::fs::write(&run, b"").unwrap();
+        let p = crate::testutil::toml_path(&run);
+        let is_active = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "if exist {p} (exit 0) else (exit 1)"]"#)
+        } else {
+            format!(r#"["test", "-e", "{p}"]"#)
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            eviction_timeout_s = 1
+
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = {is_active}
+            {kill}
+            "#,
+            kill = crate::testutil::stateful_kill_cmd(&run, &killed),
+        )))
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = evict(
+            &cfg.resolved_units()[0],
+            &cfg,
+            GpuBackend::default(),
+            EvictMode::HardStop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, EvictionOutcome::Escalated);
+        assert!(killed.exists(), "the escalation must run kill_cmd");
+        assert!(!run.exists());
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "kill_cmd must wait out eviction_timeout_s first"
+        );
+        let _ = std::fs::remove_file(&killed);
+    }
+
+    #[tokio::test]
+    async fn failed_stop_with_the_unit_still_up_escalates_to_kill_cmd() {
+        // `sc.exe stop` refusing outright (e.g. 1061 on a service wedged in
+        // START_PENDING) used to return the error with the tenant still on the
+        // GPU. It is still an error, but the kill is attempted first.
+        let run = crate::testutil::temp_marker("stopfail-run");
+        let killed = crate::testutil::temp_marker("stopfail-killed");
+        std::fs::write(&run, b"").unwrap();
+        let p = crate::testutil::toml_path(&run);
+        let is_active = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "if exist {p} (exit 0) else (exit 1)"]"#)
+        } else {
+            format!(r#"["test", "-e", "{p}"]"#)
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["false"]
+            is_active_cmd = {is_active}
+            {kill}
+            "#,
+            kill = crate::testutil::stateful_kill_cmd(&run, &killed),
+        )))
+        .unwrap();
+
+        let result = evict(
+            &cfg.resolved_units()[0],
+            &cfg,
+            GpuBackend::default(),
+            EvictMode::HardStop,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(UnitError::Exit { action: "stop", .. })),
+            "{result:?}"
+        );
+        assert!(killed.exists(), "a failed stop must still try kill_cmd");
+        assert!(!run.exists());
+        let _ = std::fs::remove_file(&killed);
     }
 }

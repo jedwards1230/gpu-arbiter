@@ -101,6 +101,19 @@ fn default_yield_timeout_s() -> u64 {
     3
 }
 
+/// Default [`Config::game_exit_grace_s`]: 10s.
+///
+/// Long enough to ride out the claim gaps a real game produces — a launcher
+/// handing off to the game binary, an anti-cheat relaunch, a single scan that
+/// lands between two processes — short enough that tenants come back promptly
+/// once the game is really gone.
+pub const DEFAULT_GAME_EXIT_GRACE_S: u64 = 10;
+
+/// serde default for [`Config::game_exit_grace_s`].
+fn default_game_exit_grace_s() -> u64 {
+    DEFAULT_GAME_EXIT_GRACE_S
+}
+
 /// Default base URL for [`Introspection::Ollama`] when a unit sets no
 /// [`ManagedUnit::ollama_url`] — Ollama's own default listen address.
 pub const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
@@ -239,7 +252,11 @@ pub struct ManagedUnit {
     /// [`crate::units::BusyReply`].
     #[serde(default)]
     pub busy_cmd: Option<ArgvCmd>,
-    /// Optional **cooperative** GPU release, tried before any stop.
+    /// Optional **cooperative** GPU release, tried before any stop — **only**
+    /// when a busy higher-tier tenant preempts this unit
+    /// ([`crate::units::EvictMode::YieldFirst`]). A game launch and a manual
+    /// stop always stop the unit; leaving this unset makes tenant preemption
+    /// stop it too.
     ///
     /// Asks the tenant to let go of the GPU while staying alive. For a
     /// PyTorch-backed ASR service, for example, that can mean flipping a
@@ -492,6 +509,20 @@ pub struct Config {
     #[serde(default = "default_game_priority")]
     pub game_priority: u8,
 
+    /// Seconds the game-claim set must stay **continuously empty** before
+    /// `gaming` ends. Defaults to [`DEFAULT_GAME_EXIT_GRACE_S`] (10).
+    ///
+    /// Without a debounce, one reconcile pass that happened to see no game
+    /// (a launcher handing off to the game binary, a scan between two
+    /// processes) ended gaming on the spot: owed resumes ran and eager units
+    /// were started straight back onto the GPU, only for the next pass to see
+    /// the game again and evict them — a flap per gap. Inside the grace
+    /// window the state stays `gaming` and nothing is resumed or started; a
+    /// claim reappearing resets the window. `0` restores the immediate
+    /// behavior.
+    #[serde(default = "default_game_exit_grace_s")]
+    pub game_exit_grace_s: u64,
+
     // ── detection ──────────────────────────────────────────────────────────
     /// Match `SteamLaunch AppId=` in exec'd cmdlines (covers all Steam games).
     pub detect_steam: bool,
@@ -563,6 +594,7 @@ impl Default for Config {
             bind: default_bind(),
             game_priority: DEFAULT_GAME_PRIORITY,
             yield_timeout_s: default_yield_timeout_s(),
+            game_exit_grace_s: DEFAULT_GAME_EXIT_GRACE_S,
             managed_units: default_managed_units(),
             eviction_timeout_s: 5,
             vram_free_threshold_mb: 2000,
@@ -1177,6 +1209,40 @@ match = "Heroic"
         assert_eq!(
             Config::default().resolved_units()[0].ollama_base_url(),
             DEFAULT_OLLAMA_URL
+        );
+    }
+
+    #[test]
+    fn game_exit_grace_defaults_parses_and_rejects_bad_values() {
+        // Absent from the file and from `Default` alike: 10 seconds.
+        assert_eq!(Config::default().game_exit_grace_s, 10);
+        assert_eq!(Config::from_toml("").unwrap().game_exit_grace_s, 10);
+        // 0 is valid: the pre-debounce immediate behavior.
+        assert_eq!(
+            Config::from_toml("game_exit_grace_s = 0")
+                .unwrap()
+                .game_exit_grace_s,
+            0
+        );
+        assert_eq!(
+            Config::from_toml("game_exit_grace_s = 30")
+                .unwrap()
+                .game_exit_grace_s,
+            30
+        );
+        // Unsigned seconds only: a negative or a string is a parse error.
+        assert!(Config::from_toml("game_exit_grace_s = -1").is_err());
+        assert!(Config::from_toml(r#"game_exit_grace_s = "10s""#).is_err());
+        // A root key, so it is rejected inside a [[managed_units]] table.
+        assert!(
+            Config::from_toml(
+                r#"
+                [[managed_units]]
+                unit = "ollama.service"
+                game_exit_grace_s = 10
+                "#
+            )
+            .is_err()
         );
     }
 }

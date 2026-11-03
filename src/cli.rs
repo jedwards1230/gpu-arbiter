@@ -1057,6 +1057,23 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn check_config_validates_game_exit_grace_s() {
+        let path = unique_temp_path("checkcfg-grace.toml");
+        std::fs::write(&path, "game_exit_grace_s = 0\n").unwrap();
+        assert!(
+            check_config(path.to_str().unwrap())
+                .unwrap()
+                .starts_with("OK: ")
+        );
+        std::fs::write(&path, "game_exit_grace_s = -5\n").unwrap();
+        assert!(matches!(
+            check_config(path.to_str().unwrap()).unwrap_err(),
+            ConfigError::Parse(_)
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ── render_status ────────────────────────────────────────────────────────
 
     /// A literal gaming `/status` payload renders the full human summary.

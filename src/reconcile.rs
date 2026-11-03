@@ -8,16 +8,18 @@
 //! side-effecting parts — the `/proc` scan that *builds* the snapshot, and the
 //! managed-unit drive — are async and integration-tested on a live Linux host.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::classify;
 use crate::config::{Config, ManagedUnit};
 use crate::gpu::{self, GpuBackend};
 use crate::state::{
-    ArbiterState, Claim, EvictionStage, ManualActionError, ReconcileTrigger, State, UnitStatus,
-    read_state, write_state,
+    ArbiterState, Claim, EvictionStage, LastEviction, ManualActionError, ReconcileTrigger, State,
+    UnitStatus, read_state, write_state,
 };
-use crate::units;
+use crate::units::{self, EvictMode};
 
 /// Reconcile-pass errors. Composes the module errors a pass can surface: the
 /// `/proc` scan (and the blocking task that runs it) is the only source that
@@ -251,6 +253,28 @@ pub async fn observe() -> Result<ProcSnapshot, ReconcileError> {
     Ok(ProcSnapshot::default())
 }
 
+/// Where a reconcile pass gets its process snapshot from.
+///
+/// The daemon always uses [`SystemObserver`] (the platform [`observe`]). The
+/// trait exists so tests can drive the claim set — a game appearing, a
+/// one-pass gap, a game ending — without a real game on the host: the
+/// platform scan is the only input to `gaming` and nothing else can produce a
+/// claim. Crate-private on purpose; it is a seam, not an extension point.
+pub(crate) trait Observer: Sync {
+    /// Take one snapshot. Called once at the top of a pass and once more as
+    /// the TOCTOU re-scan before any eager start.
+    async fn observe(&self) -> Result<ProcSnapshot, ReconcileError>;
+}
+
+/// The real observer: the platform process scan ([`observe`]).
+pub(crate) struct SystemObserver;
+
+impl Observer for SystemObserver {
+    async fn observe(&self) -> Result<ProcSnapshot, ReconcileError> {
+        observe().await
+    }
+}
+
 /// Run one reconcile pass: observe → compute claims → resolve state → drive the
 /// managed units (evict each on `available → gaming`; verified restart on
 /// `gaming → available`).
@@ -299,8 +323,21 @@ pub async fn observe() -> Result<ProcSnapshot, ReconcileError> {
 // Splitting it to satisfy the line-count threshold would scatter that context
 // across several near-private helpers for no readability win; kept as one
 // function deliberately.
-#[allow(clippy::too_many_lines)]
 pub async fn reconcile(
+    state: &Arc<RwLock<ArbiterState>>,
+    cfg: &Config,
+    presence: &crate::presence::PresenceMonitor,
+    trigger: ReconcileTrigger,
+    backend: GpuBackend,
+) -> Result<(), ReconcileError> {
+    reconcile_with(&SystemObserver, state, cfg, presence, trigger, backend).await
+}
+
+/// [`reconcile`] with an explicit [`Observer`] — the test seam. See
+/// [`reconcile`] for the behavior.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn reconcile_with<O: Observer>(
+    observer: &O,
     state: &Arc<RwLock<ArbiterState>>,
     cfg: &Config,
     presence: &crate::presence::PresenceMonitor,
@@ -333,11 +370,11 @@ pub async fn reconcile(
         ReconcileTrigger::ManualStart { unit, reply } => {
             // Never start a managed unit into a live game — the same invariant
             // startup reconciliation enforces applies to a manual start.
-            // Eviction is edge-triggered (it fires on the available → gaming
-            // TRANSITION, not on the gaming level), so a unit started here
-            // mid-game would NOT be re-evicted by the next pass — it would sit
-            // on the GPU alongside the game until the game exited. Rejecting is
-            // the only behavior consistent with "gaming wins the GPU". The
+            // A unit started here mid-game would only be stopped again by the
+            // next pass's gaming invariant, after sitting on the GPU next to
+            // the game in between. Rejecting is the only behavior consistent
+            // with "gaming wins the GPU", and it holds through the exit grace
+            // too, since `state` stays `Gaming` there. The
             // rejection is typed (`GpuHeldByGame` → HTTP 409, distinct from a
             // 500 start failure) and leaves any manual hold in place — nothing
             // about the unit changed.
@@ -363,9 +400,9 @@ pub async fn reconcile(
                             tracing::info!(unit = %unit, "manual unit start");
                             guard.metrics.record_unit_restart(&unit);
                         } else {
-                            // Already running — typically a manual stop that
-                            // *yielded* (the tenant parked, the process stayed
-                            // up). Nothing was started, so no restart is
+                            // Already running — a stop that failed, or a start
+                            // from outside the daemon. Nothing was started, so
+                            // no restart is
                             // counted. The resume is NOT forced here: the stop
                             // already recorded it in `needs_resume`, and the
                             // resume step below runs it now that the hold is
@@ -397,18 +434,34 @@ pub async fn reconcile(
             {
                 let mut guard = write_state(state);
                 guard.held.insert(unit.clone());
-                // A manual stop may yield rather than stop; either way the
-                // unit needs a resume once it is allowed to run again.
+                // A stopped tenant may still carry a park flag from an earlier
+                // tenant preemption, so it owes a resume once it is allowed to
+                // run again (`evict_one` records this too; inserting it before
+                // the eviction keeps it owed even if resolving the unit fails).
                 guard.needs_resume.insert(unit.clone());
             }
-            let result = units::evict_by_name(cfg, backend, &unit).await;
-            // Record before the reply match below consumes `result` — a
-            // manual stop is still an eviction event and must be counted like
-            // any other (see `units::eviction_metric_outcome`'s docs on why
-            // `AlreadyClear` is excluded).
-            if let Some(outcome) = units::eviction_metric_outcome(&result) {
-                write_state(state).metrics.record_eviction(&unit, outcome);
-            }
+            // HardStop: an operator hold means "off the GPU", so the service is
+            // really stopped rather than parked (a parked tenant keeps several
+            // GB resident; see `EvictMode`). `evict_one` counts it like any
+            // other eviction (see `units::eviction_metric_outcome` on why
+            // `AlreadyClear` is excluded) and logs the VRAM around it.
+            let result = match units::resolve_unit(cfg, &unit) {
+                Ok(u) => {
+                    let vram_before = vram_used_mb(backend).await;
+                    evict_one(
+                        state,
+                        cfg,
+                        backend,
+                        u,
+                        EvictMode::HardStop,
+                        "manual stop",
+                        vram_before,
+                    )
+                    .await
+                    .0
+                }
+                Err(e) => Err(e),
+            };
             match result {
                 Ok(outcome) => {
                     tracing::info!(unit = %unit, ?outcome, "manual unit stop (held)");
@@ -424,21 +477,88 @@ pub async fn reconcile(
     }
 
     // Slow, off-lock: scan /proc.
-    let snap = observe().await?;
+    let snap = observer.observe().await?;
     let claims = claim_set(&snap, cfg);
+
+    // Brief lock: decide (with the game-exit debounce), record the fresh claim
+    // set, and snapshot what the busy probes below need, so no shell-out runs
+    // under the lock.
+    let (current, desired, held) = {
+        let mut guard = write_state(state);
+        let current = guard.state;
+        let from_claims = ArbiterState::resolve_state(&claims);
+        let pending_before = guard.game_exit_pending_since;
+        let desired = debounce_game_exit(
+            current,
+            from_claims,
+            &mut guard.game_exit_pending_since,
+            Duration::from_secs(cfg.game_exit_grace_s),
+            Instant::now(),
+        );
+        match (pending_before, guard.game_exit_pending_since) {
+            (None, Some(_)) => tracing::info!(
+                grace_s = cfg.game_exit_grace_s,
+                "no game claims; holding `gaming` for the exit grace before restoring tenants"
+            ),
+            (Some(_), None) if from_claims == State::Gaming => {
+                tracing::info!("a game claim reappeared inside the exit grace; staying `gaming`");
+            }
+            (Some(_), None) => tracing::info!(
+                grace_s = cfg.game_exit_grace_s,
+                "game exit grace elapsed with no claims; leaving `gaming`"
+            ),
+            _ => {}
+        }
+        guard.claims.clone_from(&claims);
+        tracing::debug!(
+            trigger = trigger_label,
+            from = ?current,
+            to = ?desired,
+            claims = guard.claims.len(),
+            "reconcile"
+        );
+        (current, desired, guard.held.clone())
+    };
 
     // Which tenants currently have work. A busy tenant demands the GPU at its
     // own priority and preempts every strictly-lower tier; see
     // [`effective_demand`] and [`preempted_units`]. Probed off-lock, like every
     // other shell-out here. Units without a `busy_cmd` are never busy, so a
     // config that uses no priorities does zero extra work per pass.
+    //
+    // Only a unit that could actually be doing work is asked: a held unit is
+    // off by the operator's order, and a unit confirmed stopped has no work in
+    // flight. Asking them anyway was actively harmful — a probe that "fails
+    // toward busy" when its service is unreachable (ComfyUI's gate does) made
+    // a stopped tenant demand the GPU and kept a lower tier preempted with
+    // nothing running above it. An `is_running` probe that fails ("couldn't
+    // tell") still asks `busy_cmd`, as before.
+    //
+    // The run states probed here are reused below (tenant preemption, the
+    // gaming invariant) — they are taken before this pass acts on any unit.
+    let mut running_now: HashMap<&str, Option<bool>> = HashMap::new();
     let mut busy: Vec<&ManagedUnit> = Vec::new();
     for u in cfg.resolved_units() {
+        if u.busy_cmd.is_none() || held.contains(&u.unit) {
+            continue;
+        }
+        let running = units::is_running(u).await.ok();
+        running_now.insert(u.unit.as_str(), running);
+        if running == Some(false) {
+            continue;
+        }
         if units::is_busy(u).await {
             busy.push(u);
         }
     }
-    let demand = effective_demand(&claims, cfg, &busy);
+    let mut demand = effective_demand(&claims, cfg, &busy);
+    if desired == State::Gaming {
+        // Inside the exit grace the claim set is empty but the game still owns
+        // the GPU, so it keeps demanding at `game_priority` — otherwise the
+        // gaming invariant below would stop defending "freed" exactly while
+        // the game may be relaunching.
+        demand = demand.max(Some(cfg.game_priority));
+    }
     let preempted = preempted_units(cfg, demand);
     if !preempted.is_empty() {
         tracing::debug!(
@@ -449,23 +569,6 @@ pub async fn reconcile(
         );
     }
 
-    // Brief lock: decide, record the fresh claim set, snapshot the current state
-    // so we can pick an Ollama action without holding the lock.
-    let (current, desired) = {
-        let mut guard = write_state(state);
-        let desired = ArbiterState::resolve_state(&claims);
-        let current = guard.state;
-        guard.claims = claims;
-        tracing::debug!(
-            trigger = trigger_label,
-            from = ?current,
-            to = ?desired,
-            claims = guard.claims.len(),
-            "reconcile"
-        );
-        (current, desired)
-    };
-
     match unit_action(current, desired) {
         UnitAction::Evict => {
             // available → gaming: announce `evicting` first (brief lock) so remote
@@ -473,19 +576,23 @@ pub async fn reconcile(
             // the lock DROPPED so `/status` stays responsive across the whole kill
             // window. Gaming wins unconditionally even if one unit errors.
             //
+            // HardStop, never the cooperative yield: a parked tenant keeps its
+            // process and several GB of VRAM with it, and on Windows nothing can
+            // even observe that. "Freed" for a game is the unit not running.
+            //
             // `preempted` is NOT the tenant-ladder-only set here, which is easy to
-            // misread. We are on the `available → gaming` edge, so `claims` is
-            // non-empty, so `effective_demand` returned at least
-            // `cfg.game_priority` — and `preempted_units` therefore selected every
-            // unit below that. With stock config (all units 50, game 100) that is
-            // literally every unit.
+            // misread. We are on the `available → gaming` edge, so the game
+            // demands at least `cfg.game_priority` — and `preempted_units`
+            // therefore selected every unit below that. With stock config (all
+            // units 50, game 100) that is literally every unit.
             //
             // A unit that survives here is one an operator deliberately placed at
             // or above `game_priority`, which is a supported configuration, not a
             // leak: see `a_tenant_above_game_priority_survives_a_game`. Passing
             // `cfg.resolved_units()` instead would silently delete that ability.
             write_state(state).set_state(State::Evicting);
-            let any_eviction_failed = evict_units(state, cfg, backend, &preempted).await;
+            let any_eviction_failed =
+                evict_units(state, cfg, backend, &preempted, EvictMode::HardStop, "game").await;
             if any_eviction_failed {
                 // Visibility only — gaming still wins the GPU unconditionally
                 // below. A wedged tenant may still hold VRAM even though `state`
@@ -501,12 +608,13 @@ pub async fn reconcile(
             guard.set_state(State::Gaming);
         }
         UnitAction::Restart => {
-            // gaming → available (verified: the snapshot above was clean). Settle
-            // the state; the ensure-running post-step below brings the eager units
-            // back. Units are never started in this branch — the post-step
-            // subsumes it (the edge is reached only after a clean scan, and the
-            // post-step's `desired == Available` guard is the same "GPU is free"
-            // condition), so both paths share one idempotent code path.
+            // gaming → available (verified: the snapshot above was clean, and
+            // has stayed clean for `game_exit_grace_s`). Settle the state; the
+            // ensure-running post-step below brings the eager units back. Units
+            // are never started in this branch — the post-step subsumes it (the
+            // edge is reached only after a clean scan, and the post-step's
+            // `desired == Available` guard is the same "GPU is free" condition),
+            // so both paths share one idempotent code path.
             //
             // Leaving `gaming` clears any eviction-degraded flag from the prior
             // session — it was scoped to that eviction, and it's moot once the
@@ -521,11 +629,55 @@ pub async fn reconcile(
             // Clear `degraded` only once we've settled cleanly back to
             // `available` — while still `gaming`, a prior pass's degraded flag
             // must persist across the steady-state passes in between.
-            let mut guard = write_state(state);
-            if desired == State::Available {
-                guard.degraded = false;
+            {
+                let mut guard = write_state(state);
+                if desired == State::Available {
+                    guard.degraded = false;
+                }
+                guard.set_state(desired);
             }
-            guard.set_state(desired);
+
+            // ── Gaming invariant: keep the GPU freed, not just freed once ──
+            //
+            // Eviction is edge-triggered, so without this a preempted unit that
+            // came back mid-game — its service manager restarting it (WinSW
+            // `onfailure`, systemd `Restart=`), an operator or script starting
+            // it outside the daemon — would sit on the GPU next to the game
+            // until the game exited. Every steady `gaming` pass (including the
+            // exit grace) re-checks the preempted units and hard-stops any
+            // that is running again. Reuses this pass's busy-stage probes;
+            // other units cost one `is_running` each.
+            if current == State::Gaming && desired == State::Gaming {
+                let mut came_back: Vec<&ManagedUnit> = Vec::new();
+                for u in &preempted {
+                    let running = match running_now.get(u.unit.as_str()) {
+                        Some(r) => *r,
+                        None => units::is_running(u).await.ok(),
+                    };
+                    if running == Some(true) {
+                        came_back.push(*u);
+                    }
+                }
+                if !came_back.is_empty() {
+                    let names: Vec<&str> = came_back.iter().map(|u| u.unit.as_str()).collect();
+                    tracing::warn!(
+                        units = ?names,
+                        "gaming invariant: a preempted unit is running again during gaming; hard-stopping it"
+                    );
+                    if evict_units(
+                        state,
+                        cfg,
+                        backend,
+                        &came_back,
+                        EvictMode::HardStop,
+                        "gaming invariant",
+                    )
+                    .await
+                    {
+                        write_state(state).degraded = true;
+                    }
+                }
+            }
         }
     }
 
@@ -573,7 +725,12 @@ pub async fn reconcile(
                 // Only evict what is actually up — `evict` already reports
                 // AlreadyClear for a stopped unit, but skipping avoids a
                 // shell-out per already-stopped tenant on every 2 s pass.
-                if units::is_running(u).await.unwrap_or(true) {
+                // Reuses the busy stage's probe where there was one.
+                let running = match running_now.get(u.unit.as_str()) {
+                    Some(r) => *r,
+                    None => units::is_running(u).await.ok(),
+                };
+                if running.unwrap_or(true) {
                     v.push(*u);
                 }
             }
@@ -585,7 +742,18 @@ pub async fn reconcile(
                 units = still_up.len(),
                 "preempting lower-priority tenants for a busy higher tier"
             );
-            let _ = evict_units(state, cfg, backend, &still_up).await;
+            // YieldFirst: the one place the cooperative yield is used. Saving a
+            // lower tenant's in-flight work is worth its residual footprint
+            // when the GPU goes to another tenant rather than a game.
+            let _ = evict_units(
+                state,
+                cfg,
+                backend,
+                &still_up,
+                EvictMode::YieldFirst,
+                "tenant preemption",
+            )
+            .await;
         }
     }
 
@@ -656,7 +824,7 @@ pub async fn reconcile(
             // timer) retries and self-heals either way. `scan_proc` is a cheap
             // `/proc` walk, so this is only paid when there's actually
             // something to start.
-            let fresh = observe().await?;
+            let fresh = observer.observe().await?;
             if ensure_running_toctou_clear(&claim_set(&fresh, cfg)) {
                 for u in to_start {
                     if let Err(e) = units::start(u).await {
@@ -687,10 +855,10 @@ pub async fn reconcile(
 /// running. Returns `Ok(true)` if `start_cmd` ran, `Ok(false)` if the unit was
 /// already up and was left alone.
 ///
-/// The already-running check matters for a unit with a `yield_cmd`: a manual
-/// stop of such a unit may *yield* (the tenant parks, its process stays up), so
-/// the unit is still running when the operator starts it again. Running
-/// `start_cmd` anyway is not idempotent everywhere — Windows `sc.exe start`
+/// The already-running check matters for a held unit that is nonetheless up —
+/// its stop failed, or something outside the daemon started it (before
+/// v0.14.0, also a manual stop that merely *yielded*). Running `start_cmd`
+/// anyway is not idempotent everywhere — Windows `sc.exe start`
 /// exits non-zero (error 1056) on a running service — and a failed start keeps
 /// the hold, which in turn keeps `resume_cmd` from ever running.
 ///
@@ -724,73 +892,168 @@ async fn manual_start(cfg: &Config, unit: &str) -> Result<bool, units::UnitError
     }
 }
 
-/// Evict every managed unit, in order, for an `available → gaming` transition.
+/// Evict `targets`, in order, under `mode`. Used by the `available → gaming`
+/// edge and the gaming invariant ([`EvictMode::HardStop`]) and by tenant
+/// preemption ([`EvictMode::YieldFirst`]); `reason` only labels the logs.
 /// Gaming wins the GPU unconditionally regardless of outcome (each failure is
-/// logged here) — this only reports whether **any** unit failed, which feeds
-/// the `degraded` visibility flag. Pulled out of [`reconcile`] as its own
-/// function so the "did anything fail" decision is unit-testable without
-/// needing a real game claim to reach the `Evict` branch (macOS/CI `observe`
-/// is stubbed empty, so nothing ever resolves to `Gaming` there).
+/// logged in [`evict_one`]) — this only reports whether **any** unit failed,
+/// which feeds the `degraded` visibility flag.
 ///
-/// Also records each unit's eviction outcome into
-/// [`crate::state::Metrics::record_eviction`] — one brief write-lock
-/// acquisition per unit, interleaved with the (already sequential, already
-/// slow) per-unit `units::evict` shell-outs, so it adds no new contention
-/// pattern over what this loop already had.
+/// Total VRAM is read once before the first unit and once after each unit that
+/// was actually evicted, so a batch of `n` costs at most `n + 1` GPU queries:
+/// each unit's "after" is the next unit's "before".
 async fn evict_units(
     state: &Arc<RwLock<ArbiterState>>,
     cfg: &Config,
     backend: GpuBackend,
     targets: &[&ManagedUnit],
+    mode: EvictMode,
+    reason: &'static str,
 ) -> bool {
     let mut any_failed = false;
+    let mut vram = vram_used_mb(backend).await;
     for u in targets {
-        let (result, timings) = units::evict_timed(u, cfg, backend).await;
-        {
-            // One lock for both the outcome counter and the duration samples,
-            // rather than reacquiring per metric.
-            let mut guard = write_state(state);
-            // Any eviction attempt may have sent `yield_cmd` (or stopped a
-            // tenant whose park flag outlives the process), so the unit owes a
-            // resume the next time it is eligible to run. Recorded for every
-            // outcome, errors included: an extra idempotent resume is cheap, a
-            // missed one leaves the tenant parked.
-            guard.needs_resume.insert(u.unit.clone());
-            if let Some(outcome) = units::eviction_metric_outcome(&result) {
-                guard.metrics.record_eviction(&u.unit, outcome);
-            }
-            // A no-op eviction (nothing was running) is excluded from durations
-            // for the same reason it is excluded from the outcome counter: a
-            // pile of ~0s samples from steady-state passes would drag every
-            // quantile toward zero and make the timeouts look far more generous
-            // than they are.
-            if !matches!(result, Ok(units::EvictionOutcome::AlreadyClear)) {
-                if let Some(s) = timings.yield_secs {
-                    guard
-                        .metrics
-                        .record_eviction_duration(&u.unit, EvictionStage::Yield, s);
-                }
-                if let Some(s) = timings.stop_secs {
-                    guard
-                        .metrics
-                        .record_eviction_duration(&u.unit, EvictionStage::Stop, s);
-                }
-                guard.metrics.record_eviction_duration(
-                    &u.unit,
-                    EvictionStage::Total,
-                    timings.total_secs,
-                );
-            }
-        }
-        match result {
-            Ok(outcome) => tracing::info!(unit = %u.unit, ?outcome, "evicted unit for gaming"),
-            Err(e) => {
-                any_failed = true;
-                tracing::error!(unit = %u.unit, error = %e, "unit eviction errored; proceeding (gaming wins)");
-            }
-        }
+        let (result, vram_after) = evict_one(state, cfg, backend, u, mode, reason, vram).await;
+        any_failed |= result.is_err();
+        vram = vram_after;
     }
     any_failed
+}
+
+/// Total GPU VRAM in use (MiB), best effort: `None` when the query fails (no
+/// GPU tool, a timeout). For the eviction logs only.
+async fn vram_used_mb(backend: GpuBackend) -> Option<u64> {
+    backend.query_memory().await.ok().map(|m| m.used_mb)
+}
+
+/// Evict one unit under `mode` and record everything about it: the outcome
+/// counter, the stage durations, the owed resume, `/status`
+/// `units[].last_eviction`, and one log line carrying the unit, mode, outcome
+/// and total VRAM before/after. Returns the eviction result and the VRAM
+/// reading after it (`vram_before` unchanged for a no-op eviction, which
+/// skips the query).
+///
+/// Total VRAM is the whole device — on the game edge it includes the game
+/// loading concurrently — so the before/after pair is a diagnostic, not a gate.
+async fn evict_one(
+    state: &Arc<RwLock<ArbiterState>>,
+    cfg: &Config,
+    backend: GpuBackend,
+    u: &ManagedUnit,
+    mode: EvictMode,
+    reason: &'static str,
+    vram_before: Option<u64>,
+) -> (
+    Result<units::EvictionOutcome, units::UnitError>,
+    Option<u64>,
+) {
+    let (result, timings) = units::evict_timed(u, cfg, backend, mode).await;
+    let no_op = matches!(result, Ok(units::EvictionOutcome::AlreadyClear));
+    let vram_after = if no_op {
+        vram_before
+    } else {
+        vram_used_mb(backend).await
+    };
+    let metric_outcome = units::eviction_metric_outcome(&result);
+    {
+        // One lock for every bookkeeping write, rather than reacquiring per
+        // metric.
+        let mut guard = write_state(state);
+        // Any eviction attempt may leave a park flag behind (a yield, or a
+        // stopped tenant whose flag outlives the process), so the unit owes a
+        // resume the next time it is eligible to run. Recorded for every
+        // outcome, errors included: an extra idempotent resume is cheap, a
+        // missed one leaves the tenant parked.
+        guard.needs_resume.insert(u.unit.clone());
+        if let Some(outcome) = metric_outcome {
+            guard.metrics.record_eviction(&u.unit, outcome);
+            guard.last_evictions.insert(
+                u.unit.clone(),
+                LastEviction {
+                    mode: mode.label().to_string(),
+                    outcome: outcome.label().to_string(),
+                    at: crate::state::format_rfc3339(std::time::SystemTime::now()),
+                },
+            );
+        }
+        // A no-op eviction (nothing was running) is excluded from durations
+        // for the same reason it is excluded from the outcome counter: a
+        // pile of ~0s samples from steady-state passes would drag every
+        // quantile toward zero and make the timeouts look far more generous
+        // than they are.
+        if !no_op {
+            if let Some(s) = timings.yield_secs {
+                guard
+                    .metrics
+                    .record_eviction_duration(&u.unit, EvictionStage::Yield, s);
+            }
+            if let Some(s) = timings.stop_secs {
+                guard
+                    .metrics
+                    .record_eviction_duration(&u.unit, EvictionStage::Stop, s);
+            }
+            guard.metrics.record_eviction_duration(
+                &u.unit,
+                EvictionStage::Total,
+                timings.total_secs,
+            );
+        }
+    }
+    let outcome_label = metric_outcome.map_or("already_clear", units::EvictionMetricOutcome::label);
+    match &result {
+        Ok(_) => tracing::info!(
+            unit = %u.unit,
+            mode = mode.label(),
+            reason,
+            outcome = outcome_label,
+            vram_before_mb = ?vram_before,
+            vram_after_mb = ?vram_after,
+            elapsed_s = timings.total_secs,
+            "evicted unit"
+        ),
+        Err(e) => tracing::error!(
+            unit = %u.unit,
+            mode = mode.label(),
+            reason,
+            outcome = outcome_label,
+            vram_before_mb = ?vram_before,
+            vram_after_mb = ?vram_after,
+            error = %e,
+            "unit eviction errored"
+        ),
+    }
+    (result, vram_after)
+}
+
+/// The game-exit debounce ([`Config::game_exit_grace_s`]). **Pure** —
+/// unit-tested. Given the state at the top of the pass and the state the
+/// fresh claim set resolves to, return the state this pass should act on,
+/// updating `pending_since` (when the claim set was first seen empty while
+/// gaming).
+///
+/// Only the `gaming → available` direction is debounced: a game appearing is
+/// acted on at once, and a claim reappearing resets the window. While the
+/// window is open the result stays [`State::Gaming`], which keeps every
+/// downstream gate (resume, ensure-running, manual-start rejection, `/status`)
+/// on the gaming side. A zero `grace` returns `observed` unchanged.
+fn debounce_game_exit(
+    current: State,
+    observed: State,
+    pending_since: &mut Option<Instant>,
+    grace: Duration,
+    now: Instant,
+) -> State {
+    if observed != State::Available || current == State::Available {
+        *pending_since = None;
+        return observed;
+    }
+    let since = *pending_since.get_or_insert(now);
+    if now.saturating_duration_since(since) >= grace {
+        *pending_since = None;
+        State::Available
+    } else {
+        State::Gaming
+    }
 }
 
 /// The eager units the ensure-running post-step should bring up this pass. **Pure**
@@ -935,14 +1198,14 @@ async fn refresh_substate(
     // isn't restarting (see ArbiterState::held / ensure_running_targets). The
     // previous pass's model-query errors ride along so a failing query is
     // logged on its transitions, not on every 2 s pass.
-    let (held, prior_models_errors) = {
+    let (held, prior_models_errors, last_evictions) = {
         let guard = read_state(state);
-        let prior: std::collections::HashMap<String, Option<String>> = guard
+        let prior: HashMap<String, Option<String>> = guard
             .units
             .iter()
             .map(|u| (u.unit.clone(), u.models_error.clone()))
             .collect();
-        (guard.held.clone(), prior)
+        (guard.held.clone(), prior, guard.last_evictions.clone())
     };
 
     // Each unit's substate is queried CONCURRENTLY, not serially: a serial
@@ -959,6 +1222,7 @@ async fn refresh_substate(
         let compute = &compute;
         let held = &held;
         let prior_models_errors = &prior_models_errors;
+        let last_evictions = &last_evictions;
         async move {
             // Tristate: a failed is-active check is "couldn't tell", not
             // a confirmed `false` — logged here (the one place this query
@@ -1018,6 +1282,7 @@ async fn refresh_substate(
                 models_error,
                 vram_mb,
                 held: held.contains(&u.unit),
+                last_eviction: last_evictions.get(&u.unit).cloned(),
             }
         }
     });
@@ -1179,13 +1444,22 @@ mod tests {
         assert!(claims.contains(&Claim::Pattern("heroic".into())));
     }
 
-    // ── reconcile orchestration (macOS: observe() yields an empty snapshot, so
-    //    claim_set is empty; the systemctl/nvidia-smi shell-outs fail-soft) ──
+    // ── reconcile orchestration (driven through `reconcile_with` and a
+    //    `FakeObserver`, so a game running on the test host — Steam is common on
+    //    a Linux dev box — cannot leak a claim into these tests; the
+    //    systemctl/nvidia-smi shell-outs fail-soft) ──
 
     /// Wrap a state in the shared `Arc<RwLock>` `reconcile` takes, mirroring the
     /// daemon's real wiring.
     fn shared(state: ArbiterState) -> Arc<RwLock<ArbiterState>> {
         Arc::new(RwLock::new(state))
+    }
+
+    /// A `game_exit_pending_since` far enough in the past that the default
+    /// `game_exit_grace_s` (10 s) has elapsed — for tests that model a game
+    /// that is already gone, not the debounce itself.
+    fn grace_elapsed() -> Option<Instant> {
+        Instant::now().checked_sub(Duration::from_secs(60))
     }
 
     #[tokio::test]
@@ -1196,9 +1470,12 @@ mod tests {
         let cfg = Config::default();
         let mut s = ArbiterState::new();
         s.state = State::Gaming;
+        // The game left long enough ago that the exit grace has elapsed.
+        s.game_exit_pending_since = grace_elapsed();
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1232,7 +1509,8 @@ mod tests {
         .unwrap();
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1280,7 +1558,8 @@ mod tests {
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
         let start = std::time::Instant::now();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1310,7 +1589,8 @@ mod tests {
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(1_700_000_000);
         presence.record_input(1_700_000_500);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1340,7 +1620,8 @@ mod tests {
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1378,7 +1659,8 @@ mod tests {
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1409,7 +1691,8 @@ mod tests {
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1444,7 +1727,8 @@ mod tests {
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1481,7 +1765,8 @@ mod tests {
         let presence = crate::presence::PresenceMonitor::new(0);
 
         let state = shared(ArbiterState::new());
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1493,7 +1778,8 @@ mod tests {
         assert_eq!(read_state(&state).metrics.reconcile_passes.timer, 1);
 
         let state = shared(ArbiterState::new());
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1505,7 +1791,8 @@ mod tests {
         assert_eq!(read_state(&state).metrics.reconcile_passes.proc_event, 1);
 
         let state = shared(ArbiterState::new());
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1519,7 +1806,8 @@ mod tests {
         // Both manual variants bucket to `manual`.
         let state = shared(ArbiterState::new());
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1542,7 +1830,8 @@ mod tests {
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1566,7 +1855,8 @@ mod tests {
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1603,7 +1893,8 @@ mod tests {
         // 1. Manual stop → holds the unit (AlreadyClear since it already reports
         //    stopped; the hold is set unconditionally regardless of outcome).
         let (tx, rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1628,7 +1919,8 @@ mod tests {
         // 2. A Timer-triggered reconcile pass — including the periodic backstop —
         //    must NOT restart the held unit even though it still looks stopped
         //    and is otherwise eager_restart = true.
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1655,7 +1947,8 @@ mod tests {
 
         // Hold it first (as above).
         let (tx, rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1672,7 +1965,8 @@ mod tests {
 
         // A manual start clears the hold AND starts the unit (via the same call).
         let (tx, rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1716,7 +2010,8 @@ mod tests {
         let presence = crate::presence::PresenceMonitor::new(0);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1761,7 +2056,8 @@ mod tests {
         let presence = crate::presence::PresenceMonitor::new(0);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -1815,7 +2111,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        p.push(uniq);
+        // No parentheses: markers are also interpolated into `sh -c` /
+        // `cmd /c` strings, and both shells would parse `ThreadId(N)`.
+        p.push(uniq.replace(['(', ')'], "-"));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -1846,9 +2144,16 @@ mod tests {
 
     async fn pass(state: &Arc<RwLock<ArbiterState>>, cfg: &Config, trigger: ReconcileTrigger) {
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(state, cfg, &presence, trigger, GpuBackend::default())
-            .await
-            .unwrap();
+        reconcile_with(
+            &FakeObserver { game: false },
+            state,
+            cfg,
+            &presence,
+            trigger,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
     }
 
     /// Did `marker` get touched since the last call? Consumes the marker.
@@ -1895,26 +2200,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_start_after_yielding_stop_resumes_without_start_cmd() {
-        // v0.13.0 bug: a manual stop that yielded left the unit running+held;
-        // the following manual start ran start_cmd anyway (sc.exe: error 1056,
+    async fn manual_start_on_running_held_unit_skips_start_and_resumes() {
+        // v0.13.0 bug: a held unit that was still running (then: a manual stop
+        // that yielded; now: a stop that failed, or a start from outside the
+        // daemon) got start_cmd anyway on the manual start (sc.exe: error 1056,
         // HTTP 500), kept the hold, and resume_cmd never ran — parked forever.
         let start_marker = marker_path("yield-start-start");
         let resume_marker = marker_path("yield-start-resume");
         let cfg = yielding_cfg(&start_marker, &resume_marker);
-        let state = shared(ArbiterState::new());
-
-        assert_eq!(manual(&state, &cfg, false).await, Ok(()));
-        {
-            let g = read_state(&state);
-            assert!(
-                g.metrics.evictions["fake.service"].yielded >= 1,
-                "fixture must yield"
-            );
-            assert!(g.held.contains("fake.service"));
-            assert_eq!(g.units[0].running, Some(true), "a yield leaves it running");
-        }
-        assert!(!take_marker(&resume_marker), "no resume while held");
+        let mut initial = ArbiterState::new();
+        initial.held.insert("fake.service".to_string());
+        initial.needs_resume.insert("fake.service".to_string());
+        let state = shared(initial);
 
         assert_eq!(manual(&state, &cfg, true).await, Ok(()));
         assert!(
@@ -1938,6 +2235,64 @@ mod tests {
         pass(&state, &cfg, ReconcileTrigger::Timer).await;
         assert!(!take_marker(&resume_marker), "resume_cmd runs exactly once");
         assert!(!take_marker(&start_marker));
+    }
+
+    #[tokio::test]
+    async fn manual_stop_hard_stops_a_yielding_unit_and_manual_start_resumes_it() {
+        // An operator hold means "off the GPU": the service is stopped, never
+        // parked, even though it has a working yield. The later manual start
+        // starts it again and runs the owed resume_cmd in the same pass.
+        let run = marker_path("hold-run");
+        let yielded = marker_path("hold-yield");
+        let resume = marker_path("hold-resume");
+        std::fs::write(&run, b"").unwrap();
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            eviction_timeout_s = 0
+
+            [[managed_units]]
+            unit = "fake.service"
+            {cmds}
+            busy_cmd = "false"
+            yield_cmd = ["touch", "{yielded}"]
+            resume_cmd = ["touch", "{resume}"]
+            "#,
+            cmds = crate::testutil::stateful_unit_cmds(&run),
+            yielded = crate::testutil::toml_path(&yielded),
+            resume = crate::testutil::toml_path(&resume),
+        )))
+        .unwrap();
+        let state = shared(ArbiterState::new());
+
+        assert_eq!(manual(&state, &cfg, false).await, Ok(()));
+        assert!(!run.exists(), "a manual stop must really stop the service");
+        assert!(!take_marker(&yielded), "a manual stop must never yield");
+        assert!(!take_marker(&resume), "no resume while held");
+        {
+            let g = read_state(&state);
+            let ev = &g.metrics.evictions["fake.service"];
+            assert_eq!((ev.yielded, ev.graceful), (0, 1));
+            assert!(g.held.contains("fake.service"));
+            assert_eq!(g.units[0].running, Some(false));
+            let last = g.units[0].last_eviction.as_ref().unwrap();
+            assert_eq!(
+                (last.mode.as_str(), last.outcome.as_str()),
+                ("hard_stop", "graceful")
+            );
+        }
+
+        assert_eq!(manual(&state, &cfg, true).await, Ok(()));
+        assert!(run.exists(), "the manual start must start the service");
+        assert!(take_marker(&resume), "and run the owed resume_cmd");
+        {
+            let g = read_state(&state);
+            assert!(!g.held.contains("fake.service"));
+            assert!(g.needs_resume.is_empty());
+            assert_eq!(g.metrics.unit_restarts["fake.service"], 1);
+        }
+        pass(&state, &cfg, ReconcileTrigger::Timer).await;
+        assert!(!take_marker(&resume), "resume_cmd runs exactly once");
+        let _ = std::fs::remove_file(&run);
     }
 
     #[tokio::test]
@@ -2313,7 +2668,8 @@ mod tests {
         .unwrap();
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -2342,7 +2698,8 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -2371,7 +2728,8 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -2397,7 +2755,8 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -2435,7 +2794,8 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -2470,7 +2830,8 @@ mod tests {
         s.state = State::Available;
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -2493,9 +2854,12 @@ mod tests {
         let cfg = ensure_cfg(false, &marker, true);
         let mut s = ArbiterState::new();
         s.state = State::Gaming;
+        // The game left long enough ago that the exit grace has elapsed.
+        s.game_exit_pending_since = grace_elapsed();
         let state = shared(s);
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -2871,7 +3235,9 @@ mod tests {
                 &state,
                 &cfg,
                 GpuBackend::default(),
-                &cfg.resolved_units().iter().collect::<Vec<_>>()
+                &cfg.resolved_units().iter().collect::<Vec<_>>(),
+                EvictMode::HardStop,
+                "test",
             )
             .await
         );
@@ -2898,7 +3264,9 @@ mod tests {
                 &state,
                 &cfg,
                 GpuBackend::default(),
-                &cfg.resolved_units().iter().collect::<Vec<_>>()
+                &cfg.resolved_units().iter().collect::<Vec<_>>(),
+                EvictMode::HardStop,
+                "test",
             )
             .await
         );
@@ -2916,11 +3284,14 @@ mod tests {
         // — the wedge, if any, is moot once the game (and gaming state) is gone.
         let mut s = ArbiterState::new();
         s.state = State::Gaming;
+        // The game left long enough ago that the exit grace has elapsed.
+        s.game_exit_pending_since = grace_elapsed();
         s.degraded = true;
         let state = shared(s);
         let cfg = Config::default();
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -2945,7 +3316,8 @@ mod tests {
         let state = shared(s);
         let cfg = Config::default();
         let presence = crate::presence::PresenceMonitor::new(0);
-        reconcile(
+        reconcile_with(
+            &FakeObserver { game: false },
             &state,
             &cfg,
             &presence,
@@ -2986,5 +3358,368 @@ mod tests {
             unit_action(State::Evicting, State::Available),
             UnitAction::None
         );
+    }
+
+    // ── injected claims: the game edge, the exit grace, the invariant ───────
+
+    /// Test observer: a Steam game is running iff `game`.
+    struct FakeObserver {
+        game: bool,
+    }
+
+    impl Observer for FakeObserver {
+        async fn observe(&self) -> Result<ProcSnapshot, ReconcileError> {
+            let procs = if self.game {
+                vec![proc(4242, "reaper SteamLaunch AppId=440 -- /games/tf2")]
+            } else {
+                Vec::new()
+            };
+            Ok(ProcSnapshot { procs })
+        }
+    }
+
+    /// One timer pass with the claim set driven by `game`.
+    async fn pass_seen(state: &Arc<RwLock<ArbiterState>>, cfg: &Config, game: bool) {
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile_with(
+            &FakeObserver { game },
+            state,
+            cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Two marker-backed tenants: a busy-capable `high` (75) and an eager
+    /// `low` (25) with a working cooperative yield. `eviction_timeout_s = 0`
+    /// keeps every stop instant on hosts with no GPU to poll.
+    struct Ladder {
+        cfg: Config,
+        high_run: std::path::PathBuf,
+        low_run: std::path::PathBuf,
+        yielded: std::path::PathBuf,
+        resumed: std::path::PathBuf,
+    }
+
+    fn ladder(tag: &str, high_busy: bool) -> Ladder {
+        let high_run = marker_path(&format!("{tag}-high-run"));
+        let low_run = marker_path(&format!("{tag}-low-run"));
+        let yielded = marker_path(&format!("{tag}-yield"));
+        let resumed = marker_path(&format!("{tag}-resume"));
+        let busy = if high_busy { "true" } else { "false" };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            eviction_timeout_s = 0
+
+            [[managed_units]]
+            unit = "high.service"
+            priority = 75
+            eager_restart = false
+            {high_cmds}
+            busy_cmd = "{busy}"
+
+            [[managed_units]]
+            unit = "low.service"
+            priority = 25
+            {low_cmds}
+            busy_cmd = "false"
+            yield_cmd = ["touch", "{yielded}"]
+            resume_cmd = ["touch", "{resumed}"]
+            "#,
+            high_cmds = crate::testutil::stateful_unit_cmds(&high_run),
+            low_cmds = crate::testutil::stateful_unit_cmds(&low_run),
+            yielded = crate::testutil::toml_path(&yielded),
+            resumed = crate::testutil::toml_path(&resumed),
+        )))
+        .unwrap();
+        std::fs::write(&high_run, b"").unwrap();
+        std::fs::write(&low_run, b"").unwrap();
+        Ladder {
+            cfg,
+            high_run,
+            low_run,
+            yielded,
+            resumed,
+        }
+    }
+
+    impl Drop for Ladder {
+        fn drop(&mut self) {
+            for p in [&self.high_run, &self.low_run, &self.yielded, &self.resumed] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    fn last_eviction(state: &Arc<RwLock<ArbiterState>>, unit: &str) -> (String, String) {
+        let g = read_state(state);
+        let le = g.last_evictions[unit].clone();
+        (le.mode, le.outcome)
+    }
+
+    #[tokio::test]
+    async fn game_eviction_hard_stops_a_unit_with_yield_cmd() {
+        // v0.13.0: the game edge reused the cooperative yield, the parked
+        // tenant kept ~5 GB of CUDA state, and the eviction counted `yielded`.
+        let l = ladder("game-hs", false);
+        let state = shared(ArbiterState::new());
+
+        pass_seen(&state, &l.cfg, true).await;
+        assert_eq!(read_state(&state).state, State::Gaming);
+        assert!(!l.low_run.exists(), "the tenant must really be stopped");
+        assert!(!l.high_run.exists());
+        assert!(!take_marker(&l.yielded), "a game eviction must never yield");
+        {
+            let g = read_state(&state);
+            for unit in ["low.service", "high.service"] {
+                let ev = &g.metrics.evictions[unit];
+                assert_eq!((ev.yielded, ev.graceful), (0, 1), "{unit}");
+            }
+            assert!(g.needs_resume.contains("low.service"));
+        }
+        assert_eq!(
+            last_eviction(&state, "low.service"),
+            ("hard_stop".into(), "graceful".into())
+        );
+        assert!(!take_marker(&l.resumed), "no resume while gaming");
+    }
+
+    #[tokio::test]
+    async fn tenant_preemption_still_yields_first() {
+        let l = ladder("tenant-yield", true);
+        let state = shared(ArbiterState::new());
+
+        pass_seen(&state, &l.cfg, false).await;
+        assert_eq!(read_state(&state).state, State::Available);
+        assert!(take_marker(&l.yielded), "tenant preemption must yield");
+        assert!(l.low_run.exists(), "a yield leaves the tenant running");
+        assert!(l.high_run.exists(), "the busy tier is untouched");
+        let ev = read_state(&state).metrics.evictions["low.service"];
+        assert_eq!((ev.yielded, ev.graceful), (1, 0));
+        assert_eq!(
+            last_eviction(&state, "low.service"),
+            ("yield_first".into(), "yielded".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn game_hard_stops_a_unit_that_tenant_preemption_parked() {
+        // A parked tenant is still running, so the game edge must not read it
+        // as AlreadyClear — it gets stopped like any other.
+        let l = ladder("parked-then-game", true);
+        let state = shared(ArbiterState::new());
+
+        pass_seen(&state, &l.cfg, false).await;
+        assert!(take_marker(&l.yielded));
+        assert!(l.low_run.exists(), "parked, not stopped");
+
+        pass_seen(&state, &l.cfg, true).await;
+        assert!(!l.low_run.exists(), "the game must stop the parked tenant");
+        assert!(!take_marker(&l.yielded), "and must not re-yield it");
+        let ev = read_state(&state).metrics.evictions["low.service"];
+        assert_eq!((ev.yielded, ev.graceful), (1, 1));
+        assert_eq!(
+            last_eviction(&state, "low.service"),
+            ("hard_stop".into(), "graceful".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_gap_inside_the_exit_grace_neither_restarts_nor_resumes() {
+        let l = ladder("grace", false);
+        let state = shared(ArbiterState::new());
+
+        pass_seen(&state, &l.cfg, true).await;
+        assert!(!l.low_run.exists());
+
+        // One pass sees no game (a launcher hand-off, a scan between two
+        // processes). Inside the 10 s default grace: still gaming, nothing
+        // resumed, nothing started.
+        pass_seen(&state, &l.cfg, false).await;
+        {
+            let g = read_state(&state);
+            assert_eq!(g.state, State::Gaming, "/status must stay gaming");
+            assert!(g.game_exit_pending_since.is_some());
+        }
+        assert!(!l.low_run.exists(), "an eager unit must not restart");
+        assert!(!take_marker(&l.resumed), "an owed resume must not run");
+
+        // The game is back: the window resets, and nothing was evicted again
+        // (there was nothing to evict).
+        pass_seen(&state, &l.cfg, true).await;
+        assert!(read_state(&state).game_exit_pending_since.is_none());
+        assert_eq!(
+            read_state(&state).metrics.evictions["low.service"].graceful,
+            1
+        );
+
+        // A gap that outlasts the grace does end gaming: resume, then restart.
+        pass_seen(&state, &l.cfg, false).await;
+        assert_eq!(read_state(&state).state, State::Gaming);
+        write_state(&state).game_exit_pending_since = grace_elapsed();
+        pass_seen(&state, &l.cfg, false).await;
+        {
+            let g = read_state(&state);
+            assert_eq!(g.state, State::Available);
+            assert!(g.game_exit_pending_since.is_none());
+        }
+        assert!(take_marker(&l.resumed), "leaving gaming must resume");
+        assert!(l.low_run.exists(), "and restart the eager unit");
+        assert!(!l.high_run.exists(), "a non-eager unit stays down");
+    }
+
+    #[tokio::test]
+    async fn zero_exit_grace_restores_immediately() {
+        let mut l = ladder("grace-zero", false);
+        l.cfg.game_exit_grace_s = 0;
+        let state = shared(ArbiterState::new());
+
+        pass_seen(&state, &l.cfg, true).await;
+        pass_seen(&state, &l.cfg, false).await;
+        assert_eq!(read_state(&state).state, State::Available);
+        assert!(take_marker(&l.resumed));
+        assert!(l.low_run.exists());
+    }
+
+    #[tokio::test]
+    async fn gaming_invariant_restops_a_unit_that_came_back() {
+        let l = ladder("invariant", false);
+        let state = shared(ArbiterState::new());
+
+        pass_seen(&state, &l.cfg, true).await;
+        assert!(!l.low_run.exists());
+
+        // The service manager (WinSW onfailure, systemd Restart=) or someone
+        // outside the daemon starts it again mid-game.
+        std::fs::write(&l.low_run, b"").unwrap();
+        pass_seen(&state, &l.cfg, true).await;
+        assert!(!l.low_run.exists(), "a steady gaming pass must re-stop it");
+        assert_eq!(read_state(&state).state, State::Gaming);
+        assert_eq!(
+            read_state(&state).metrics.evictions["low.service"].graceful,
+            2
+        );
+
+        // Inside the exit grace the game still owns the GPU, so it holds there
+        // too.
+        pass_seen(&state, &l.cfg, false).await;
+        std::fs::write(&l.high_run, b"").unwrap();
+        pass_seen(&state, &l.cfg, false).await;
+        assert_eq!(read_state(&state).state, State::Gaming);
+        assert!(!l.high_run.exists(), "the invariant holds inside the grace");
+        assert!(!take_marker(&l.yielded), "the invariant never yields");
+    }
+
+    #[tokio::test]
+    async fn busy_probe_skips_held_and_stopped_units() {
+        // `busy_cmd` touches a marker, so a marker that exists means the probe
+        // ran. ComfyUI's gate fails toward busy when the service is down, so a
+        // probe on a stopped or held unit invented demand that preempted a
+        // lower tier with nothing running above it.
+        let held_run = marker_path("busy-held-run");
+        let held_busy = marker_path("busy-held-probe");
+        let stopped_run = marker_path("busy-stopped-run");
+        let stopped_busy = marker_path("busy-stopped-probe");
+        let live_run = marker_path("busy-live-run");
+        let live_busy = marker_path("busy-live-probe");
+        let unit = |name: &str, prio: u8, run: &std::path::Path, probe: &std::path::Path| {
+            format!(
+                r#"
+                [[managed_units]]
+                unit = "{name}"
+                priority = {prio}
+                eager_restart = false
+                {cmds}
+                busy_cmd = ["touch", "{probe}"]
+                "#,
+                cmds = crate::testutil::stateful_unit_cmds(run),
+                probe = crate::testutil::toml_path(probe),
+            )
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            "{}{}{}",
+            unit("held.service", 75, &held_run, &held_busy),
+            unit("stopped.service", 60, &stopped_run, &stopped_busy),
+            unit("live.service", 10, &live_run, &live_busy),
+        )))
+        .unwrap();
+        std::fs::write(&live_run, b"").unwrap();
+        let mut initial = ArbiterState::new();
+        initial.held.insert("held.service".to_string());
+        let state = shared(initial);
+
+        pass_seen(&state, &cfg, false).await;
+        assert!(!take_marker(&held_busy), "a held unit must not be probed");
+        assert!(
+            !take_marker(&stopped_busy),
+            "a stopped unit must not be probed"
+        );
+        assert!(take_marker(&live_busy), "a running unit is still probed");
+        let _ = std::fs::remove_file(&live_run);
+    }
+
+    #[test]
+    fn debounce_game_exit_table() {
+        let grace = Duration::from_secs(10);
+        let t0 = Instant::now();
+        // A game appearing is never delayed, and clears any open window.
+        let mut pending = Some(t0);
+        assert_eq!(
+            debounce_game_exit(State::Available, State::Gaming, &mut pending, grace, t0),
+            State::Gaming
+        );
+        assert_eq!(pending, None);
+
+        // Gaming with no claims: the window opens and gaming holds.
+        assert_eq!(
+            debounce_game_exit(State::Gaming, State::Available, &mut pending, grace, t0),
+            State::Gaming
+        );
+        assert_eq!(pending, Some(t0));
+        let t9 = t0 + Duration::from_secs(9);
+        assert_eq!(
+            debounce_game_exit(State::Gaming, State::Available, &mut pending, grace, t9),
+            State::Gaming
+        );
+        assert_eq!(pending, Some(t0), "the window does not slide");
+
+        // A claim inside the window resets it.
+        assert_eq!(
+            debounce_game_exit(State::Gaming, State::Gaming, &mut pending, grace, t9),
+            State::Gaming
+        );
+        assert_eq!(pending, None);
+
+        // Continuously empty for the full grace: gaming ends.
+        debounce_game_exit(State::Gaming, State::Available, &mut pending, grace, t9);
+        let t19 = t9 + grace;
+        assert_eq!(
+            debounce_game_exit(State::Gaming, State::Available, &mut pending, grace, t19),
+            State::Available
+        );
+        assert_eq!(pending, None);
+
+        // Already available: nothing to debounce.
+        assert_eq!(
+            debounce_game_exit(State::Available, State::Available, &mut pending, grace, t19),
+            State::Available
+        );
+        assert_eq!(pending, None);
+
+        // Zero grace is the old immediate behavior.
+        assert_eq!(
+            debounce_game_exit(
+                State::Gaming,
+                State::Available,
+                &mut pending,
+                Duration::ZERO,
+                t19
+            ),
+            State::Available
+        );
+        assert_eq!(pending, None);
     }
 }

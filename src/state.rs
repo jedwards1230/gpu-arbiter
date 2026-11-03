@@ -5,8 +5,8 @@
 //! agents) code against. They are pure and cross-platform — no Linux-only
 //! imports — so they unit-test on macOS.
 
-use std::collections::HashSet;
-use std::time::SystemTime;
+use std::collections::{HashMap, HashSet};
+use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -111,10 +111,11 @@ pub enum ReconcileTrigger {
     /// into a live game, the same invariant startup reconciliation enforces.
     /// On a successful start, clears any manual hold on `unit` (see
     /// [`ArbiterState::held`]) so the ensure-running post-step resumes
-    /// managing it. A unit that is **already running** (e.g. after a manual
-    /// stop that yielded) is not started again: the hold is cleared, the reply
-    /// is `Ok`, and any resume the stop left owed
-    /// ([`ArbiterState::needs_resume`]) runs in the resume step. The handler awaits `reply` for the outcome.
+    /// managing it. A unit that is **already running** (started outside the
+    /// daemon, or one whose stop failed) is not started again: the hold is
+    /// cleared and the reply is `Ok`. Either way, any resume the stop left owed
+    /// ([`ArbiterState::needs_resume`]) runs in the resume step of the same
+    /// pass. The handler awaits `reply` for the outcome.
     ManualStart {
         /// The managed unit to start (already validated by the HTTP handler
         /// against [`crate::config::Config::resolved_units`]).
@@ -124,7 +125,9 @@ pub enum ReconcileTrigger {
         /// a `409` rejection from a `500` failure).
         reply: oneshot::Sender<Result<(), ManualActionError>>,
     },
-    /// `POST /units/{unit}/stop`: evict `unit` now via its supervisor, and
+    /// `POST /units/{unit}/stop`: **hard-stop** `unit` now via its supervisor
+    /// ([`crate::units::EvictMode::HardStop`] — no cooperative yield, so the
+    /// service really stops and frees its VRAM), and
     /// add it to the manually-held set (see
     /// [`ArbiterState::held`]) so the ensure-running post-step — including the
     /// very next reconcile pass, even the periodic backstop timer — doesn't
@@ -206,6 +209,25 @@ pub struct UnitStatus {
     /// not restart it even when the GPU is free (see [`ArbiterState::held`]).
     /// Cleared by a manual start on the same unit, or a daemon restart.
     pub held: bool,
+    /// The most recent eviction of this unit that actually did something
+    /// (a no-op on a unit that was already stopped is not recorded). Omitted
+    /// until the first one. In-memory only, like every other field here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_eviction: Option<LastEviction>,
+}
+
+/// One unit's most recent eviction, for `/status` `units[].last_eviction`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastEviction {
+    /// `"hard_stop"` (a game, the gaming invariant, a manual stop) or
+    /// `"yield_first"` (tenant-vs-tenant preemption) — see
+    /// [`crate::units::EvictMode`].
+    pub mode: String,
+    /// The `gpu_arbiter_evictions_total` outcome label: `"yielded"`,
+    /// `"graceful"`, `"sigkill"` or `"error"`.
+    pub outcome: String,
+    /// RFC 3339 UTC timestamp the eviction finished.
+    pub at: String,
 }
 
 /// The `/status` payload, serialized verbatim for remote machines + dashboards.
@@ -316,6 +338,14 @@ pub struct ArbiterState {
     /// was yielded cannot know that it was, so it resumes everything once
     /// rather than leave a tenant parked forever.
     pub needs_resume: HashSet<String>,
+    /// When the game-claim set was first seen empty while `gaming`, for the
+    /// [`crate::config::Config::game_exit_grace_s`] debounce. `None` while a
+    /// game is present, or once `gaming` has ended. Monotonic, so a wall-clock
+    /// step cannot shorten or stretch the window.
+    pub game_exit_pending_since: Option<Instant>,
+    /// Each unit's most recent effective eviction, copied into
+    /// [`UnitStatus::last_eviction`] on every `/status` refresh.
+    pub last_evictions: HashMap<String, LastEviction>,
     /// `true` if the most recent eviction pass had at least one unit fail —
     /// feeds [`StatusSnapshot::degraded`].
     pub degraded: bool,
@@ -581,6 +611,8 @@ impl Default for ArbiterState {
             presence: Presence::default(),
             held: HashSet::new(),
             needs_resume: HashSet::new(),
+            game_exit_pending_since: None,
+            last_evictions: HashMap::new(),
             degraded: false,
             metrics: Metrics::default(),
         }
@@ -826,6 +858,7 @@ mod tests {
             models_error: None,
             vram_mb: None,
             held: false,
+            last_eviction: None,
         };
         let json = serde_json::to_string(&u).unwrap();
         assert!(json.contains(r#""running":null"#), "{json}");
@@ -844,6 +877,7 @@ mod tests {
             models_error: None,
             vram_mb: Some(21000),
             held: true,
+            last_eviction: None,
         }];
         s.gpu_vram_used_mb = 21500;
         s.gpu_vram_total_mb = 32768;
@@ -868,6 +902,7 @@ mod tests {
                 models_error: None,
                 vram_mb: Some(8000),
                 held: false,
+                last_eviction: None,
             },
             UnitStatus {
                 unit: "ollama.service".into(),
@@ -876,6 +911,7 @@ mod tests {
                 models_error: None,
                 vram_mb: Some(21000),
                 held: false,
+                last_eviction: None,
             },
         ];
         let snap = s.snapshot();
