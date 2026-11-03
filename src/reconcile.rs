@@ -385,8 +385,25 @@ pub(crate) async fn reconcile_with<O: Observer>(
             // rejection is typed (`GpuHeldByGame` → HTTP 409, distinct from a
             // 500 start failure) and leaves any manual hold in place — nothing
             // about the unit changed.
+            //
+            // `state` is the previous pass's verdict, and a game can have
+            // launched since. So a manual start also re-scans (off-lock) and
+            // is rejected the same way if any claim is present right now.
             let current = read_state(state).state;
-            if matches!(current, State::Gaming | State::Evicting) {
+            let game_now = if matches!(current, State::Gaming | State::Evicting) {
+                true
+            } else {
+                match observer.observe().await {
+                    Ok(snap) => !claim_set(&snap, cfg).is_empty(),
+                    Err(e) => {
+                        // Cannot tell whether a game is running: do not start.
+                        tracing::warn!(unit = %unit, error = %e, "manual unit start: claim re-scan failed (still held)");
+                        let _ = reply.send(Err(ManualActionError::Failed));
+                        return Err(e);
+                    }
+                }
+            };
+            if game_now {
                 tracing::info!(
                     unit = %unit,
                     state = ?current,
@@ -773,90 +790,87 @@ pub(crate) async fn reconcile_with<O: Observer>(
         (guard.held.clone(), guard.needs_resume.clone())
     };
 
-    // Units this pass started, and whether the TOCTOU re-scan saw a game:
-    // both gate the resume step below.
-    let mut started: Vec<&str> = Vec::new();
-    let mut claim_mid_pass = false;
-    let eager_targets = ensure_running_targets(desired, cfg, &held, &preempted);
-    if !eager_targets.is_empty() {
-        // Only units NOT already running are actual start candidates
-        // (idempotence — an already-running unit is left alone). Tristate:
-        // when the check itself fails, the decision default is "treat as
-        // stopped and try to start" (unsure ⇒ attempt), logged rather than
-        // silently coerced.
-        let mut to_start = Vec::new();
-        for u in eager_targets {
-            let confirmed_running = units::is_running(u)
-                .await
-                .inspect_err(|e| {
-                    tracing::warn!(unit = %u.unit, error = %e, "ensure-running: is_running check failed; treating as stopped and attempting start");
-                })
-                .unwrap_or(false);
-            if !confirmed_running {
-                to_start.push(u);
-            }
-        }
-
-        if !to_start.is_empty() {
-            // ── TOCTOU close ───────────────────────────────────────────────────
-            //
-            // `desired` was resolved from the snapshot taken at the TOP of this
-            // pass (see `observe`/`claim_set` above). Everything since then —
-            // the unit-action branch, the `is_running` checks just above — is
-            // real elapsed wall-clock time in which a game can exec. Without
-            // this re-check, that race would start a unit directly into a live
-            // game, violating the "never start a unit into a live game"
-            // invariant documented on `ensure_running_targets`.
-            //
-            // Re-scanning immediately before the first start closes it: a claim
-            // that appeared mid-pass aborts every eager start this pass. Safety
-            // over promptness — the next pass (event-driven or the backstop
-            // timer) retries and self-heals either way. `scan_proc` is a cheap
-            // `/proc` walk, so this is only paid when there's actually
-            // something to start.
-            let fresh = observer.observe().await?;
-            if ensure_running_toctou_clear(&claim_set(&fresh, cfg)) {
-                for u in to_start {
-                    if let Err(e) = units::start(u).await {
-                        tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
-                    } else {
-                        tracing::info!(unit = %u.unit, "ensure-running: started eager unit (GPU free)");
-                        // This is also the `gaming → available` restore path
-                        // (the post-step subsumes it — see `UnitAction::Restart`'s
-                        // docs above), so one counter covers both triggers of an
-                        // eager restart.
-                        write_state(state).metrics.record_unit_restart(&u.unit);
-                        started.push(u.unit.as_str());
-                    }
-                }
-            } else {
-                claim_mid_pass = true;
-                tracing::warn!(
-                    units = to_start.len(),
-                    "ensure-running: a claim appeared mid-pass; skipping eager start(s) and resumes this pass"
-                );
-            }
+    // Only units NOT already running are actual start candidates
+    // (idempotence — an already-running unit is left alone). Tristate: when
+    // the check itself fails, the decision default is "treat as stopped and
+    // try to start" (unsure ⇒ attempt), logged rather than silently coerced.
+    let mut to_start = Vec::new();
+    for u in ensure_running_targets(desired, cfg, &held, &preempted) {
+        let confirmed_running = units::is_running(u)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(unit = %u.unit, error = %e, "ensure-running: is_running check failed; treating as stopped and attempting start");
+            })
+            .unwrap_or(false);
+        if !confirmed_running {
+            to_start.push(u);
         }
     }
+    let owed: Vec<&ManagedUnit> = resume_targets(desired, cfg, &held, &preempted)
+        .into_iter()
+        .filter(|u| needs_resume.contains(&u.unit))
+        .collect();
 
-    // Owed resumes run AFTER the starts above, and only for a unit that is
-    // actually up — started by this pass, or confirmed running — so the
-    // tenant hears "you may use the GPU" when it can act on it. A unit that
-    // is not up keeps the resume owed until it is (a non-eager unit started
-    // later by an operator, say). When the TOCTOU re-scan saw a game, the GPU
-    // is not free after all, so no resume runs this pass.
+    // ── TOCTOU close ───────────────────────────────────────────────────────
     //
-    // Edge-triggered via `needs_resume` (see its docs): a unit owes a resume
-    // after any eviction attempt and once at daemon startup, so `resume_cmd`
-    // runs on the way back instead of every 2 s pass. Running it every pass
-    // made it a second writer that could clobber state the tenant's own
-    // coordinator had set since. A failed resume stays owed and is retried
-    // next pass.
-    if !claim_mid_pass {
-        for u in resume_targets(desired, cfg, &held, &preempted) {
-            if !needs_resume.contains(&u.unit) {
-                continue;
+    // `desired` was resolved from the snapshot taken at the TOP of this pass
+    // (see `observe`/`claim_set` above). Everything since then — the
+    // unit-action branch, the `is_running` checks just above — is real
+    // elapsed wall-clock time in which a game can exec. Without this
+    // re-check, that race would start a unit directly into a live game,
+    // violating the "never start a unit into a live game" invariant documented
+    // on `ensure_running_targets`, or tell a tenant it may use a GPU a game
+    // has just taken.
+    //
+    // Re-scanning once, immediately before the first start or resume, closes
+    // it for both: a claim that appeared mid-pass aborts every eager start AND
+    // every owed resume this pass. Safety over promptness — the next pass
+    // (event-driven or the backstop timer) retries and self-heals either way.
+    // The scan is only paid when there is something to start or resume.
+    let gpu_free = if to_start.is_empty() && owed.is_empty() {
+        true
+    } else {
+        let fresh = observer.observe().await?;
+        let clear = ensure_running_toctou_clear(&claim_set(&fresh, cfg));
+        if !clear {
+            tracing::warn!(
+                starts = to_start.len(),
+                resumes = owed.len(),
+                "a claim appeared mid-pass; skipping eager start(s) and owed resume(s) this pass"
+            );
+        }
+        clear
+    };
+
+    let mut started: Vec<&str> = Vec::new();
+    if gpu_free {
+        for u in to_start {
+            if let Err(e) = units::start(u).await {
+                tracing::error!(unit = %u.unit, error = %e, "ensure-running: eager unit start failed");
+            } else {
+                tracing::info!(unit = %u.unit, "ensure-running: started eager unit (GPU free)");
+                // This is also the `gaming → available` restore path (the
+                // post-step subsumes it — see `UnitAction::Restart`'s docs
+                // above), so one counter covers both triggers of an eager
+                // restart.
+                write_state(state).metrics.record_unit_restart(&u.unit);
+                started.push(u.unit.as_str());
             }
+        }
+
+        // Owed resumes run AFTER the starts above, and only for a unit that is
+        // actually up — started by this pass, or confirmed running — so the
+        // tenant hears "you may use the GPU" when it can act on it. A unit
+        // that is not up keeps the resume owed until it is (a non-eager unit
+        // started later by an operator, say).
+        //
+        // Edge-triggered via `needs_resume` (see its docs): a unit owes a
+        // resume after any eviction attempt and once at daemon startup, so
+        // `resume_cmd` runs on the way back instead of every 2 s pass. Running
+        // it every pass made it a second writer that could clobber state the
+        // tenant's own coordinator had set since. A failed resume stays owed
+        // and is retried next pass.
+        for u in owed {
             let up = started.contains(&u.unit.as_str())
                 || matches!(units::is_running(u).await, Ok(true));
             if up && units::resume(u).await {
@@ -4010,5 +4024,79 @@ mod tests {
         .unwrap();
         assert_eq!(rx.await.unwrap(), Ok(()));
         assert!(l.low_run.exists());
+    }
+
+    #[tokio::test]
+    async fn claim_on_the_rescan_skips_an_owed_resume_with_nothing_to_start() {
+        // Nothing needs starting (the unit is already up), a resume is owed,
+        // and a game appears between the top scan and the resume: the GPU is
+        // not free after all, so resume_cmd must not run.
+        let run = marker_path("toctou-resume-only-run");
+        let resume = marker_path("toctou-resume-only-resume");
+        std::fs::write(&run, b"").unwrap();
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            {cmds}
+            resume_cmd = ["touch", "{resume}"]
+            "#,
+            cmds = crate::testutil::stateful_unit_cmds(&run),
+            resume = crate::testutil::toml_path(&resume),
+        )))
+        .unwrap();
+        let state = shared(ArbiterState::with_config(&cfg));
+
+        pass_scripted(&state, &cfg, &[false, true], 0).await;
+        assert!(!take_marker(&resume), "no resume into a game seen mid-pass");
+        assert!(read_state(&state).needs_resume.contains("fake.service"));
+
+        pass_scripted(&state, &cfg, &[false, false], 0).await;
+        assert!(take_marker(&resume), "a clean pass runs the owed resume");
+        assert!(read_state(&state).needs_resume.is_empty());
+        let _ = std::fs::remove_file(&run);
+    }
+
+    #[tokio::test]
+    async fn manual_start_rejects_a_game_that_launched_since_the_last_pass() {
+        // `/status` still says available (the last pass saw no game), but a
+        // game is running now: the start must re-scan and refuse.
+        let run = marker_path("manual-fresh-game-run");
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            eager_restart = false
+            {cmds}
+            "#,
+            cmds = crate::testutil::stateful_unit_cmds(&run),
+        )))
+        .unwrap();
+        let mut initial = ArbiterState::new();
+        initial.held.insert("fake.service".to_string());
+        let state = shared(initial);
+        assert_eq!(read_state(&state).state, State::Available);
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile_with(
+            &ScriptedObserver::new(&[true, true, true], Duration::ZERO),
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "fake.service".to_string(),
+                reply,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.await.unwrap(), Err(ManualActionError::GpuHeldByGame));
+        assert!(!run.exists(), "never started into the game");
+        assert!(
+            read_state(&state).held.contains("fake.service"),
+            "hold kept"
+        );
     }
 }
