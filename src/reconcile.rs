@@ -261,8 +261,9 @@ pub async fn observe() -> Result<ProcSnapshot, ReconcileError> {
 /// platform scan is the only input to `gaming` and nothing else can produce a
 /// claim. Crate-private on purpose; it is a seam, not an extension point.
 pub(crate) trait Observer: Sync {
-    /// Take one snapshot. Called once at the top of a pass and once more as
-    /// the TOCTOU re-scan before any eager start.
+    /// Take one snapshot. Called at the top of a pass, then as the TOCTOU
+    /// re-scan immediately before each eager start, each owed resume and a
+    /// manual start (see `claim_appeared`).
     async fn observe(&self) -> Result<ProcSnapshot, ReconcileError>;
 
     /// The monotonic clock for this pass's time-based decisions (the
@@ -839,10 +840,11 @@ pub(crate) async fn reconcile_with<O: Observer>(
     // when there is work. What `claim_appeared` cannot close is documented
     // there.
     let mut started: Vec<&str> = Vec::new();
-    let mut game_seen = false;
+    // Which loop saw the claim that stopped the rest of the pass, for the log.
+    let mut stopped_in: Option<&'static str> = None;
     for u in to_start {
         if claim_appeared(observer, cfg).await? {
-            game_seen = true;
+            stopped_in = Some("eager-start loop");
             break;
         }
         if let Err(e) = units::start(u).await {
@@ -869,15 +871,22 @@ pub(crate) async fn reconcile_with<O: Observer>(
     // made it a second writer that could clobber state the tenant's own
     // coordinator had set since. A failed resume stays owed and is retried
     // next pass.
-    if !game_seen {
+    if stopped_in.is_none() {
         for u in owed {
             let up = started.contains(&u.unit.as_str())
                 || matches!(units::is_running(u).await, Ok(true));
             if !up {
                 continue;
             }
-            if claim_appeared(observer, cfg).await? {
-                game_seen = true;
+            // A failed re-scan is treated like a claim (fail closed: no
+            // resume), but does not abort the pass, so `/status` still
+            // refreshes below.
+            let game = claim_appeared(observer, cfg).await.unwrap_or_else(|e| {
+                tracing::warn!(unit = %u.unit, error = %e, "owed-resume loop: claim re-scan failed; skipping the remaining resumes this pass");
+                true
+            });
+            if game {
+                stopped_in = Some("owed-resume loop");
                 break;
             }
             if units::resume(u).await {
@@ -885,9 +894,10 @@ pub(crate) async fn reconcile_with<O: Observer>(
             }
         }
     }
-    if game_seen {
+    if let Some(stage) = stopped_in {
         tracing::warn!(
-            "a claim appeared mid-pass; skipping the remaining eager start(s) and owed resume(s) this pass"
+            stage,
+            "a claim appeared mid-pass (or could not be ruled out); skipping the remaining eager start(s) and owed resume(s) this pass"
         );
     }
 
@@ -1326,10 +1336,9 @@ pub fn preempted_units(cfg: &Config, demand: Option<u8>) -> Vec<&ManagedUnit> {
 }
 
 /// The TOCTOU-close decision: given a **freshly** re-scanned claim set (taken
-/// immediately before the ensure-running post-step's first `units::start`),
-/// should the pending eager start(s) proceed? Pure — unit-tested; the impure
-/// re-scan (`observe` + `claim_set`) itself lives at the call site in
-/// [`reconcile`], right before the first start.
+/// immediately before each eager start, owed resume, or manual start), may
+/// that action proceed? Pure — unit-tested; the impure re-scan (`observe` +
+/// `claim_set`) is [`claim_appeared`].
 fn ensure_running_toctou_clear(fresh_claims: &[Claim]) -> bool {
     fresh_claims.is_empty()
 }
@@ -4277,45 +4286,81 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn claim_after_the_first_of_two_resumes_skips_the_second() {
-        // Both units are already up, so nothing starts; scans: top (clean),
-        // before resume #1 (clean), before resume #2 (a game).
-        let run_a = marker_path("two-resumes-a-run");
-        let run_b = marker_path("two-resumes-b-run");
-        let res_a = marker_path("two-resumes-a-resume");
-        let res_b = marker_path("two-resumes-b-resume");
-        std::fs::write(&run_a, b"").unwrap();
-        std::fs::write(&run_b, b"").unwrap();
-        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
-            r#"
-            [[managed_units]]
-            unit = "a.service"
-            {a}
-            resume_cmd = ["touch", "{ra}"]
+    /// Three running units, each owing a resume that touches its own marker.
+    fn three_owed(tag: &str) -> (Config, Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+        use std::fmt::Write as _;
+        let runs: Vec<_> = (0..3)
+            .map(|i| marker_path(&format!("{tag}-{i}-run")))
+            .collect();
+        let resumes: Vec<_> = (0..3)
+            .map(|i| marker_path(&format!("{tag}-{i}-resume")))
+            .collect();
+        let mut toml = String::new();
+        for i in 0..3 {
+            std::fs::write(&runs[i], b"").unwrap();
+            let _ = write!(
+                toml,
+                "\n[[managed_units]]\nunit = \"u{i}.service\"\n{}\nresume_cmd = [\"touch\", \"{}\"]\n",
+                crate::testutil::stateful_unit_cmds(&runs[i]),
+                crate::testutil::toml_path(&resumes[i]),
+            );
+        }
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&toml)).unwrap();
+        (cfg, runs, resumes)
+    }
 
-            [[managed_units]]
-            unit = "b.service"
-            {b}
-            resume_cmd = ["touch", "{rb}"]
-            "#,
-            a = crate::testutil::stateful_unit_cmds(&run_a),
-            b = crate::testutil::stateful_unit_cmds(&run_b),
-            ra = crate::testutil::toml_path(&res_a),
-            rb = crate::testutil::toml_path(&res_b),
-        )))
-        .unwrap();
+    #[tokio::test]
+    async fn claim_after_the_first_of_three_resumes_skips_the_rest() {
+        // Nothing starts (all up). Scans: top (clean), before resume #1
+        // (clean), before #2 (a game), before #3 (clean again). The claim must
+        // stop the loop: #3 must not run even though its own re-scan would be
+        // clean — a `continue` instead of `break` would run it.
+        let (cfg, runs, resumes) = three_owed("three-resumes");
         let state = shared(ArbiterState::with_config(&cfg));
 
-        pass_scripted(&state, &cfg, &[false, false, true], 0).await;
-        assert!(take_marker(&res_a), "the first resume ran");
-        assert!(!take_marker(&res_b), "the second resume must not run");
+        pass_scripted(&state, &cfg, &[false, false, true, false], 0).await;
+        assert!(take_marker(&resumes[0]), "resume #1 ran");
+        assert!(!take_marker(&resumes[1]), "resume #2 must not run");
+        assert!(!take_marker(&resumes[2]), "resume #3 must not run");
         {
             let g = read_state(&state);
-            assert!(!g.needs_resume.contains("a.service"));
-            assert!(g.needs_resume.contains("b.service"), "still owed");
+            assert!(!g.needs_resume.contains("u0.service"));
+            assert!(g.needs_resume.contains("u1.service"), "#2 still owed");
+            assert!(g.needs_resume.contains("u2.service"), "#3 still owed");
         }
-        for p in [&run_a, &run_b] {
+        for p in &runs {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_loop_rescan_error_fails_closed_without_aborting_the_pass() {
+        // Scans: top (ok), before resume #1 (error). No resume runs, the pass
+        // still succeeds, and `/status` is refreshed.
+        let (cfg, runs, resumes) = three_owed("resume-scan-err");
+        let state = shared(ArbiterState::with_config(&cfg));
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile_with(
+            &ErrAtObserver {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_at: 1,
+            },
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::Timer,
+            GpuBackend::default(),
+        )
+        .await
+        .expect("a resume-loop scan error must not abort the pass");
+        for r in &resumes {
+            assert!(!take_marker(r), "no resume without a clean re-scan");
+        }
+        let g = read_state(&state);
+        assert_eq!(g.needs_resume.len(), 3, "all still owed");
+        assert_eq!(g.units.len(), 3, "/status was refreshed");
+        drop(g);
+        for p in &runs {
             let _ = std::fs::remove_file(p);
         }
     }
