@@ -47,14 +47,6 @@
 # (cn_proc); this only covers dropped netlink events.
 #reconcile_interval_s = 30
 
-# Default budget (seconds) for a COOPERATIVE release, used by units that set
-# yield_cmd but no per-unit yield_timeout_s. Deliberately shorter than
-# eviction_timeout_s: this is the FIRST of two eviction stages and its budget is
-# spent before the stop path even begins, so a generous value here directly
-# delays a game getting the GPU. Tune it from the
-# gpu_arbiter_eviction_duration_seconds{stage="yield"} histogram, not by guessing.
-#yield_timeout_s = 3
-
 # The priority a detected GAME claims at. Higher wins. The default sits above
 # every unit's default priority (50), which is what makes gaming preempt
 # everything. Lowering it below a tenant's priority would let that tenant
@@ -69,7 +61,12 @@
 # the window /status stays `gaming`; a claim reappearing resets it. 0 restores
 # the old immediate behavior. Needs gpu-arbiter >= 0.14.0 (older builds reject
 # the key).
-#game_exit_grace_s = 10
+#game_exit_grace_s = 30
+
+# DEPRECATED (0.14.0): yield_timeout_s (top level and per unit) and yield_cmd
+# are still accepted so an older config keeps loading, but they do nothing —
+# every eviction stops the unit. The daemon warns about them at startup and
+# --check-config lists them; remove them.
 
 # GPU vendor backend: "auto" (nvidia-smi if present, else amdgpu sysfs, else
 # nvidia), "nvidia", or "amd".
@@ -142,29 +139,23 @@
 #vram_match = "vllm"
 #introspect_cmd = "vllm-cli list-models"
 
-# --- the priority ladder & cooperative eviction -------------------------------
+# --- the priority ladder --------------------------------------------------------
 #
 # `priority` (default 50) sets a tenant's tier; a demand at P preempts every
 # unit with priority < P. `busy_cmd` (exit 0 = busy, exit 1 = idle; any other
 # code also reads idle, so `curl -sf` probes work) is required for a unit to
 # preempt anything — without it, a unit can only be preempted, never preempt.
-# `yield_cmd`/`resume_cmd` add a cooperative release stage ahead of the stop
-# path: the daemon asks the tenant to drop the GPU while staying alive, then
-# polls busy_cmd until it agrees the GPU is free. yield_cmd is ignored unless
-# busy_cmd is also set. The yield is used ONLY when a busy higher-tier tenant
-# preempts this one; a game launch and a manual stop always stop the unit
-# (a parked tenant keeps its CUDA context resident). Leave yield_cmd unset to
-# have tenant preemption stop the unit too. Tune both budgets from
-# gpu_arbiter_eviction_duration_seconds{stage=...}. Full treatment:
-# docs/reference.md#priority-ladder-and-cooperative-eviction.
+# A preempted tenant is STOPPED, exactly like a game eviction, and restarted
+# (if eager_restart) once nothing above it is busy. `resume_cmd` is an
+# idempotent "you may use the GPU again" hook, run once after the unit is
+# brought back and once at daemon startup — use it to clear tenant-side park
+# flags. Full treatment: docs/reference.md#priority-ladder.
 #[[managed_units]]
 #unit = "asr.service"
-#priority = 25                                  # below the default 50: yields to other tenants
+#priority = 25                                  # below the default 50: preempted by other tenants
 #eager_restart = true
 #busy_cmd = ["curl", "-sf", "http://127.0.0.1:9000/busy"]   # exit 0 = has work; HTTP error = idle
-#yield_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/release"]
 #resume_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/acquire"]
-#yield_timeout_s = 10                           # overrides the top-level default
 
 # Non-systemd supervisor overrides (OpenRC / runit / plain processes).
 # When ALL four *_cmd overrides are absent, the tenant is driven byte-for-byte by

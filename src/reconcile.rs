@@ -19,7 +19,7 @@ use crate::state::{
     ArbiterState, Claim, EvictionStage, LastEviction, ManualActionError, ReconcileTrigger, State,
     UnitStatus, read_state, write_state,
 };
-use crate::units::{self, EvictMode};
+use crate::units;
 
 /// Reconcile-pass errors. Composes the module errors a pass can surface: the
 /// `/proc` scan (and the blocking task that runs it) is the only source that
@@ -440,25 +440,15 @@ pub(crate) async fn reconcile_with<O: Observer>(
                 // the eviction keeps it owed even if resolving the unit fails).
                 guard.needs_resume.insert(unit.clone());
             }
-            // HardStop: an operator hold means "off the GPU", so the service is
-            // really stopped rather than parked (a parked tenant keeps several
-            // GB resident; see `EvictMode`). `evict_one` counts it like any
-            // other eviction (see `units::eviction_metric_outcome` on why
+            // An operator hold means "off the GPU": the service is stopped.
+            // `evict_one` counts it like any other eviction (see `units::eviction_metric_outcome` on why
             // `AlreadyClear` is excluded) and logs the VRAM around it.
             let result = match units::resolve_unit(cfg, &unit) {
                 Ok(u) => {
                     let vram_before = vram_used_mb(backend).await;
-                    evict_one(
-                        state,
-                        cfg,
-                        backend,
-                        u,
-                        EvictMode::HardStop,
-                        "manual stop",
-                        vram_before,
-                    )
-                    .await
-                    .0
+                    evict_one(state, cfg, backend, u, "manual stop", vram_before)
+                        .await
+                        .0
                 }
                 Err(e) => Err(e),
             };
@@ -576,9 +566,9 @@ pub(crate) async fn reconcile_with<O: Observer>(
             // the lock DROPPED so `/status` stays responsive across the whole kill
             // window. Gaming wins unconditionally even if one unit errors.
             //
-            // HardStop, never the cooperative yield: a parked tenant keeps its
-            // process and several GB of VRAM with it, and on Windows nothing can
-            // even observe that. "Freed" for a game is the unit not running.
+            // Every eviction stops the unit: "freed" for a game is the unit not
+            // running, the one postcondition observable on every platform
+            // (WDDM reports no per-process VRAM).
             //
             // `preempted` is NOT the tenant-ladder-only set here, which is easy to
             // misread. We are on the `available → gaming` edge, so the game
@@ -591,8 +581,7 @@ pub(crate) async fn reconcile_with<O: Observer>(
             // leak: see `a_tenant_above_game_priority_survives_a_game`. Passing
             // `cfg.resolved_units()` instead would silently delete that ability.
             write_state(state).set_state(State::Evicting);
-            let any_eviction_failed =
-                evict_units(state, cfg, backend, &preempted, EvictMode::HardStop, "game").await;
+            let any_eviction_failed = evict_units(state, cfg, backend, &preempted, "game").await;
             if any_eviction_failed {
                 // Visibility only — gaming still wins the GPU unconditionally
                 // below. A wedged tenant may still hold VRAM even though `state`
@@ -644,7 +633,7 @@ pub(crate) async fn reconcile_with<O: Observer>(
             // `onfailure`, systemd `Restart=`), an operator or script starting
             // it outside the daemon — would sit on the GPU next to the game
             // until the game exited. Every steady `gaming` pass (including the
-            // exit grace) re-checks the preempted units and hard-stops any
+            // exit grace) re-checks the preempted units and stops any
             // that is running again. Reuses this pass's busy-stage probes;
             // other units cost one `is_running` each.
             if current == State::Gaming && desired == State::Gaming {
@@ -662,18 +651,9 @@ pub(crate) async fn reconcile_with<O: Observer>(
                     let names: Vec<&str> = came_back.iter().map(|u| u.unit.as_str()).collect();
                     tracing::warn!(
                         units = ?names,
-                        "gaming invariant: a preempted unit is running again during gaming; hard-stopping it"
+                        "gaming invariant: a preempted unit is running again during gaming; stopping it"
                     );
-                    if evict_units(
-                        state,
-                        cfg,
-                        backend,
-                        &came_back,
-                        EvictMode::HardStop,
-                        "gaming invariant",
-                    )
-                    .await
-                    {
+                    if evict_units(state, cfg, backend, &came_back, "gaming invariant").await {
                         write_state(state).degraded = true;
                     }
                 }
@@ -742,18 +722,9 @@ pub(crate) async fn reconcile_with<O: Observer>(
                 units = still_up.len(),
                 "preempting lower-priority tenants for a busy higher tier"
             );
-            // YieldFirst: the one place the cooperative yield is used. Saving a
-            // lower tenant's in-flight work is worth its residual footprint
-            // when the GPU goes to another tenant rather than a game.
-            let _ = evict_units(
-                state,
-                cfg,
-                backend,
-                &still_up,
-                EvictMode::YieldFirst,
-                "tenant preemption",
-            )
-            .await;
+            // Stopped, like every eviction: the displaced tenant loses its
+            // in-flight work, and `resume_cmd` runs once it may run again.
+            let _ = evict_units(state, cfg, backend, &still_up, "tenant preemption").await;
         }
     }
 
@@ -761,31 +732,6 @@ pub(crate) async fn reconcile_with<O: Observer>(
         let guard = read_state(state);
         (guard.held.clone(), guard.needs_resume.clone())
     };
-
-    // Undo any owed cooperative yield first, before any start. This covers
-    // every unit allowed to hold the GPU again (see [`resume_targets`]), not
-    // just eager ones and not just stopped ones:
-    //
-    // - A unit that released the GPU via `yield_cmd` is still *running*, so it
-    //   never reaches `to_start` below. Gating the resume on "needs starting"
-    //   would leave it paused forever: alive, healthy by every check here, and
-    //   quietly not doing any work.
-    // - A non-eager unit is never auto-started, but it can still be yielded.
-    //   `resume_cmd` is the un-yield hook, not a start, so running it for a
-    //   non-eager unit never starts anything; skipping it would leave that
-    //   tenant parked indefinitely.
-    //
-    // Edge-triggered via `needs_resume` (see its docs): a unit owes a resume
-    // after any eviction attempt and once at daemon startup, so `resume_cmd`
-    // runs on the way out of a yield instead of every 2 s pass. Running it
-    // every pass made it a second writer that could clobber state the tenant's
-    // own coordinator had set since. A failed resume stays owed and is retried
-    // next pass.
-    for u in resume_targets(desired, cfg, &held, &preempted) {
-        if needs_resume.contains(&u.unit) && units::resume(u).await {
-            write_state(state).needs_resume.remove(&u.unit);
-        }
-    }
 
     let eager_targets = ensure_running_targets(desired, cfg, &held, &preempted);
     if !eager_targets.is_empty() {
@@ -847,6 +793,26 @@ pub(crate) async fn reconcile_with<O: Observer>(
         }
     }
 
+    // Owed resumes run AFTER the starts above, so a unit the arbiter just
+    // brought back hears "you may use the GPU" once it is up. This covers every
+    // unit allowed to hold the GPU again (see [`resume_targets`]), not just
+    // eager ones: `resume_cmd` is an idempotent hook, not a start, so running
+    // it for a non-eager unit (still stopped) never starts anything, and
+    // skipping it could leave a stale tenant-side park flag (e.g. one a 0.13
+    // cooperative yield set) in place for whenever that unit next starts.
+    //
+    // Edge-triggered via `needs_resume` (see its docs): a unit owes a resume
+    // after any eviction attempt and once at daemon startup, so `resume_cmd`
+    // runs on the way back instead of every 2 s pass. Running it every pass
+    // made it a second writer that could clobber state the tenant's own
+    // coordinator had set since. A failed resume stays owed and is retried
+    // next pass.
+    for u in resume_targets(desired, cfg, &held, &preempted) {
+        if needs_resume.contains(&u.unit) && units::resume(u).await {
+            write_state(state).needs_resume.remove(&u.unit);
+        }
+    }
+
     refresh_substate(state, cfg, presence, backend).await;
     Ok(())
 }
@@ -892,9 +858,9 @@ async fn manual_start(cfg: &Config, unit: &str) -> Result<bool, units::UnitError
     }
 }
 
-/// Evict `targets`, in order, under `mode`. Used by the `available → gaming`
-/// edge and the gaming invariant ([`EvictMode::HardStop`]) and by tenant
-/// preemption ([`EvictMode::YieldFirst`]); `reason` only labels the logs.
+/// Evict (stop) `targets`, in order. Used by the `available → gaming` edge,
+/// the gaming invariant and tenant preemption; `reason` labels the logs and
+/// `/status` `last_eviction`.
 /// Gaming wins the GPU unconditionally regardless of outcome (each failure is
 /// logged in [`evict_one`]) — this only reports whether **any** unit failed,
 /// which feeds the `degraded` visibility flag.
@@ -907,13 +873,12 @@ async fn evict_units(
     cfg: &Config,
     backend: GpuBackend,
     targets: &[&ManagedUnit],
-    mode: EvictMode,
     reason: &'static str,
 ) -> bool {
     let mut any_failed = false;
     let mut vram = vram_used_mb(backend).await;
     for u in targets {
-        let (result, vram_after) = evict_one(state, cfg, backend, u, mode, reason, vram).await;
+        let (result, vram_after) = evict_one(state, cfg, backend, u, reason, vram).await;
         any_failed |= result.is_err();
         vram = vram_after;
     }
@@ -926,9 +891,9 @@ async fn vram_used_mb(backend: GpuBackend) -> Option<u64> {
     backend.query_memory().await.ok().map(|m| m.used_mb)
 }
 
-/// Evict one unit under `mode` and record everything about it: the outcome
+/// Evict (stop) one unit and record everything about it: the outcome
 /// counter, the stage durations, the owed resume, `/status`
-/// `units[].last_eviction`, and one log line carrying the unit, mode, outcome
+/// `units[].last_eviction`, and one log line carrying the unit, reason, outcome
 /// and total VRAM before/after. Returns the eviction result and the VRAM
 /// reading after it (`vram_before` unchanged for a no-op eviction, which
 /// skips the query).
@@ -940,14 +905,13 @@ async fn evict_one(
     cfg: &Config,
     backend: GpuBackend,
     u: &ManagedUnit,
-    mode: EvictMode,
     reason: &'static str,
     vram_before: Option<u64>,
 ) -> (
     Result<units::EvictionOutcome, units::UnitError>,
     Option<u64>,
 ) {
-    let (result, timings) = units::evict_timed(u, cfg, backend, mode).await;
+    let (result, timings) = units::evict_timed(u, cfg, backend).await;
     let no_op = matches!(result, Ok(units::EvictionOutcome::AlreadyClear));
     let vram_after = if no_op {
         vram_before
@@ -959,8 +923,8 @@ async fn evict_one(
         // One lock for every bookkeeping write, rather than reacquiring per
         // metric.
         let mut guard = write_state(state);
-        // Any eviction attempt may leave a park flag behind (a yield, or a
-        // stopped tenant whose flag outlives the process), so the unit owes a
+        // A stopped tenant may carry a park flag that outlives its process (a
+        // stale one from a 0.13 yield included), so the unit owes a
         // resume the next time it is eligible to run. Recorded for every
         // outcome, errors included: an extra idempotent resume is cheap, a
         // missed one leaves the tenant parked.
@@ -970,7 +934,7 @@ async fn evict_one(
             guard.last_evictions.insert(
                 u.unit.clone(),
                 LastEviction {
-                    mode: mode.label().to_string(),
+                    reason: reason.to_string(),
                     outcome: outcome.label().to_string(),
                     at: crate::state::format_rfc3339(std::time::SystemTime::now()),
                 },
@@ -982,11 +946,6 @@ async fn evict_one(
         // quantile toward zero and make the timeouts look far more generous
         // than they are.
         if !no_op {
-            if let Some(s) = timings.yield_secs {
-                guard
-                    .metrics
-                    .record_eviction_duration(&u.unit, EvictionStage::Yield, s);
-            }
             if let Some(s) = timings.stop_secs {
                 guard
                     .metrics
@@ -1003,7 +962,6 @@ async fn evict_one(
     match &result {
         Ok(_) => tracing::info!(
             unit = %u.unit,
-            mode = mode.label(),
             reason,
             outcome = outcome_label,
             vram_before_mb = ?vram_before,
@@ -1013,7 +971,6 @@ async fn evict_one(
         ),
         Err(e) => tracing::error!(
             unit = %u.unit,
-            mode = mode.label(),
             reason,
             outcome = outcome_label,
             vram_before_mb = ?vram_before,
@@ -1086,9 +1043,9 @@ fn ensure_running_targets<'c>(
 /// The same safety gate as [`ensure_running_targets`] **without** the
 /// `eager_restart` filter: `desired` must be exactly [`State::Available`], and
 /// held and preempted units are excluded. `eager_restart` only governs whether
-/// the daemon *starts* a stopped unit; resuming is the undo of a cooperative
-/// yield, so a non-eager unit that was yielded must still be resumed, or it
-/// stays parked indefinitely.
+/// the daemon *starts* a stopped unit; `resume_cmd` is an idempotent "you may
+/// use the GPU again" hook, so a non-eager unit that was evicted still gets
+/// it, or a tenant-side park flag could outlive the eviction.
 fn resume_targets<'c>(
     desired: State,
     cfg: &'c Config,
@@ -1456,7 +1413,7 @@ mod tests {
     }
 
     /// A `game_exit_pending_since` far enough in the past that the default
-    /// `game_exit_grace_s` (10 s) has elapsed — for tests that model a game
+    /// `game_exit_grace_s` (30 s) has elapsed — for tests that model a game
     /// that is already gone, not the debounce itself.
     fn grace_elapsed() -> Option<Instant> {
         Instant::now().checked_sub(Duration::from_secs(60))
@@ -1686,7 +1643,7 @@ mod tests {
         // the ensure-running post-step later in the same pass never starts it a
         // second time — isolates this test to the ManualStart handler's own
         // increment. (A running unit is not restarted at all; see
-        // `manual_start_after_yielding_stop_resumes_without_start_cmd`.)
+        // `manual_start_on_running_held_unit_skips_start_and_resumes`.)
         let cfg = ensure_cfg(false, &marker, false);
         let state = shared(ArbiterState::new());
         let presence = crate::presence::PresenceMonitor::new(0);
@@ -2179,9 +2136,9 @@ mod tests {
         rx.await.unwrap()
     }
 
-    /// A running unit that yields cooperatively on a manual stop. `start_cmd`
+    /// A unit that always reports running (its stop does not take). `start_cmd`
     /// and `resume_cmd` touch separate markers.
-    fn yielding_cfg(start_marker: &std::path::Path, resume_marker: &std::path::Path) -> Config {
+    fn always_up_cfg(start_marker: &std::path::Path, resume_marker: &std::path::Path) -> Config {
         Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             [[managed_units]]
@@ -2190,7 +2147,6 @@ mod tests {
             stop_cmd = ["true"]
             is_active_cmd = "true"
             busy_cmd = "false"
-            yield_cmd = ["true"]
             resume_cmd = ["touch", "{resume}"]
             "#,
             start = crate::testutil::toml_path(start_marker),
@@ -2207,7 +2163,7 @@ mod tests {
         // HTTP 500), kept the hold, and resume_cmd never ran — parked forever.
         let start_marker = marker_path("yield-start-start");
         let resume_marker = marker_path("yield-start-resume");
-        let cfg = yielding_cfg(&start_marker, &resume_marker);
+        let cfg = always_up_cfg(&start_marker, &resume_marker);
         let mut initial = ArbiterState::new();
         initial.held.insert("fake.service".to_string());
         initial.needs_resume.insert("fake.service".to_string());
@@ -2238,9 +2194,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_stop_hard_stops_a_yielding_unit_and_manual_start_resumes_it() {
-        // An operator hold means "off the GPU": the service is stopped, never
-        // parked, even though it has a working yield. The later manual start
+    async fn manual_stop_stops_the_unit_and_manual_start_resumes_it() {
+        // An operator hold means "off the GPU": the service is stopped. The
+        // unit still carries a (deprecated) yield_cmd, which never runs. The later manual start
         // starts it again and runs the owed resume_cmd in the same pass.
         let run = marker_path("hold-run");
         let yielded = marker_path("hold-yield");
@@ -2276,8 +2232,8 @@ mod tests {
             assert_eq!(g.units[0].running, Some(false));
             let last = g.units[0].last_eviction.as_ref().unwrap();
             assert_eq!(
-                (last.mode.as_str(), last.outcome.as_str()),
-                ("hard_stop", "graceful")
+                (last.reason.as_str(), last.outcome.as_str()),
+                ("manual stop", "graceful")
             );
         }
 
@@ -2301,7 +2257,7 @@ mod tests {
         // so a manual start on it must run neither start_cmd nor resume_cmd.
         let start_marker = marker_path("never-evicted-start");
         let resume_marker = marker_path("never-evicted-resume");
-        let cfg = yielding_cfg(&start_marker, &resume_marker);
+        let cfg = always_up_cfg(&start_marker, &resume_marker);
         let state = shared(ArbiterState::new());
 
         assert_eq!(manual(&state, &cfg, true).await, Ok(()));
@@ -2447,95 +2403,6 @@ mod tests {
                 "a steady pass must not re-run resume_cmd"
             );
         }
-    }
-
-    /// Two-tier ladder: `high` (75) and an eager `low` (25) that yields
-    /// cooperatively. `high_busy` decides whether `high` demands the GPU.
-    fn yield_ladder_cfg(marker: &std::path::Path, high_busy: bool) -> Config {
-        yield_ladder_cfg_eager(marker, high_busy, true)
-    }
-
-    fn yield_ladder_cfg_eager(
-        marker: &std::path::Path,
-        high_busy: bool,
-        low_eager: bool,
-    ) -> Config {
-        let busy = if high_busy { "true" } else { "false" };
-        Config::from_toml(&crate::testutil::portable_toml(&format!(
-            r#"
-            [[managed_units]]
-            unit = "high.service"
-            priority = 75
-            start_cmd = ["true"]
-            stop_cmd = ["true"]
-            is_active_cmd = "true"
-            busy_cmd = "{busy}"
-
-            [[managed_units]]
-            unit = "low.service"
-            priority = 25
-            eager_restart = {low_eager}
-            start_cmd = ["true"]
-            stop_cmd = ["true"]
-            is_active_cmd = "true"
-            busy_cmd = "false"
-            yield_cmd = ["true"]
-            resume_cmd = ["touch", "{marker}"]
-            "#,
-            marker = crate::testutil::toml_path(marker),
-        )))
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn resume_runs_once_after_a_yield() {
-        let marker = marker_path("resume-yield");
-        let busy = yield_ladder_cfg(&marker, true);
-        let idle = yield_ladder_cfg(&marker, false);
-        // `new()`, not `with_config`: no startup resume owed, so every marker
-        // below is caused by the yield alone.
-        let state = shared(ArbiterState::new());
-
-        // `high` is busy → `low` is preempted and yields. No resume while it
-        // stays preempted, however many passes go by.
-        for _ in 0..2 {
-            pass(&state, &busy, ReconcileTrigger::Timer).await;
-            assert!(!take_marker(&marker), "no resume while still preempted");
-        }
-        assert!(
-            read_state(&state).metrics.evictions["low.service"].yielded >= 1,
-            "fixture must actually yield"
-        );
-        assert!(read_state(&state).needs_resume.contains("low.service"));
-
-        // Demand ends → exactly one resume on the way out of the yield.
-        pass(&state, &idle, ReconcileTrigger::Timer).await;
-        assert!(take_marker(&marker), "leaving preemption must resume");
-        assert!(read_state(&state).needs_resume.is_empty());
-
-        pass(&state, &idle, ReconcileTrigger::Timer).await;
-        assert!(!take_marker(&marker), "only once per yield");
-    }
-
-    #[tokio::test]
-    async fn non_eager_unit_is_resumed_after_a_yield() {
-        // Review regression: resume used to be reached only while iterating the
-        // eager targets, so a non-eager unit that yielded stayed parked forever.
-        let marker = marker_path("resume-noneager");
-        let busy = yield_ladder_cfg_eager(&marker, true, false);
-        let idle = yield_ladder_cfg_eager(&marker, false, false);
-        let state = shared(ArbiterState::new());
-
-        pass(&state, &busy, ReconcileTrigger::Timer).await;
-        assert!(!take_marker(&marker), "no resume while still preempted");
-        assert!(read_state(&state).needs_resume.contains("low.service"));
-
-        pass(&state, &idle, ReconcileTrigger::Timer).await;
-        assert!(take_marker(&marker), "a non-eager unit must be resumed too");
-        assert!(read_state(&state).needs_resume.is_empty());
-
-        pass(&state, &idle, ReconcileTrigger::Timer).await;
-        assert!(!take_marker(&marker), "only once per yield");
     }
 
     #[tokio::test]
@@ -3236,7 +3103,6 @@ mod tests {
                 &cfg,
                 GpuBackend::default(),
                 &cfg.resolved_units().iter().collect::<Vec<_>>(),
-                EvictMode::HardStop,
                 "test",
             )
             .await
@@ -3265,7 +3131,6 @@ mod tests {
                 &cfg,
                 GpuBackend::default(),
                 &cfg.resolved_units().iter().collect::<Vec<_>>(),
-                EvictMode::HardStop,
                 "test",
             )
             .await
@@ -3394,7 +3259,10 @@ mod tests {
     }
 
     /// Two marker-backed tenants: a busy-capable `high` (75) and an eager
-    /// `low` (25) with a working cooperative yield. `eviction_timeout_s = 0`
+    /// `low` (25) still carrying a deprecated `yield_cmd` (touches `yielded`,
+    /// so a test can prove it never runs). `low`'s `resume_cmd` touches
+    /// `resumed`, and also `resumed_up` if `low` was running at that moment,
+    /// which shows the resume ran after the restart. `eviction_timeout_s = 0`
     /// keeps every stop instant on hosts with no GPU to poll.
     struct Ladder {
         cfg: Config,
@@ -3402,14 +3270,29 @@ mod tests {
         low_run: std::path::PathBuf,
         yielded: std::path::PathBuf,
         resumed: std::path::PathBuf,
+        resumed_up: std::path::PathBuf,
     }
 
     fn ladder(tag: &str, high_busy: bool) -> Ladder {
+        ladder_with(tag, high_busy, true)
+    }
+
+    fn ladder_with(tag: &str, high_busy: bool, low_eager: bool) -> Ladder {
         let high_run = marker_path(&format!("{tag}-high-run"));
         let low_run = marker_path(&format!("{tag}-low-run"));
         let yielded = marker_path(&format!("{tag}-yield"));
         let resumed = marker_path(&format!("{tag}-resume"));
-        let busy = if high_busy { "true" } else { "false" };
+        let resumed_up = marker_path(&format!("{tag}-resume-up"));
+        let (r, u, run) = (
+            crate::testutil::toml_path(&resumed),
+            crate::testutil::toml_path(&resumed_up),
+            crate::testutil::toml_path(&low_run),
+        );
+        let resume = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "type nul > {r} & if exist {run} (type nul > {u}) & exit 0"]"#)
+        } else {
+            format!(r#"["sh", "-c", "touch {r}; if [ -e {run} ]; then touch {u}; fi"]"#)
+        };
         let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
             r#"
             eviction_timeout_s = 0
@@ -3424,15 +3307,16 @@ mod tests {
             [[managed_units]]
             unit = "low.service"
             priority = 25
+            eager_restart = {low_eager}
             {low_cmds}
             busy_cmd = "false"
             yield_cmd = ["touch", "{yielded}"]
-            resume_cmd = ["touch", "{resumed}"]
+            resume_cmd = {resume}
             "#,
+            busy = if high_busy { "true" } else { "false" },
             high_cmds = crate::testutil::stateful_unit_cmds(&high_run),
             low_cmds = crate::testutil::stateful_unit_cmds(&low_run),
             yielded = crate::testutil::toml_path(&yielded),
-            resumed = crate::testutil::toml_path(&resumed),
         )))
         .unwrap();
         std::fs::write(&high_run, b"").unwrap();
@@ -3443,12 +3327,36 @@ mod tests {
             low_run,
             yielded,
             resumed,
+            resumed_up,
+        }
+    }
+
+    impl Ladder {
+        /// The same fixture (same markers) with `high`'s busy probe set to
+        /// `high_busy`.
+        fn with_high_busy(&self, high_busy: bool) -> Config {
+            let probe = Config::from_toml(&crate::testutil::portable_toml(&format!(
+                "[[managed_units]]\nunit = \"x\"\nbusy_cmd = \"{}\"\n",
+                if high_busy { "true" } else { "false" }
+            )))
+            .unwrap();
+            let mut cfg = self.cfg.clone();
+            cfg.managed_units[0]
+                .busy_cmd
+                .clone_from(&probe.managed_units[0].busy_cmd);
+            cfg
         }
     }
 
     impl Drop for Ladder {
         fn drop(&mut self) {
-            for p in [&self.high_run, &self.low_run, &self.yielded, &self.resumed] {
+            for p in [
+                &self.high_run,
+                &self.low_run,
+                &self.yielded,
+                &self.resumed,
+                &self.resumed_up,
+            ] {
                 let _ = std::fs::remove_file(p);
             }
         }
@@ -3457,13 +3365,14 @@ mod tests {
     fn last_eviction(state: &Arc<RwLock<ArbiterState>>, unit: &str) -> (String, String) {
         let g = read_state(state);
         let le = g.last_evictions[unit].clone();
-        (le.mode, le.outcome)
+        (le.reason, le.outcome)
     }
 
     #[tokio::test]
-    async fn game_eviction_hard_stops_a_unit_with_yield_cmd() {
+    async fn game_eviction_stops_a_unit_and_ignores_its_yield_cmd() {
         // v0.13.0: the game edge reused the cooperative yield, the parked
         // tenant kept ~5 GB of CUDA state, and the eviction counted `yielded`.
+        // Since 0.14.0 `yield_cmd` is a parsed no-op.
         let l = ladder("game-hs", false);
         let state = shared(ArbiterState::new());
 
@@ -3482,49 +3391,69 @@ mod tests {
         }
         assert_eq!(
             last_eviction(&state, "low.service"),
-            ("hard_stop".into(), "graceful".into())
+            ("game".into(), "graceful".into())
         );
         assert!(!take_marker(&l.resumed), "no resume while gaming");
     }
 
     #[tokio::test]
-    async fn tenant_preemption_still_yields_first() {
-        let l = ladder("tenant-yield", true);
+    async fn tenant_preemption_stops_the_lower_tier_then_restores_and_resumes_it() {
+        let l = ladder("tenant-stop", true);
+        let idle = l.with_high_busy(false);
+        // `new()`, not `with_config`: no startup resume owed, so every resume
+        // below is caused by the preemption alone.
         let state = shared(ArbiterState::new());
 
-        pass_seen(&state, &l.cfg, false).await;
-        assert_eq!(read_state(&state).state, State::Available);
-        assert!(take_marker(&l.yielded), "tenant preemption must yield");
-        assert!(l.low_run.exists(), "a yield leaves the tenant running");
-        assert!(l.high_run.exists(), "the busy tier is untouched");
+        // `high` is busy → `low` is preempted: stopped, never parked.
+        for _ in 0..2 {
+            pass_seen(&state, &l.cfg, false).await;
+            assert_eq!(read_state(&state).state, State::Available);
+            assert!(!l.low_run.exists(), "the displaced tenant must be stopped");
+            assert!(l.high_run.exists(), "the busy tier is untouched");
+            assert!(!take_marker(&l.resumed), "no resume while still preempted");
+        }
+        assert!(!take_marker(&l.yielded), "yield_cmd must never run");
         let ev = read_state(&state).metrics.evictions["low.service"];
-        assert_eq!((ev.yielded, ev.graceful), (1, 0));
+        assert_eq!((ev.yielded, ev.graceful), (0, 1));
         assert_eq!(
             last_eviction(&state, "low.service"),
-            ("yield_first".into(), "yielded".into())
+            ("tenant preemption".into(), "graceful".into())
         );
+        assert!(read_state(&state).needs_resume.contains("low.service"));
+
+        // Demand ends → `low` is restarted, then resumed exactly once.
+        pass_seen(&state, &idle, false).await;
+        assert!(l.low_run.exists(), "the eager tenant comes back");
+        assert!(take_marker(&l.resumed), "leaving preemption must resume");
+        assert!(
+            take_marker(&l.resumed_up),
+            "resume_cmd must run after the unit is back up"
+        );
+        assert!(read_state(&state).needs_resume.is_empty());
+
+        pass_seen(&state, &idle, false).await;
+        assert!(!take_marker(&l.resumed), "only once per eviction");
     }
 
     #[tokio::test]
-    async fn game_hard_stops_a_unit_that_tenant_preemption_parked() {
-        // A parked tenant is still running, so the game edge must not read it
-        // as AlreadyClear — it gets stopped like any other.
-        let l = ladder("parked-then-game", true);
+    async fn non_eager_unit_is_resumed_after_preemption_but_not_started() {
+        // Review regression (v0.12): resume used to be reached only while
+        // iterating the eager targets, so a non-eager unit kept its park flag.
+        let l = ladder_with("tenant-noneager", true, false);
+        let idle = l.with_high_busy(false);
         let state = shared(ArbiterState::new());
 
         pass_seen(&state, &l.cfg, false).await;
-        assert!(take_marker(&l.yielded));
-        assert!(l.low_run.exists(), "parked, not stopped");
+        assert!(!l.low_run.exists());
+        assert!(!take_marker(&l.resumed), "no resume while still preempted");
 
-        pass_seen(&state, &l.cfg, true).await;
-        assert!(!l.low_run.exists(), "the game must stop the parked tenant");
-        assert!(!take_marker(&l.yielded), "and must not re-yield it");
-        let ev = read_state(&state).metrics.evictions["low.service"];
-        assert_eq!((ev.yielded, ev.graceful), (1, 1));
-        assert_eq!(
-            last_eviction(&state, "low.service"),
-            ("hard_stop".into(), "graceful".into())
-        );
+        pass_seen(&state, &idle, false).await;
+        assert!(take_marker(&l.resumed), "a non-eager unit is resumed too");
+        assert!(!l.low_run.exists(), "but never started");
+        assert!(read_state(&state).needs_resume.is_empty());
+
+        pass_seen(&state, &idle, false).await;
+        assert!(!take_marker(&l.resumed), "only once per eviction");
     }
 
     #[tokio::test]
@@ -3536,7 +3465,7 @@ mod tests {
         assert!(!l.low_run.exists());
 
         // One pass sees no game (a launcher hand-off, a scan between two
-        // processes). Inside the 10 s default grace: still gaming, nothing
+        // processes). Inside the 30 s default grace: still gaming, nothing
         // resumed, nothing started.
         pass_seen(&state, &l.cfg, false).await;
         {

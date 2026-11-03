@@ -365,6 +365,16 @@ mod daemon {
             reconcile_interval_s = cfg.reconcile_interval_s,
             "gpu-arbiter starting"
         );
+        // Once, at load: 0.13 configs still carry the retired cooperative-yield
+        // keys. They parse (an upgrade must not break a live config) but do
+        // nothing, which the operator should hear about.
+        let deprecated = cfg.deprecated_keys();
+        if !deprecated.is_empty() {
+            tracing::warn!(
+                keys = %deprecated.join(", "),
+                "config sets deprecated keys that are ignored since 0.14.0 (evictions always stop the unit); remove them"
+            );
+        }
 
         // 2. Shared state + the trigger channel.
         let state = Arc::new(RwLock::new(ArbiterState::with_config(&cfg)));

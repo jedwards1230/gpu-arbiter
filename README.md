@@ -108,9 +108,8 @@ busy_cmd = ["sh", "-c", "ollama ps | tail -n +2 | grep -q ."]  # exit 0 = busy, 
 
 [[managed_units]]
 unit = "asr.service"
-priority = 25                                       # yields to the LLM as well as to games
+priority = 25                                       # stopped for the LLM as well as for games
 busy_cmd  = ["curl", "-sf", "http://127.0.0.1:9000/busy"]
-yield_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/release"]
 resume_cmd = ["curl", "-sfX", "POST", "http://127.0.0.1:9000/gpu/acquire"]
 
 [[game_patterns]]
@@ -164,15 +163,12 @@ A few decisions that are less obvious than they look:
 - **A zero VRAM reading is not trusted until a nonzero one is seen first.**
   Otherwise a typo'd `vram_match` reads as "already drained" and the daemon
   reports a completed eviction while the tenant still holds the card.
-- **A game gets a stopped tenant, never a parked one.** The cooperative
-  `yield_cmd` is only for one tenant preempting another. A parked tenant keeps
-  its process and its CUDA context, and on Windows nothing can see that, so a
-  game launch (and a manual stop) always stops the unit, re-stops one that comes
-  back mid-game, and waits `game_exit_grace_s` (default 10 s) of no game before
-  restoring anything.
-- **`yield_cmd` requires `busy_cmd`.** Without a probe, cooperative release is
-  unobservable — the daemon would declare success on zero evidence. It refuses
-  the stage instead of guessing.
+- **Eviction means stopped, never parked.** A tenant asked to "park" keeps its
+  process and its CUDA context, and on Windows nothing can see that. So every
+  eviction — a game, a busier tenant, a manual stop — stops the unit, a unit
+  that comes back mid-game is stopped again, and nothing is restored until no
+  game has been seen for `game_exit_grace_s` (default 30 s). (The 0.13
+  `yield_cmd` still parses but is ignored.)
 - **Platform-specific at the edges, portable in the middle.** Every OS-specific
   edge is `cfg`-gated with a stub, so classification, config parsing, and state
   transitions are one implementation, shared by Linux and Windows and tested
