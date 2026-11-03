@@ -275,8 +275,10 @@ loading, but they do nothing, and the daemon warns about them once at startup.
 .B resume_cmd
 runs once after the daemon brings a stopped unit back (and once per unit at
 startup) and must be idempotent; use it to clear tenant\-side park flags. It
-runs only once the unit is up (started by that pass, or confirmed running), and
-not in a pass whose pre\-start re\-scan saw a game; until then it stays owed.
+runs only once the unit is up (started by that pass, or confirmed running).
+The pass re\-scans processes immediately before each start and each resume;
+the first game it sees skips every remaining start and resume in that pass,
+and a unit whose resume was skipped stays owed.
 .B busy_cmd
 is not run for a held unit or one confirmed stopped.
 .PP

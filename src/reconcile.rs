@@ -386,13 +386,14 @@ pub(crate) async fn reconcile_with<O: Observer>(
             // 500 start failure) and leaves any manual hold in place — nothing
             // about the unit changed.
             let current = read_state(state).state;
-            if matches!(current, State::Gaming | State::Evicting) {
+            let gate = if matches!(current, State::Gaming | State::Evicting) {
                 tracing::info!(
                     unit = %unit,
                     state = ?current,
                     "manual unit start rejected: a game holds the GPU"
                 );
                 let _ = reply.send(Err(ManualActionError::GpuHeldByGame));
+                ManualStartGate::Refused
             } else if let Some(by) = preempting_tenant(state, cfg, &unit).await {
                 // Starting it would only have this same pass's tenant
                 // preemption stop it again: reply 200, then stop. Reject the
@@ -403,25 +404,33 @@ pub(crate) async fn reconcile_with<O: Observer>(
                     "manual unit start rejected: a busy higher-priority tenant preempts it"
                 );
                 let _ = reply.send(Err(ManualActionError::PreemptedByTenant));
-            } else if match claim_appeared(observer, cfg).await {
+                ManualStartGate::Refused
+            } else {
                 // `state` is the previous pass's verdict, and the busy probes
                 // above can take seconds, so re-scan (off-lock) immediately
                 // before the start and refuse the same way if a game is up.
                 // See `claim_appeared` for the window that remains.
-                Ok(game) => game,
-                Err(e) => {
-                    // Cannot tell whether a game is running: do not start.
-                    tracing::warn!(unit = %unit, error = %e, "manual unit start: claim re-scan failed (still held)");
-                    let _ = reply.send(Err(ManualActionError::Failed));
-                    return Err(e);
+                match claim_appeared(observer, cfg).await {
+                    Ok(false) => ManualStartGate::Proceed(reply),
+                    Ok(true) => {
+                        tracing::info!(
+                            unit = %unit,
+                            "manual unit start rejected: a game launched since the last pass"
+                        );
+                        let _ = reply.send(Err(ManualActionError::GpuHeldByGame));
+                        ManualStartGate::Refused
+                    }
+                    Err(e) => {
+                        // Cannot tell whether a game is running: do not start.
+                        // Still fall through to the rest of the pass — its own
+                        // observe may well succeed and drive an eviction.
+                        tracing::warn!(unit = %unit, error = %e, "manual unit start: claim re-scan failed (still held)");
+                        let _ = reply.send(Err(ManualActionError::Failed));
+                        ManualStartGate::Failed
+                    }
                 }
-            } {
-                tracing::info!(
-                    unit = %unit,
-                    "manual unit start rejected: a game launched since the last pass"
-                );
-                let _ = reply.send(Err(ManualActionError::GpuHeldByGame));
-            } else {
+            };
+            if let ManualStartGate::Proceed(reply) = gate {
                 match manual_start(cfg, &unit).await {
                     Ok(started) => {
                         // Clear the hold (if any) on success: the operator is
@@ -884,6 +893,19 @@ pub(crate) async fn reconcile_with<O: Observer>(
 
     refresh_substate(state, cfg, presence, backend).await;
     Ok(())
+}
+
+/// What the checks ahead of a manual start decided. The reply has already
+/// been sent for anything but `Proceed`, which carries it to the start;
+/// either way the rest of the pass runs.
+#[derive(Debug)]
+enum ManualStartGate {
+    /// Every check passed: run the start, then reply.
+    Proceed(tokio::sync::oneshot::Sender<Result<(), ManualActionError>>),
+    /// Rejected with a 409 (a game, or a busy higher tier).
+    Refused,
+    /// A check itself failed (the claim re-scan): replied 500, nothing started.
+    Failed,
 }
 
 /// Re-scan right now: has a game claim appeared since the top of the pass?
@@ -4162,5 +4184,76 @@ mod tests {
         for p in [&run_a, &run_b] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// Fails its first `observe` call, then reports a game on every later one.
+    struct FailFirstObserver {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Observer for FailFirstObserver {
+        fn now(&self) -> Instant {
+            Instant::now() + FAKE_CLOCK_LEAD
+        }
+
+        async fn observe(&self) -> Result<ProcSnapshot, ReconcileError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(ReconcileError::Io(std::io::Error::other("scan failed")));
+            }
+            FakeObserver { game: true }.observe().await
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_start_rescan_error_still_lets_the_pass_evict() {
+        // The manual start's re-scan fails (500, hold kept), but the pass must
+        // carry on: its own observe sees a game and evicts the running unit.
+        let run_a = marker_path("rescan-err-a-run");
+        let run_b = marker_path("rescan-err-b-run");
+        std::fs::write(&run_a, b"").unwrap();
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            eviction_timeout_s = 0
+
+            [[managed_units]]
+            unit = "a.service"
+            {a}
+
+            [[managed_units]]
+            unit = "b.service"
+            eager_restart = false
+            {b}
+            "#,
+            a = crate::testutil::stateful_unit_cmds(&run_a),
+            b = crate::testutil::stateful_unit_cmds(&run_b),
+        )))
+        .unwrap();
+        let mut initial = ArbiterState::new();
+        initial.held.insert("b.service".to_string());
+        let state = shared(initial);
+
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let presence = crate::presence::PresenceMonitor::new(0);
+        reconcile_with(
+            &FailFirstObserver {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            },
+            &state,
+            &cfg,
+            &presence,
+            ReconcileTrigger::ManualStart {
+                unit: "b.service".to_string(),
+                reply,
+            },
+            GpuBackend::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.await.unwrap(), Err(ManualActionError::Failed));
+        assert!(!run_b.exists(), "nothing started");
+        let g = read_state(&state);
+        assert!(g.held.contains("b.service"), "hold kept");
+        assert_eq!(g.state, State::Gaming, "the pass still ran");
+        assert!(!run_a.exists(), "and evicted the running unit");
     }
 }

@@ -118,7 +118,9 @@ reconciliation enforces applies to operators too; a unit started mid-game
 would only be stopped again by the next pass's
 [gaming invariant](#game-edge-gaming-invariant-and-exit-grace). The rejection
 also applies during the exit grace, while `state` is still `gaming`, and to a
-game that launched since the last pass: the start re-scans processes first. On
+game that launched since the last pass: the start re-scans processes
+immediately before starting (a re-scan that fails replies `500`, keeps the hold,
+and the rest of the pass still runs). On
 rejection nothing changes: the
 unit is not started and any hold stays in place; retry once `/status` reports
 `available`.
@@ -454,8 +456,12 @@ keys.
 **edge-triggered**: it is owed after every eviction and once per unit when the
 daemon starts, and runs once the unit is eligible **and up** — started by that
 pass, or confirmed running. A unit that stays down (a non-eager unit, say) keeps
-it owed until it is running again. Before any start or owed resume the pass
-re-scans processes once; if a game has appeared, neither runs this pass. It does not run on steady-state passes. A failed run is retried on the next pass until it succeeds. "Eligible"
+it owed until it is running again. The pass re-scans processes immediately
+before **each** start and **each** resume; the first game it sees skips every
+remaining start and resume in that pass, and a unit whose resume was skipped
+stays owed. (A game launching in the instant between that scan and the start
+itself is caught by the next pass's game edge and the gaming invariant.) It
+does not run on steady-state passes. A failed run is retried on the next pass until it succeeds. "Eligible"
 means no game holds the GPU and the unit is neither held nor preempted; it does
 **not** depend on `eager_restart`, which only controls whether a stopped unit
 is started. It never starts a unit itself.
