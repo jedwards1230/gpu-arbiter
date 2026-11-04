@@ -60,7 +60,8 @@ pub enum UnitError {
         action: &'static str,
         /// The unit name.
         unit: String,
-        /// Failure detail (trimmed stderr, or why nothing ran).
+        /// Failure detail (exit code plus bounded stderr/stdout, or why nothing
+        /// ran).
         detail: String,
     },
     /// A process-control invocation exceeded `SYSTEMCTL_TIMEOUT`. A wedged
@@ -78,6 +79,17 @@ pub enum UnitError {
     /// The GPU query during the eviction wait failed.
     #[error("gpu query during eviction: {0}")]
     Gpu(#[from] crate::gpu::GpuError),
+    /// The eviction escalated to the kill, and the unit was still running
+    /// (or its run state could not be confirmed) afterwards. The eviction's
+    /// postcondition — not running — does not hold, so it is reported as a
+    /// failure rather than a completed `sigkill`.
+    #[error("{unit} still running after kill ({detail})")]
+    StillRunning {
+        /// The unit name.
+        unit: String,
+        /// What the kill command reported, for the log.
+        detail: String,
+    },
 }
 
 /// How a single tenant's process is controlled. Resolved purely from a
@@ -139,14 +151,6 @@ impl Supervisor {
 /// Outcome of an eviction attempt — surfaced for logging/metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionOutcome {
-    /// The tenant released the GPU **cooperatively** in response to `yield_cmd`
-    /// and was never stopped — its process is still running, just no longer
-    /// holding the GPU.
-    ///
-    /// The best outcome available: no in-flight work is lost and there is no
-    /// cold model reload when the tenant resumes. Only reachable for a unit that
-    /// configures `yield_cmd`.
-    Yielded,
     /// VRAM dropped below the free threshold within the timeout (graceful).
     Freed,
     /// Timed out → SIGKILL was issued and the daemon proceeded regardless.
@@ -161,9 +165,6 @@ pub enum EvictionOutcome {
 /// force-killed once the log window has passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionMetricOutcome {
-    /// [`EvictionOutcome::Yielded`] — the tenant released the GPU cooperatively
-    /// and was never stopped.
-    Yielded,
     /// [`EvictionOutcome::Freed`] — VRAM drained gracefully.
     Graceful,
     /// [`EvictionOutcome::Escalated`] — SIGKILL was issued.
@@ -177,7 +178,6 @@ impl EvictionMetricOutcome {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            EvictionMetricOutcome::Yielded => "yielded",
             EvictionMetricOutcome::Graceful => "graceful",
             EvictionMetricOutcome::Sigkill => "sigkill",
             EvictionMetricOutcome::Error => "error",
@@ -195,7 +195,6 @@ pub fn eviction_metric_outcome(
     result: &Result<EvictionOutcome, UnitError>,
 ) -> Option<EvictionMetricOutcome> {
     match result {
-        Ok(EvictionOutcome::Yielded) => Some(EvictionMetricOutcome::Yielded),
         Ok(EvictionOutcome::Freed) => Some(EvictionMetricOutcome::Graceful),
         Ok(EvictionOutcome::Escalated) => Some(EvictionMetricOutcome::Sigkill),
         Ok(EvictionOutcome::AlreadyClear) => None,
@@ -211,18 +210,17 @@ const EVICTION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Which tenant hook a failure came from — the `{hook=...}` label on
 /// `gpu_arbiter_hook_failures_total`.
 ///
-/// Deliberately only the three *tenant-supplied* hooks. `is-active`/`stop`/
+/// Deliberately only the *tenant-supplied* hooks. `is-active`/`stop`/
 /// `start` already surface as typed [`UnitError`]s that callers propagate and
-/// count elsewhere; these three are the ones whose failures are swallowed by
+/// count elsewhere; these are the ones whose failures are swallowed by
 /// design (best-effort resume, fail-toward-not-busy probe) and therefore need a
 /// counter to be observable at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Hook {
     /// `busy_cmd` — the preemption-source probe.
     Busy,
-    /// `yield_cmd` — the cooperative-release request.
-    Yield,
-    /// `resume_cmd` — the undo for a cooperative yield.
+    /// `resume_cmd` — the idempotent hook run when a unit may use the GPU
+    /// again. (`hook="yield"` was retired with `yield_cmd` in 0.14.0.)
     Resume,
 }
 
@@ -233,7 +231,6 @@ impl Hook {
     pub fn label(self) -> &'static str {
         match self {
             Hook::Busy => "busy",
-            Hook::Yield => "yield",
             Hook::Resume => "resume",
         }
     }
@@ -341,6 +338,53 @@ fn stderr_excerpt(stderr: &[u8]) -> String {
         format!("{truncated}… (truncated)")
     } else {
         line.to_string()
+    }
+}
+
+/// Bounded failure detail for a control command that exited non-zero, for
+/// [`UnitError::Exit`]: the exit code plus whatever it printed on **both**
+/// streams. stdout matters as much as stderr here — Windows `sc.exe` reports
+/// failures (e.g. `FAILED 1056: An instance of the service is already
+/// running`) on stdout and leaves stderr empty, which used to make the logged
+/// error blank.
+///
+/// Each stream's non-empty lines are trimmed and joined with ` | ` onto one line
+/// (no newline can forge a log record), and capped at [`OUTPUT_EXCERPT_MAX`]
+/// chars per stream.
+fn exit_detail(out: &std::process::Output) -> String {
+    let code = out
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |c| c.to_string());
+    let mut parts = vec![format!("exit {code}")];
+    for (name, bytes) in [("stderr", &out.stderr), ("stdout", &out.stdout)] {
+        if let Some(text) = output_excerpt(bytes) {
+            parts.push(format!("{name}: {text}"));
+        }
+    }
+    parts.join("; ")
+}
+
+/// Per-stream character cap for [`exit_detail`].
+const OUTPUT_EXCERPT_MAX: usize = 300;
+
+/// All non-empty trimmed lines of `bytes` joined with ` | `, capped at
+/// [`OUTPUT_EXCERPT_MAX`] chars; `None` if there are none.
+fn output_excerpt(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if joined.is_empty() {
+        None
+    } else if joined.chars().count() > OUTPUT_EXCERPT_MAX {
+        let truncated: String = joined.chars().take(OUTPUT_EXCERPT_MAX).collect();
+        Some(format!("{truncated}… (truncated)"))
+    } else {
+        Some(joined)
     }
 }
 
@@ -626,6 +670,10 @@ async fn run_argv(
     };
     let mut cmd = tokio::process::Command::new(prog);
     cmd.args(rest);
+    // When the timeout below fires, the `output()` future is dropped; without
+    // this the child (a wedged probe, a hung hook) would be orphaned and keep
+    // running. With it, dropping the future kills the child.
+    cmd.kill_on_drop(true);
     if !unit_arg.is_empty() {
         cmd.arg(unit_arg);
     }
@@ -667,101 +715,15 @@ pub async fn is_running(u: &ManagedUnit) -> Result<bool, UnitError> {
     Ok(out.status.success())
 }
 
-/// How the cooperative release stage ended. Internal to [`evict`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum YieldOutcome {
-    /// The tenant let go of the GPU within its budget — no stop needed.
-    Released,
-    /// The request was accepted but the tenant had not released in time.
-    TimedOut,
-    /// The `yield_cmd` itself could not be run.
-    Failed,
-}
-
-/// Ask `u` to release the GPU cooperatively and wait for it to actually do so.
+/// Run `u`'s `resume_cmd`: the idempotent hook that tells a tenant it may use
+/// the GPU again (for example, clearing a park flag a v0.13 cooperative yield
+/// left behind — earmark's `runner_control.arbiter_yield`).
 ///
-/// `yield_cmd` exiting 0 means only "request accepted" — the tenant still needs
-/// time to drop its GPU context — so this then polls until it reports itself no
-/// longer busy, or the budget expires.
-///
-/// **Release is judged by `busy_cmd`, not by VRAM.** That is the one signal that
-/// works on both platforms: per-process VRAM is unavailable under WDDM entirely,
-/// and even on Linux a tenant that parks its model to host RAM without exiting
-/// may not drop device VRAM to zero (the CUDA context itself survives). Asking
-/// the tenant "are you still working?" is both more portable and more honest
-/// than inferring it from a number.
-///
-/// A unit with `yield_cmd` but no `busy_cmd` therefore cannot prove it released,
-/// and always [`YieldOutcome::TimedOut`]s into the stop path. That is the safe
-/// direction, and it is called out in the config docs.
-async fn try_yield(u: &ManagedUnit, cfg: &Config) -> YieldOutcome {
-    let Some(cmd) = u.yield_cmd.as_ref() else {
-        return YieldOutcome::Failed;
-    };
-
-    // No `busy_cmd` means release is UNOBSERVABLE, so the cooperative stage
-    // cannot run at all — skip it before sending anything.
-    //
-    // This guard is load-bearing, not defensive. `is_busy` reports `false` for a
-    // unit with no probe, so without it the poll below reads "not busy" on its
-    // first iteration and returns `Released` — declaring the tenant let go of the
-    // GPU on zero evidence, leaving it running and holding VRAM while the daemon
-    // reports a completed eviction. That is the worst possible failure here: the
-    // game never gets the card and nothing looks wrong.
-    //
-    // Escalating immediately rather than sleeping out the budget is deliberate.
-    // Waiting cannot produce information we are structurally unable to observe,
-    // so it would be pure added latency ahead of the stop we are going to do
-    // anyway — and sending a `yield_cmd` whose effect we can never confirm just
-    // perturbs the tenant for nothing.
-    if u.busy_cmd.is_none() {
-        tracing::warn!(
-            unit = %u.unit,
-            "yield_cmd is set without busy_cmd, so a cooperative release cannot be verified; \
-             skipping the yield stage and stopping the unit instead"
-        );
-        return YieldOutcome::Failed;
-    }
-    match run_argv("yield", &u.unit, &cmd.0, "").await {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            record_hook_failure(&u.unit, Hook::Yield, HookFailure::NonZero);
-            tracing::warn!(
-                unit = %u.unit,
-                code = ?out.status.code(),
-                stderr = %stderr_excerpt(&out.stderr),
-                "yield_cmd exited non-zero; escalating to stop"
-            );
-            return YieldOutcome::Failed;
-        }
-        Err(e) => {
-            record_hook_failure(&u.unit, Hook::Yield, HookFailure::Unrunnable);
-            tracing::warn!(unit = %u.unit, error = %e, "yield_cmd could not be run; escalating to stop");
-            return YieldOutcome::Failed;
-        }
-    }
-
-    let budget = Duration::from_secs(u.yield_timeout_s.unwrap_or(cfg.yield_timeout_s));
-    let start = std::time::Instant::now();
-    loop {
-        if !is_busy(u).await {
-            return YieldOutcome::Released;
-        }
-        if start.elapsed() >= budget {
-            return YieldOutcome::TimedOut;
-        }
-        tokio::time::sleep(EVICTION_POLL_INTERVAL).await;
-    }
-}
-
-/// Let `u` use the GPU again after a cooperative yield — the undo for
-/// [`ManagedUnit::yield_cmd`].
-///
-/// Edge-triggered by the caller: the restore path runs it once when a unit
-/// leaves preemption (after any eviction attempt, yielded or stopped) and once
-/// per unit at daemon startup — see [`crate::state::ArbiterState::needs_resume`].
-/// It must still be idempotent, because the startup resume runs on units that
-/// were never yielded.
+/// Edge-triggered by the caller: the restore path runs it once when a unit the
+/// arbiter stopped may run again (after the unit is back up, if it was
+/// started), and once per unit at daemon startup — see
+/// [`crate::state::ArbiterState::needs_resume`]. It must be idempotent, because
+/// the startup run reaches units that were never stopped.
 ///
 /// Returns `true` when there is nothing left to do (the resume succeeded, or
 /// the unit has no `resume_cmd`), and `false` when it failed, so the caller
@@ -1002,8 +964,8 @@ async fn ollama_loaded_models(
 }
 
 /// Resolve `unit` (a name) against `cfg.resolved_units()`. Used by the
-/// name-only entry points ([`start_by_name`]/[`evict_by_name`]) the reconcile
-/// task drives a `ManualStart`/`ManualStop` trigger through — the HTTP handler
+/// name-only entry points ([`start_by_name`]/[`evict_by_name`]) and by the
+/// reconcile task's `ManualStart`/`ManualStop` handling — the HTTP handler
 /// only has a `String`, not an already-borrowed `&ManagedUnit`, by the time it
 /// crosses the trigger channel.
 ///
@@ -1012,7 +974,7 @@ async fn ollama_loaded_models(
 /// the daemon has no config-reload path (no SIGHUP) that could change
 /// `resolved_units()` out from under a live `Arc<Config>`. Still a typed error,
 /// not a panic or silent no-op, in case that invariant is ever broken.
-fn resolve_unit<'c>(cfg: &'c Config, unit: &str) -> Result<&'c ManagedUnit, UnitError> {
+pub(crate) fn resolve_unit<'c>(cfg: &'c Config, unit: &str) -> Result<&'c ManagedUnit, UnitError> {
     cfg.resolved_units()
         .iter()
         .find(|u| u.unit == unit)
@@ -1065,12 +1027,13 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
         Err(UnitError::Exit {
             action: "start",
             unit: u.unit.clone(),
-            detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            detail: exit_detail(&out),
         })
     }
 }
 
-/// Evict `unit` from the GPU: `systemctl stop`, then poll until the unit's own
+/// Evict `unit` from the GPU by **stopping** it: `systemctl stop` (or
+/// `stop_cmd`), then poll until the unit's own
 /// VRAM drains below `vram_free_threshold_mb` (graceful) or
 /// `eviction_timeout_s` elapses. On timeout, re-check the unit: if it's
 /// already inactive the process is gone and its VRAM released (VRAM free *or
@@ -1124,6 +1087,8 @@ pub async fn start(u: &ManagedUnit) -> Result<(), UnitError> {
 ///
 /// Returns [`UnitError`] if the initial `is_running` check or the `stop`
 /// control command fails to spawn, times out, or (for `stop`) exits non-zero.
+/// A failed `stop` with the unit still up (or unknown) is escalated to the
+/// kill before the error is returned.
 /// A failed VRAM/attribution poll during the wait loop is handled internally
 /// (treated as "not yet free"), not propagated as an error.
 pub async fn evict(
@@ -1137,18 +1102,12 @@ pub async fn evict(
 /// Per-stage wall-clock of one eviction, in seconds.
 ///
 /// Feeds `gpu_arbiter_eviction_duration_seconds`, which exists so
-/// `yield_timeout_s` and `eviction_timeout_s` can be set from what evictions
-/// actually cost on the host rather than guessed. The stages are reported
-/// separately on purpose: a combined number would hide whether the cooperative
-/// stage is paying for itself or merely adding latency ahead of a stop that was
-/// always going to happen.
+/// `eviction_timeout_s` can be set from what evictions actually cost on the
+/// host rather than guessed.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EvictionTimings {
-    /// Time in stage 1 (`yield_cmd` → tenant reports not busy). `None` when the
-    /// unit has no `yield_cmd`, which is distinct from a zero-length stage.
-    pub yield_secs: Option<f64>,
-    /// Time in stage 2 (`stop_cmd` → freed, or the SIGKILL escalation). `None`
-    /// when a cooperative release meant the stop path never ran.
+    /// Time from `stop_cmd` to freed (or the SIGKILL escalation). `None` when
+    /// the unit was not running, so nothing was stopped.
     pub stop_secs: Option<f64>,
     /// End-to-end, which is what a launching game actually waits through.
     pub total_secs: f64,
@@ -1195,52 +1154,32 @@ async fn evict_inner(
         return Ok(EvictionOutcome::AlreadyClear);
     }
 
-    // ── Stage 1: cooperative release ────────────────────────────────────────
-    //
-    // Ask the tenant to drop the GPU while staying alive. Strictly better than a
-    // stop when it works: no in-flight work is lost and there is no cold model
-    // reload afterwards. Skipped entirely for a unit with no `yield_cmd`.
-    //
-    // The tenant cannot hold the GPU against a higher tier by ignoring this —
-    // failure to release within the budget falls through to the stop path below,
-    // and the budget is deliberately short (see `Config::yield_timeout_s`).
-    if u.yield_cmd.is_some() {
-        let started = std::time::Instant::now();
-        let yield_outcome = try_yield(u, cfg).await;
-        timings.yield_secs = Some(started.elapsed().as_secs_f64());
-        match yield_outcome {
-            YieldOutcome::Released => {
-                tracing::info!(
-                    unit = %u.unit,
-                    elapsed_s = started.elapsed().as_secs_f64(),
-                    "tenant released the GPU cooperatively; not stopping it"
-                );
-                return Ok(EvictionOutcome::Yielded);
-            }
-            YieldOutcome::TimedOut => {
-                tracing::info!(
-                    unit = %u.unit,
-                    elapsed_s = started.elapsed().as_secs_f64(),
-                    "cooperative release did not complete in time; escalating to stop"
-                );
-            }
-            YieldOutcome::Failed => {
-                // Already logged inside `try_yield`. Fall through — a broken
-                // yield must never block the eviction.
-            }
-        }
-    }
-
     // Graceful teardown: SIGTERM frees the CUDA context in ~1s. An in-flight
     // request dying is accepted by design.
     let stop_started = std::time::Instant::now();
-    let stop = stop_unit(&sup, &u.unit).await?;
-    if !stop.status.success() {
-        return Err(UnitError::Exit {
+    let stop_err = match stop_unit(&sup, &u.unit).await {
+        Ok(stop) if stop.status.success() => None,
+        Ok(stop) => Some(UnitError::Exit {
             action: "stop",
             unit: u.unit.clone(),
-            detail: String::from_utf8_lossy(&stop.stderr).trim().to_string(),
-        });
+            detail: exit_detail(&stop),
+        }),
+        Err(e) => Some(e),
+    };
+    if let Some(e) = stop_err {
+        // A stop that failed outright (non-zero exit, timeout, spawn failure)
+        // must not leave a live tenant on the GPU just because the polite path
+        // broke: e.g. `sc.exe stop` refusing a service wedged in START_PENDING
+        // (error 1061). Escalate to the kill if the unit is still up — or if
+        // that cannot be told — and still report the error, so the eviction is
+        // counted as `error` and the pass is marked degraded.
+        let still_running = is_running(u).await.unwrap_or(true);
+        if still_running {
+            tracing::warn!(unit = %u.unit, error = %e, "stop_cmd failed with the unit still up; escalating to kill");
+            let _ = kill_unit(&sup, &u.unit).await;
+        }
+        timings.stop_secs = Some(stop_started.elapsed().as_secs_f64());
+        return Err(e);
     }
 
     // Poll until this unit's own VRAM drops below the free threshold (or the
@@ -1262,40 +1201,33 @@ async fn evict_inner(
         {
             seen_nonzero = true;
         }
-        // VRAM cannot answer on this platform (WDDM), so the unit's own run
-        // state is the gate instead — a service that has reached SERVICE_STOPPED
-        // has had its process exit, and WDDM reclaims that process's VRAM
-        // deterministically at exit.
-        //
-        // An inconclusive check deliberately does NOT free the gate: on error
-        // this falls through to `eviction_step`, which never reports
-        // `Unavailable` as freed, so the eviction proceeds to its timeout and
-        // the existing escalation path (which re-checks run state itself before
-        // deciding whether a SIGKILL would even hit anything). Same
-        // unsure-means-keep-waiting default as everywhere else here.
-        if matches!(reading, UnitVramReading::Unavailable)
-            && let Ok(false) = is_running(u).await
-        {
-            timings.stop_secs = Some(stop_started.elapsed().as_secs_f64());
-            return Ok(EvictionOutcome::Freed);
-        }
-        match eviction_step(reading, start.elapsed(), cfg) {
+        // The postcondition of every eviction is "not running", on every
+        // platform. VRAM opening the gate is not enough on its own: on WDDM
+        // there is no VRAM answer at all (`Unavailable`), and on Linux a
+        // tenant can drop its attributed VRAM while its process lives on. So
+        // whenever VRAM would release the gate, the unit's run state is
+        // probed and has to say "stopped". An inconclusive probe keeps
+        // waiting, and the timeout escalates as usual.
+        let step = eviction_step(reading, start.elapsed(), cfg);
+        let vram_open =
+            step == EvictionStep::Freed || matches!(reading, UnitVramReading::Unavailable);
+        let running = if vram_open {
+            is_running(u).await.ok()
+        } else {
+            None
+        };
+        let timed_out = start.elapsed() >= Duration::from_secs(cfg.eviction_timeout_s);
+        match poll_step(step, vram_open, running, timed_out) {
             EvictionStep::Freed => {
                 timings.stop_secs = Some(stop_started.elapsed().as_secs_f64());
                 return Ok(EvictionOutcome::Freed);
             }
             EvictionStep::Escalate => {
-                // Timed out on VRAM — but the stop already reaped the unit
-                // synchronously, so the only way we're here is either real
-                // VRAM pressure OR a flaky `nvidia-smi` (a `None` read never
-                // resolves as "free"). VRAM free *or PID gone* gate: if the unit
-                // is already inactive, the process is gone and its CUDA context
-                // (hence VRAM) released — SIGKILL would hit nothing. Treat that as
-                // a graceful release instead of a misleading `Escalated`.
-                // Tristate: when the recheck itself fails, the decision
-                // default is "assume still running" (unsure ⇒ don't block the
-                // SIGKILL escalation on an unconfirmed "it's already gone") —
-                // kept, but logged instead of silently coerced.
+                // Timed out. If the unit is already inactive, the process is
+                // gone and its VRAM released — SIGKILL would hit nothing, so
+                // that is a graceful release, not a misleading `Escalated`.
+                // Tristate: a recheck that fails reads as "still running"
+                // (unsure ⇒ do not skip the kill), logged.
                 let still_running = is_running(u)
                     .await
                     .inspect_err(|e| {
@@ -1307,15 +1239,80 @@ async fn evict_inner(
                     return Ok(EvictionOutcome::Freed);
                 }
                 // Unit genuinely still up (orphaned runner outside the cgroup,
-                // wedged teardown): force-kill and proceed — gaming wins the GPU.
-                let _ = kill_unit(&sup, &u.unit).await;
+                // wedged teardown): kill it, then judge the result by run
+                // state, not by the kill command's exit status (`taskkill`
+                // exits 128 when the process is already gone).
+                let killed = kill_unit(&sup, &u.unit).await;
+                let gone = wait_until_stopped(u, KILL_SETTLE).await;
                 timings.stop_secs = Some(stop_started.elapsed().as_secs_f64());
-                return Ok(EvictionOutcome::Escalated);
+                if gone {
+                    if let Err(e) = &killed {
+                        tracing::debug!(unit = %u.unit, error = %e, "kill command reported failure but the unit is stopped");
+                    }
+                    return Ok(EvictionOutcome::Escalated);
+                }
+                return Err(UnitError::StillRunning {
+                    unit: u.unit.clone(),
+                    detail: match killed {
+                        Ok(()) => "kill command exited 0".to_string(),
+                        Err(e) => e.to_string(),
+                    },
+                });
             }
             EvictionStep::KeepWaiting => {
                 tokio::time::sleep(EVICTION_POLL_INTERVAL).await;
             }
         }
+    }
+}
+
+/// How long to keep re-checking run state after the kill before declaring the
+/// unit still running. A forced kill is near-synchronous, but a service
+/// manager can take a moment to report the service stopped.
+const KILL_SETTLE: Duration = Duration::from_secs(2);
+
+/// Poll `is_running` until it confirms the unit stopped or `budget` runs out.
+/// `true` only on a confirmed `Ok(false)`; a probe that keeps failing is not
+/// proof the unit is gone.
+async fn wait_until_stopped(u: &ManagedUnit, budget: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if matches!(is_running(u).await, Ok(false)) {
+            return true;
+        }
+        if start.elapsed() >= budget {
+            return false;
+        }
+        tokio::time::sleep(EVICTION_POLL_INTERVAL).await;
+    }
+}
+
+/// One eviction poll's decision, from the VRAM step and the run-state probe.
+/// **Pure** — unit-tested.
+///
+/// - `vram_open`: VRAM would release the gate this poll (the step is `Freed`,
+///   or VRAM cannot answer at all on this platform).
+/// - `running`: the `is_running` probe taken because `vram_open` (`None` when
+///   it was not taken, or failed).
+///
+/// Freed only when the unit is **confirmed** not running. A VRAM-freed step
+/// with the unit still up (or unknown) keeps waiting, and escalates once the
+/// timeout has passed — otherwise "freed wins over timed out" in
+/// [`eviction_step`] would poll a live, low-VRAM tenant forever.
+#[must_use]
+fn poll_step(
+    step: EvictionStep,
+    vram_open: bool,
+    running: Option<bool>,
+    timed_out: bool,
+) -> EvictionStep {
+    if vram_open && running == Some(false) {
+        return EvictionStep::Freed;
+    }
+    match step {
+        EvictionStep::Freed if timed_out => EvictionStep::Escalate,
+        EvictionStep::Freed => EvictionStep::KeepWaiting,
+        other => other,
     }
 }
 
@@ -1464,7 +1461,7 @@ async fn kill_unit(sup: &Supervisor, unit: &str) -> Result<(), UnitError> {
         Err(UnitError::Exit {
             action: "kill",
             unit: unit.to_string(),
-            detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            detail: exit_detail(&out),
         })
     }
 }
@@ -1504,7 +1501,6 @@ mod tests {
         // These strings are a public metric contract. If this
         // test is changed, every alert built on the metric breaks.
         assert_eq!(Hook::Busy.label(), "busy");
-        assert_eq!(Hook::Yield.label(), "yield");
         assert_eq!(Hook::Resume.label(), "resume");
         assert_eq!(HookFailure::NonZero.label(), "nonzero");
         assert_eq!(HookFailure::Unrunnable.label(), "unrunnable");
@@ -2402,6 +2398,61 @@ mod tests {
         assert!(matches!(r, Err(UnitError::Exit { .. })));
     }
 
+    #[test]
+    fn output_excerpt_joins_lines_and_bounds() {
+        // sc.exe-shaped multi-line stdout collapses onto one log-safe line.
+        assert_eq!(
+            output_excerpt(
+                b"[SC] StartService FAILED 1056:\r\n\r\nAn instance of the service is already running.\r\n"
+            )
+            .as_deref(),
+            Some("[SC] StartService FAILED 1056: | An instance of the service is already running.")
+        );
+        assert_eq!(output_excerpt(b""), None);
+        assert_eq!(output_excerpt(b"  \n \n"), None);
+        let got = output_excerpt("y\n".repeat(10_000).as_bytes()).unwrap();
+        assert!(got.ends_with("… (truncated)"), "got: {got}");
+        assert!(
+            got.chars().count() < 400,
+            "not bounded: {}",
+            got.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn start_failure_detail_includes_stdout() {
+        // sc.exe writes its failure reason to stdout and nothing to stderr; the
+        // error detail used to carry stderr only, so the log line was blank.
+        let start_argv = if cfg!(windows) {
+            r#"["cmd", "/c", "echo FAILED 1056 already running & exit 1"]"#
+        } else {
+            r#"["sh", "-c", "echo FAILED 1056 already running; exit 1"]"#
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = {start_argv}
+            stop_cmd = ["true"]
+            is_active_cmd = "false"
+            "#
+        )))
+        .unwrap();
+        let err = start(&cfg.resolved_units()[0]).await.unwrap_err();
+        let UnitError::Exit { detail, .. } = &err else {
+            panic!("expected Exit, got {err:?}");
+        };
+        assert!(detail.contains("exit 1"), "detail: {detail}");
+        assert!(
+            detail.contains("stdout: FAILED 1056 already running"),
+            "detail: {detail}"
+        );
+        assert!(
+            !detail.contains("stderr:"),
+            "empty stderr omitted: {detail}"
+        );
+    }
+
     // ── name-only resolution (start_by_name / evict_by_name) ───────────────
 
     #[tokio::test]
@@ -2455,47 +2506,10 @@ mod tests {
         assert!(matches!(err, UnitError::Exit { .. }));
     }
 
-    #[tokio::test]
-    async fn yield_without_a_busy_probe_does_not_claim_release() {
-        // Regression guard for a real bug.
-        //
-        // `is_busy` reports `false` for a unit with no `busy_cmd`, so the yield
-        // poll's `!is_busy(u)` read "not busy" on its very first iteration and
-        // returned `Released` — declaring the tenant had let go of the GPU on
-        // zero evidence. The unit was left running and still holding VRAM while
-        // the daemon recorded a completed, successful eviction: the game never
-        // got the card and nothing looked wrong anywhere.
-        //
-        // The unit here is configured to be "running" and to have a yield that
-        // succeeds, so a regression genuinely reaches the buggy path. The
-        // eviction must NOT come back `Yielded`.
-        let cfg = Config::from_toml(&crate::testutil::portable_toml(
-            r#"
-            eviction_timeout_s = 0
-
-            [[managed_units]]
-            unit = "fake.service"
-            yield_cmd = ["true"]
-            stop_cmd = ["true"]
-            is_active_cmd = "true"
-            "#,
-        ))
-        .unwrap();
-        let u = &cfg.resolved_units()[0];
-        assert!(u.busy_cmd.is_none(), "fixture must omit busy_cmd");
-
-        let outcome = evict(u, &cfg, GpuBackend::default()).await.unwrap();
-        assert_ne!(
-            outcome,
-            EvictionOutcome::Yielded,
-            "a unit with no busy probe must never be reported as having yielded"
-        );
-    }
-
     #[test]
-    fn check_config_warns_on_yield_without_busy() {
-        // The same misconfiguration, caught by `--check-config` at deploy
-        // time instead of only at the next eviction.
+    fn check_config_flags_deprecated_yield_cmd() {
+        // `yield_cmd` still parses (a 0.13 config must keep loading) but does
+        // nothing; `--check-config` says so, naming the unit.
         let dir = std::env::temp_dir().join(format!(
             "ga-yieldcheck-{}-{}",
             std::process::id(),
@@ -2521,8 +2535,10 @@ mod tests {
         let out = crate::cli::check_config(path.to_str().unwrap()).unwrap();
         assert!(out.starts_with("OK:"), "still a valid config: {out}");
         assert!(
-            out.contains("WARNING") && out.contains("fake.service"),
-            "expected a warning naming the unit, got: {out}"
+            out.contains("WARNING")
+                && out.contains("deprecated")
+                && out.contains("fake.service.yield_cmd"),
+            "expected a deprecation warning naming the key, got: {out}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2680,18 +2696,216 @@ mod tests {
         ))
         .unwrap();
 
-        let outcome = evict(&cfg.managed_units[0], &cfg, GpuBackend::default())
-            .await
-            .unwrap();
+        let result = evict(&cfg.managed_units[0], &cfg, GpuBackend::default()).await;
         // With eviction_timeout_s = 0 the very first poll escalates immediately
         // (no real GPU to read), the recheck can't confirm (the link is gone),
         // and the unsure-assume-still-running default drives the SIGKILL
         // fallback (re-running stop_cmd, since no kill_cmd is configured)
-        // rather than a misleading `Freed`.
-        assert_eq!(outcome, EvictionOutcome::Escalated);
+        // rather than a misleading `Freed`. Nothing can then confirm the unit
+        // stopped, so the eviction completes (no hang) but reports failure:
+        // "not running" is the postcondition, and it is unproven.
+        assert!(
+            matches!(result, Err(UnitError::StillRunning { .. })),
+            "{result:?}"
+        );
         assert!(
             std::fs::symlink_metadata(&link).is_err(),
             "stop_cmd must have removed the link, or the recheck never failed"
         );
+    }
+
+    // ── stop-only eviction and kill escalation ──────────────────────────────
+
+    /// A running, marker-backed unit that still carries a (deprecated)
+    /// `yield_cmd` touching `yielded`, from a 0.13-era config.
+    fn yielding_unit_cfg(run: &std::path::Path, yielded: &std::path::Path) -> Config {
+        Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            eviction_timeout_s = 0
+
+            [[managed_units]]
+            unit = "fake.service"
+            {cmds}
+            busy_cmd = "false"
+            yield_cmd = ["touch", "{yielded}"]
+            "#,
+            cmds = crate::testutil::stateful_unit_cmds(run),
+            yielded = crate::testutil::toml_path(yielded),
+        )))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn eviction_ignores_a_deprecated_yield_cmd_and_stops_the_unit() {
+        let run = crate::testutil::temp_marker("hs-run");
+        let yielded = crate::testutil::temp_marker("hs-yield");
+        std::fs::write(&run, b"").unwrap();
+        let cfg = yielding_unit_cfg(&run, &yielded);
+
+        let outcome = evict(&cfg.resolved_units()[0], &cfg, GpuBackend::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome, EvictionOutcome::Freed);
+        assert!(!run.exists(), "the unit must really be stopped");
+        assert!(!yielded.exists(), "yield_cmd is a no-op: it must never run");
+    }
+
+    #[tokio::test]
+    async fn stop_that_does_not_stop_escalates_to_kill_cmd_after_eviction_timeout() {
+        // The Windows shape: `sc.exe stop` returns at once (STOP_PENDING) but
+        // the service never reaches STOPPED. The wait is `eviction_timeout_s`
+        // (here 1 s); after it the still-running recheck sends `kill_cmd`.
+        let run = crate::testutil::temp_marker("kill-run");
+        let killed = crate::testutil::temp_marker("kill-killed");
+        std::fs::write(&run, b"").unwrap();
+        let p = crate::testutil::toml_path(&run);
+        let is_active = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "if exist {p} (exit 0) else (exit 1)"]"#)
+        } else {
+            format!(r#"["test", "-e", "{p}"]"#)
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            eviction_timeout_s = 1
+
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = {is_active}
+            {kill}
+            "#,
+            kill = crate::testutil::stateful_kill_cmd(&run, &killed),
+        )))
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = evict(&cfg.resolved_units()[0], &cfg, GpuBackend::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome, EvictionOutcome::Escalated);
+        assert!(killed.exists(), "the escalation must run kill_cmd");
+        assert!(!run.exists());
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "kill_cmd must wait out eviction_timeout_s first"
+        );
+        let _ = std::fs::remove_file(&killed);
+    }
+
+    #[tokio::test]
+    async fn failed_stop_with_the_unit_still_up_escalates_to_kill_cmd() {
+        // `sc.exe stop` refusing outright (e.g. 1061 on a service wedged in
+        // START_PENDING) used to return the error with the tenant still on the
+        // GPU. It is still an error, but the kill is attempted first.
+        let run = crate::testutil::temp_marker("stopfail-run");
+        let killed = crate::testutil::temp_marker("stopfail-killed");
+        std::fs::write(&run, b"").unwrap();
+        let p = crate::testutil::toml_path(&run);
+        let is_active = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "if exist {p} (exit 0) else (exit 1)"]"#)
+        } else {
+            format!(r#"["test", "-e", "{p}"]"#)
+        };
+        let cfg = Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["false"]
+            is_active_cmd = {is_active}
+            {kill}
+            "#,
+            kill = crate::testutil::stateful_kill_cmd(&run, &killed),
+        )))
+        .unwrap();
+
+        let result = evict(&cfg.resolved_units()[0], &cfg, GpuBackend::default()).await;
+        assert!(
+            matches!(result, Err(UnitError::Exit { action: "stop", .. })),
+            "{result:?}"
+        );
+        assert!(killed.exists(), "a failed stop must still try kill_cmd");
+        assert!(!run.exists());
+        let _ = std::fs::remove_file(&killed);
+    }
+
+    #[test]
+    fn poll_step_requires_a_confirmed_stop() {
+        use EvictionStep::{Escalate, Freed, KeepWaiting};
+        // Linux: VRAM says free, the process is confirmed gone → freed.
+        assert_eq!(poll_step(Freed, true, Some(false), false), Freed);
+        // VRAM says free but the process is up, or the probe failed → wait…
+        assert_eq!(poll_step(Freed, true, Some(true), false), KeepWaiting);
+        assert_eq!(poll_step(Freed, true, None, false), KeepWaiting);
+        // …and escalate at the timeout instead of polling forever.
+        assert_eq!(poll_step(Freed, true, Some(true), true), Escalate);
+        assert_eq!(poll_step(Freed, true, None, true), Escalate);
+        // WDDM: no VRAM answer; run state alone decides.
+        assert_eq!(poll_step(KeepWaiting, true, Some(false), false), Freed);
+        assert_eq!(poll_step(KeepWaiting, true, Some(true), false), KeepWaiting);
+        assert_eq!(poll_step(Escalate, true, Some(true), true), Escalate);
+        // VRAM still held: the probe is not consulted.
+        assert_eq!(poll_step(KeepWaiting, false, None, false), KeepWaiting);
+        assert_eq!(poll_step(Escalate, false, None, true), Escalate);
+    }
+
+    /// `is_active_cmd` tests `run`; `stop_cmd` does nothing; `kill_cmd` is
+    /// `kill` verbatim. `eviction_timeout_s = 0` escalates on the first poll.
+    fn kill_fixture(run: &std::path::Path, kill: &str) -> Config {
+        let p = crate::testutil::toml_path(run);
+        let is_active = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "if exist {p} (exit 0) else (exit 1)"]"#)
+        } else {
+            format!(r#"["test", "-e", "{p}"]"#)
+        };
+        Config::from_toml(&crate::testutil::portable_toml(&format!(
+            r#"
+            eviction_timeout_s = 0
+
+            [[managed_units]]
+            unit = "fake.service"
+            start_cmd = ["true"]
+            stop_cmd = ["true"]
+            is_active_cmd = {is_active}
+            kill_cmd = {kill}
+            "#
+        )))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn kill_that_leaves_the_unit_running_is_an_error() {
+        // A wrong is_active_cmd, or a service manager restarting a killed
+        // wrapper: the kill "succeeds" but the unit is still up afterwards.
+        let run = crate::testutil::temp_marker("kill-noop-run");
+        std::fs::write(&run, b"").unwrap();
+        let cfg = kill_fixture(&run, r#"["true"]"#);
+        let result = evict(&cfg.resolved_units()[0], &cfg, GpuBackend::default()).await;
+        assert!(
+            matches!(result, Err(UnitError::StillRunning { .. })),
+            "{result:?}"
+        );
+        let _ = std::fs::remove_file(&run);
+    }
+
+    #[tokio::test]
+    async fn kill_that_exits_non_zero_but_stops_the_unit_is_escalated() {
+        // `taskkill /F` exits 128 when the process is already gone. The
+        // outcome follows the run-state re-check, not the exit status.
+        let run = crate::testutil::temp_marker("kill-128-run");
+        std::fs::write(&run, b"").unwrap();
+        let r = crate::testutil::toml_path(&run);
+        let kill = if cfg!(windows) {
+            format!(r#"["cmd", "/c", "del /q {r} 2>nul & exit 128"]"#)
+        } else {
+            format!(r#"["sh", "-c", "rm -f {r}; exit 128"]"#)
+        };
+        let cfg = kill_fixture(&run, &kill);
+        let outcome = evict(&cfg.resolved_units()[0], &cfg, GpuBackend::default())
+            .await
+            .unwrap();
+        assert_eq!(outcome, EvictionOutcome::Escalated);
+        assert!(!run.exists());
     }
 }

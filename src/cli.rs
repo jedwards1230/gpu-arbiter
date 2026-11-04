@@ -422,25 +422,17 @@ pub fn check_config(path: &str) -> Result<String, ConfigError> {
     let cfg = Config::load(path)?;
     let mut out = format!("OK: {path}");
 
-    // A `yield_cmd` with no `busy_cmd` parses fine but is inert: release is
-    // unobservable, so the daemon skips the cooperative stage and stops the unit
-    // instead. That is safe, but it silently isn't the behavior the operator
-    // asked for — surfacing it here means the mistake is caught at deploy
-    // time rather than discovered later from an eviction that never yields.
-    let inert: Vec<&str> = cfg
-        .resolved_units()
-        .iter()
-        .filter(|u| u.yield_cmd.is_some() && u.busy_cmd.is_none())
-        .map(|u| u.unit.as_str())
-        .collect();
-    if !inert.is_empty() {
+    // The retired cooperative-yield keys still parse, so an upgrade cannot
+    // break a 0.13 config, but they do nothing. Say so at deploy time.
+    let deprecated = cfg.deprecated_keys();
+    if !deprecated.is_empty() {
         // Writing to a String is infallible.
         let _ = write!(
             out,
-            "\nWARNING: yield_cmd without busy_cmd on: {}. \
-             Cooperative release cannot be verified without a busy probe, so these units \
-             will skip the yield stage and be stopped instead.",
-            inert.join(", ")
+            "\nWARNING: deprecated keys, ignored since 0.14.0: {}. \
+             Every eviction now stops the unit; resume_cmd still runs when it comes back. \
+             Remove these keys.",
+            deprecated.join(", ")
         );
     }
 
@@ -1054,6 +1046,28 @@ mod tests {
         std::fs::write(&path, "port = 49000\n").unwrap();
         let out = check_config(path.to_str().unwrap()).unwrap();
         assert!(out.starts_with("OK: "));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn check_config_validates_game_exit_grace_s() {
+        let path = unique_temp_path("checkcfg-grace.toml");
+        std::fs::write(&path, "game_exit_grace_s = 0\n").unwrap();
+        assert!(
+            check_config(path.to_str().unwrap())
+                .unwrap()
+                .starts_with("OK: ")
+        );
+        std::fs::write(&path, "game_exit_grace_s = 86400\n").unwrap();
+        assert!(matches!(
+            check_config(path.to_str().unwrap()).unwrap_err(),
+            ConfigError::Invalid(_)
+        ));
+        std::fs::write(&path, "game_exit_grace_s = -5\n").unwrap();
+        assert!(matches!(
+            check_config(path.to_str().unwrap()).unwrap_err(),
+            ConfigError::Parse(_)
+        ));
         let _ = std::fs::remove_file(&path);
     }
 

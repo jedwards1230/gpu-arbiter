@@ -207,14 +207,13 @@ pub async fn metrics(State(app): State<AppState>) -> impl IntoResponse {
 /// - `gpu_arbiter_evictions_total{unit,outcome}` — cumulative eviction
 ///   attempts, `outcome` ∈ `yielded`/`graceful`/`sigkill`/`error`. A no-op
 ///   eviction (the unit wasn't running) is not counted — see
-///   [`crate::units::eviction_metric_outcome`]. `yielded` means the tenant
-///   released the GPU cooperatively and was never stopped.
+///   [`crate::units::eviction_metric_outcome`]. `yielded` is always `0` since
+///   0.14.0 (every eviction stops the unit); the series stays so existing
+///   queries keep resolving.
 /// - `gpu_arbiter_eviction_duration_seconds{unit,stage}` — histogram of how
-///   long evictions take, `stage` ∈ `yield`/`stop`/`total`. Exists so
-///   `yield_timeout_s` and `eviction_timeout_s` can be set from observed cost
-///   rather than guessed; the stage split is what shows whether the cooperative
-///   stage is paying for itself or just adding latency ahead of an inevitable
-///   stop. No-op evictions are excluded, so steady-state passes don't drag every
+///   long evictions take, `stage` ∈ `stop`/`total`. Exists so
+///   `eviction_timeout_s` can be set from observed cost
+///   rather than guessed. No-op evictions are excluded, so steady-state passes don't drag every
 ///   quantile toward zero.
 /// - `gpu_arbiter_unit_restarts_total{unit}` — cumulative successful
 ///   managed-unit starts driven by the daemon (the ensure-running eager
@@ -481,7 +480,7 @@ pub fn render_metrics(
         "counter",
         "gpu_arbiter_hook_failures_total",
         &format!(
-            "Cumulative tenant-hook failures by hook (busy|yield|resume) and outcome \
+            "Cumulative tenant-hook failures by hook (busy|resume) and outcome \
              (nonzero = ran and exited non-zero, or for busy was killed by a signal; \
              unrunnable = could not be spawned or timed out). \
              {MONOTONIC_NOTE}"
@@ -502,17 +501,14 @@ pub fn render_metrics(
         );
     }
 
-    // Eviction durations. This exists so `yield_timeout_s` and
-    // `eviction_timeout_s` can be set from what evictions actually cost on the
-    // host rather than guessed. The `stage` label is what makes that possible —
-    // a combined number would hide whether the cooperative stage is paying for
-    // itself or just adding latency ahead of an inevitable stop.
+    // Eviction durations. This exists so `eviction_timeout_s` can be set from
+    // what evictions actually cost on the host rather than guessed.
     metric_header(
         &mut o,
         "histogram",
         "gpu_arbiter_eviction_duration_seconds",
         &format!(
-            "Eviction wall-clock by stage (yield|stop|total). No-op evictions (nothing was running) are excluded. {MONOTONIC_NOTE}"
+            "Eviction wall-clock by stage (stop|total). No-op evictions (nothing was running) are excluded. {MONOTONIC_NOTE}"
         ),
     );
     let mut duration_keys: Vec<&(String, crate::state::EvictionStage)> =
@@ -1095,10 +1091,10 @@ pub async fn healthz() -> &'static str {
 /// the Windows equivalent). A direct override: starts the unit now —
 /// **unless a game holds the GPU**. While the state is `gaming`/`evicting`
 /// the reconcile task rejects the start with `409 Conflict` (any manual hold
-/// stays in place) rather than starting a tenant into a live game: eviction
-/// is edge-triggered (it fires on the available → gaming *transition*), so a
-/// unit started mid-game would NOT be re-evicted by the next pass — it would
-/// sit on the GPU alongside the game. This endpoint cannot override gaming.
+/// stays in place) rather than starting a tenant into a live game: a unit
+/// started mid-game would sit on the GPU alongside the game until the next
+/// pass's gaming invariant stopped it again. This endpoint cannot override
+/// gaming.
 /// No peer/loopback check: a unix-socket peer carries no `SocketAddr`, and
 /// the socket file's permissions (mode `0600`, root-owned; see
 /// [`serve_uds`]) are the entire auth boundary for this transport.
@@ -1219,6 +1215,9 @@ async fn stop_validated(app: &AppState, unit: String) -> (StatusCode, String) {
 /// - `GpuHeldByGame` → `409 Conflict` — a manual start while a game holds
 ///   the GPU (state `gaming`/`evicting`) is rejected outright, never
 ///   attempted (any hold stays in place); the body says why.
+/// - `PreemptedByTenant` → `409 Conflict` — likewise, when a busy
+///   higher-priority tenant preempts the unit, so it would be stopped again
+///   in the same pass.
 /// - `Failed` → `500` — the unit action itself was attempted and failed;
 ///   the detail is logged, not echoed to the (untrusted enough to warrant no
 ///   detail) HTTP response body. A dropped reply channel (the reconcile task
@@ -1253,6 +1252,12 @@ async fn enqueue_and_await(
             StatusCode::CONFLICT,
             format!(
                 "{unit} {verb} rejected: a game currently holds the GPU (state gaming/evicting); retry once the GPU is available"
+            ),
+        ),
+        Ok(Err(ManualActionError::PreemptedByTenant)) => (
+            StatusCode::CONFLICT,
+            format!(
+                "{unit} {verb} rejected: a busy higher-priority tenant currently preempts this unit; retry once that tenant is idle"
             ),
         ),
         Ok(Err(ManualActionError::Failed)) => (
@@ -1476,6 +1481,7 @@ mod tests {
                 models_error: None,
                 vram_mb: None,
                 held: false,
+                last_eviction: None,
             }],
             gpu_vram_used_mb: 21500,
             gpu_vram_total_mb: 32768,
@@ -1532,6 +1538,7 @@ mod tests {
                 models_error: None,
                 vram_mb: Some(21000),
                 held: false,
+                last_eviction: None,
             }],
             gpu_vram_used_mb: 21000,
             gpu_vram_total_mb: 32768,
@@ -1615,6 +1622,7 @@ mod tests {
                     models_error: None,
                     vram_mb: None,
                     held: true,
+                    last_eviction: None,
                 },
                 UnitStatus {
                     unit: "vllm.service".into(),
@@ -1623,6 +1631,7 @@ mod tests {
                     models_error: None,
                     vram_mb: None,
                     held: false,
+                    last_eviction: None,
                 },
             ],
             gpu_vram_used_mb: 0,
@@ -1718,7 +1727,7 @@ mod tests {
                 format!("gpu_arbiter_evictions_total{{unit=\"comfyui\",outcome=\"{outcome}\"}} 0");
             assert!(out.contains(&line), "missing `{line}` in:\n{out}");
         }
-        for stage in ["yield", "stop", "total"] {
+        for stage in ["stop", "total"] {
             for line in [
                 format!(
                     "gpu_arbiter_eviction_duration_seconds_bucket{{unit=\"comfyui\",stage=\"{stage}\",le=\"0.1\"}} 0"
@@ -1919,7 +1928,7 @@ mod tests {
         // absent. Locking the shape here is cheaper than discovering it from an
         // empty Grafana panel.
         let mut metrics = Metrics::default();
-        metrics.record_eviction_duration("asr-runner", crate::state::EvictionStage::Yield, 0.4);
+        metrics.record_eviction_duration("asr-runner", crate::state::EvictionStage::Stop, 0.4);
         metrics.record_eviction_duration("asr-runner", crate::state::EvictionStage::Total, 0.45);
 
         let out = render_metrics(&empty_snapshot(), &metrics, 0, 0, 600, 0);
@@ -1927,20 +1936,20 @@ mod tests {
         assert!(out.contains("# TYPE gpu_arbiter_eviction_duration_seconds histogram"));
         // Buckets are cumulative, so a 0.4s sample is in every bound >= 0.4.
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"asr-runner\",stage=\"yield\",le=\"0.5\"} 1"
+            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"asr-runner\",stage=\"stop\",le=\"0.5\"} 1"
         ));
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"asr-runner\",stage=\"yield\",le=\"0.25\"} 0"
+            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"asr-runner\",stage=\"stop\",le=\"0.25\"} 0"
         ));
         // +Inf is mandatory.
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"asr-runner\",stage=\"yield\",le=\"+Inf\"} 1"
+            "gpu_arbiter_eviction_duration_seconds_bucket{unit=\"asr-runner\",stage=\"stop\",le=\"+Inf\"} 1"
         ));
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_count{unit=\"asr-runner\",stage=\"yield\"} 1"
+            "gpu_arbiter_eviction_duration_seconds_count{unit=\"asr-runner\",stage=\"stop\"} 1"
         ));
         assert!(out.contains(
-            "gpu_arbiter_eviction_duration_seconds_sum{unit=\"asr-runner\",stage=\"yield\"}"
+            "gpu_arbiter_eviction_duration_seconds_sum{unit=\"asr-runner\",stage=\"stop\"}"
         ));
         // Stages are separate series — summing them would make neither timeout
         // tunable, which is the whole point of the label.
@@ -1950,16 +1959,17 @@ mod tests {
     }
 
     #[test]
-    fn render_metrics_exposes_the_yielded_eviction_outcome() {
+    fn render_metrics_keeps_the_retired_yielded_outcome_at_zero() {
+        // `outcome="yielded"` can no longer happen, but the series stays (at 0)
+        // so an alert or panel selecting it still resolves.
         let mut metrics = Metrics::default();
-        metrics.record_eviction("asr-runner", crate::units::EvictionMetricOutcome::Yielded);
+        metrics.record_eviction("asr-runner", crate::units::EvictionMetricOutcome::Graceful);
         let out = render_metrics(&empty_snapshot(), &metrics, 0, 0, 600, 0);
         assert!(
-            out.contains("gpu_arbiter_evictions_total{unit=\"asr-runner\",outcome=\"yielded\"} 1")
+            out.contains("gpu_arbiter_evictions_total{unit=\"asr-runner\",outcome=\"yielded\"} 0")
         );
-        // The pre-existing outcomes still render at zero for that unit.
         assert!(
-            out.contains("gpu_arbiter_evictions_total{unit=\"asr-runner\",outcome=\"sigkill\"} 0")
+            out.contains("gpu_arbiter_evictions_total{unit=\"asr-runner\",outcome=\"graceful\"} 1")
         );
     }
 

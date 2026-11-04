@@ -5,8 +5,8 @@
 //! agents) code against. They are pure and cross-platform — no Linux-only
 //! imports — so they unit-test on macOS.
 
-use std::collections::HashSet;
-use std::time::SystemTime;
+use std::collections::{HashMap, HashSet};
+use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -78,6 +78,11 @@ pub enum ManualActionError {
     /// operators too. Any manual hold on the unit is left in place. HTTP:
     /// `409 Conflict`.
     GpuHeldByGame,
+    /// A manual start was **rejected without being attempted** because a busy
+    /// higher-priority tenant currently preempts this unit: starting it would
+    /// only have it stopped again by the same pass's tenant preemption. Any
+    /// manual hold stays in place. HTTP: `409 Conflict`.
+    PreemptedByTenant,
 }
 
 /// Why a reconcile pass was triggered. Fed over the `mpsc` of triggers into the
@@ -111,7 +116,11 @@ pub enum ReconcileTrigger {
     /// into a live game, the same invariant startup reconciliation enforces.
     /// On a successful start, clears any manual hold on `unit` (see
     /// [`ArbiterState::held`]) so the ensure-running post-step resumes
-    /// managing it. The handler awaits `reply` for the outcome.
+    /// managing it. A unit that is **already running** (started outside the
+    /// daemon, or one whose stop failed) is not started again: the hold is
+    /// cleared and the reply is `Ok`. Either way, any resume the stop left owed
+    /// ([`ArbiterState::needs_resume`]) runs in the resume step of the same
+    /// pass. The handler awaits `reply` for the outcome.
     ManualStart {
         /// The managed unit to start (already validated by the HTTP handler
         /// against [`crate::config::Config::resolved_units`]).
@@ -121,7 +130,8 @@ pub enum ReconcileTrigger {
         /// a `409` rejection from a `500` failure).
         reply: oneshot::Sender<Result<(), ManualActionError>>,
     },
-    /// `POST /units/{unit}/stop`: evict `unit` now via its supervisor, and
+    /// `POST /units/{unit}/stop`: **stop** `unit` now via its supervisor, like
+    /// every eviction, and
     /// add it to the manually-held set (see
     /// [`ArbiterState::held`]) so the ensure-running post-step — including the
     /// very next reconcile pass, even the periodic backstop timer — doesn't
@@ -203,6 +213,35 @@ pub struct UnitStatus {
     /// not restart it even when the GPU is free (see [`ArbiterState::held`]).
     /// Cleared by a manual start on the same unit, or a daemon restart.
     pub held: bool,
+    /// The most recent eviction of this unit that actually did something
+    /// (a no-op on a unit that was already stopped is not recorded). Omitted
+    /// until the first one. In-memory only, like every other field here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_eviction: Option<LastEviction>,
+}
+
+/// One unit's gaming-invariant backoff: no stop before `until`, and the next
+/// failure waits `step` doubled (capped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvariantBackoff {
+    /// No invariant stop for this unit before this instant.
+    pub until: Instant,
+    /// The interval that produced `until`.
+    pub step: std::time::Duration,
+}
+
+/// One unit's most recent eviction, for `/status` `units[].last_eviction`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastEviction {
+    /// Why the unit was evicted: `"game"`, `"gaming invariant"`,
+    /// `"tenant preemption"` or `"manual stop"`. Every eviction stops the
+    /// unit; this says what asked for it.
+    pub reason: String,
+    /// The `gpu_arbiter_evictions_total` outcome label: `"graceful"`,
+    /// `"sigkill"` or `"error"`.
+    pub outcome: String,
+    /// RFC 3339 UTC timestamp the eviction finished.
+    pub at: String,
 }
 
 /// The `/status` payload, serialized verbatim for remote machines + dashboards.
@@ -302,17 +341,32 @@ pub struct ArbiterState {
     pub held: HashSet<String>,
     /// Units whose `resume_cmd` must run the next time they are eligible to run
     /// again (the ensure-running post-step). A unit enters this set whenever
-    /// an eviction is attempted on it, whether it was yielded, stopped, or the
-    /// attempt errored, and leaves it once its resume succeeds. That makes
-    /// `resume_cmd` edge-triggered: it fires on the way **out** of a yield,
-    /// not on every reconcile pass.
+    /// an eviction is attempted on it, whether it stopped or the attempt
+    /// errored, and leaves it once its resume succeeds. That makes
+    /// `resume_cmd` edge-triggered: it fires on the way **back** from an
+    /// eviction, not on every reconcile pass.
     ///
     /// [`ArbiterState::with_config`] seeds it with **every** configured unit, so
     /// a freshly started daemon resumes each unit once. That is what keeps the
     /// set safe to hold in memory only: a daemon that restarted while a tenant
-    /// was yielded cannot know that it was, so it resumes everything once
-    /// rather than leave a tenant parked forever.
+    /// was parked (including by a 0.13 yield) cannot know that it was, so it
+    /// resumes everything once rather than leave a tenant parked forever.
     pub needs_resume: HashSet<String>,
+    /// When the game-claim set was first seen empty while `gaming`, for the
+    /// [`crate::config::Config::game_exit_grace_s`] debounce. `None` while a
+    /// game is present, or once `gaming` has ended. Monotonic, so a wall-clock
+    /// step cannot shorten or stretch the window.
+    pub game_exit_pending_since: Option<Instant>,
+    /// Each unit's most recent effective eviction, copied into
+    /// [`UnitStatus::last_eviction`] on every `/status` refresh.
+    pub last_evictions: HashMap<String, LastEviction>,
+    /// Per-unit backoff for the gaming invariant: after a stop that needed the
+    /// kill or failed, the unit is not stopped again until `until`. Cleared
+    /// when gaming ends. See `crate::reconcile`'s gaming invariant.
+    pub invariant_backoff: HashMap<String, InvariantBackoff>,
+    /// When the gaming invariant last logged a WARN for each unit, so a unit
+    /// a service manager keeps restarting logs at most once a minute.
+    pub invariant_warned: HashMap<String, Instant>,
     /// `true` if the most recent eviction pass had at least one unit fail —
     /// feeds [`StatusSnapshot::degraded`].
     pub degraded: bool,
@@ -344,24 +398,18 @@ pub struct Metrics {
     pub unit_restarts: std::collections::HashMap<String, u64>,
     /// Reconcile passes run, bucketed by [`PassTrigger`].
     pub reconcile_passes: ReconcilePassCounts,
-    /// How long evictions actually take, per unit per stage — the data the
-    /// `yield_timeout_s` / `eviction_timeout_s` values should be set from
-    /// instead of guessed.
+    /// How long evictions actually take, per unit per stage — the data
+    /// `eviction_timeout_s` should be set from instead of guessed.
     pub eviction_durations: std::collections::HashMap<(String, EvictionStage), DurationHistogram>,
 }
 
-/// Which half of a two-stage eviction a duration sample belongs to — the
-/// `{stage=...}` label on `gpu_arbiter_eviction_duration_seconds`.
+/// Which part of an eviction a duration sample belongs to — the `{stage=...}`
+/// label on `gpu_arbiter_eviction_duration_seconds`.
 ///
-/// Kept separate rather than summed because the two tune *different* knobs, and
-/// a combined number would hide the thing you most want to know: whether the
-/// cooperative stage is paying for itself or just adding latency before the stop
-/// that was always going to happen.
+/// `stop` and `total` differ by the initial run-state probe; `stage="yield"`
+/// was retired with the cooperative yield in 0.14.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EvictionStage {
-    /// Cooperative release: `yield_cmd` sent → tenant reports not busy. Tunes
-    /// `yield_timeout_s`.
-    Yield,
     /// The stop path: `stop_cmd` → freed (or SIGKILL). Tunes
     /// `eviction_timeout_s`.
     Stop,
@@ -374,7 +422,6 @@ impl EvictionStage {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            EvictionStage::Yield => "yield",
             EvictionStage::Stop => "stop",
             EvictionStage::Total => "total",
         }
@@ -384,8 +431,7 @@ impl EvictionStage {
 /// Upper bounds (seconds) for the eviction-duration histogram.
 ///
 /// Chosen for the decisions they inform, not as a round-number ladder. The dense
-/// sub-second range is where a cooperative yield should land, so it can be told
-/// apart from "instant"; 3s is the default `yield_timeout_s`; 5s is the default
+/// sub-second range tells a fast stop apart from "instant"; 5s is the default
 /// `eviction_timeout_s`; the tail exists so a wedged tenant is visibly a tail
 /// rather than silently clamped into the last finite bucket.
 pub const EVICTION_DURATION_BUCKETS: &[f64] = &[0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0];
@@ -425,11 +471,7 @@ impl DurationHistogram {
 impl EvictionStage {
     /// Every stage, in exposition order — the label values a unit's
     /// `gpu_arbiter_eviction_duration_seconds` series are pre-seeded with.
-    pub const ALL: [EvictionStage; 3] = [
-        EvictionStage::Yield,
-        EvictionStage::Stop,
-        EvictionStage::Total,
-    ];
+    pub const ALL: [EvictionStage; 2] = [EvictionStage::Stop, EvictionStage::Total];
 }
 
 impl Metrics {
@@ -462,7 +504,6 @@ impl Metrics {
         use crate::units::EvictionMetricOutcome;
         let counts = self.evictions.entry(unit.to_string()).or_default();
         match outcome {
-            EvictionMetricOutcome::Yielded => counts.yielded += 1,
             EvictionMetricOutcome::Graceful => counts.graceful += 1,
             EvictionMetricOutcome::Sigkill => counts.sigkill += 1,
             EvictionMetricOutcome::Error => counts.error += 1,
@@ -497,8 +538,10 @@ impl Metrics {
 /// for `gpu_arbiter_evictions_total{unit}`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EvictionCounts {
-    /// Count of evictions where the tenant released the GPU cooperatively and
-    /// was never stopped — the best available outcome.
+    /// Always `0` since 0.14.0, when the cooperative yield was retired: every
+    /// eviction now stops the unit. The `outcome="yielded"` series is still
+    /// exposed (seeded at zero) so existing queries and alerts keep resolving
+    /// instead of silently going absent.
     pub yielded: u64,
     /// Count of gracefully-freed evictions (VRAM drained within the timeout).
     pub graceful: u64,
@@ -578,6 +621,10 @@ impl Default for ArbiterState {
             presence: Presence::default(),
             held: HashSet::new(),
             needs_resume: HashSet::new(),
+            game_exit_pending_since: None,
+            last_evictions: HashMap::new(),
+            invariant_backoff: HashMap::new(),
+            invariant_warned: HashMap::new(),
             degraded: false,
             metrics: Metrics::default(),
         }
@@ -823,6 +870,7 @@ mod tests {
             models_error: None,
             vram_mb: None,
             held: false,
+            last_eviction: None,
         };
         let json = serde_json::to_string(&u).unwrap();
         assert!(json.contains(r#""running":null"#), "{json}");
@@ -841,6 +889,7 @@ mod tests {
             models_error: None,
             vram_mb: Some(21000),
             held: true,
+            last_eviction: None,
         }];
         s.gpu_vram_used_mb = 21500;
         s.gpu_vram_total_mb = 32768;
@@ -865,6 +914,7 @@ mod tests {
                 models_error: None,
                 vram_mb: Some(8000),
                 held: false,
+                last_eviction: None,
             },
             UnitStatus {
                 unit: "ollama.service".into(),
@@ -873,6 +923,7 @@ mod tests {
                 models_error: None,
                 vram_mb: Some(21000),
                 held: false,
+                last_eviction: None,
             },
         ];
         let snap = s.snapshot();
@@ -954,16 +1005,16 @@ mod tests {
     #[test]
     fn record_eviction_duration_keys_by_unit_and_stage() {
         let mut m = Metrics::default();
-        m.record_eviction_duration("asr-runner", EvictionStage::Yield, 0.4);
+        m.record_eviction_duration("asr-runner", EvictionStage::Stop, 0.4);
         m.record_eviction_duration("asr-runner", EvictionStage::Total, 0.45);
         m.record_eviction_duration("ollama", EvictionStage::Stop, 1.2);
 
         assert_eq!(
-            m.eviction_durations[&("asr-runner".to_string(), EvictionStage::Yield)].count,
+            m.eviction_durations[&("asr-runner".to_string(), EvictionStage::Stop)].count,
             1
         );
         // Same unit, different stage — must be a separate series, otherwise the
-        // yield and stop costs get summed and neither timeout can be tuned.
+        // stop and total costs get summed into one meaningless series.
         assert_eq!(
             m.eviction_durations[&("asr-runner".to_string(), EvictionStage::Total)].count,
             1
@@ -976,15 +1027,15 @@ mod tests {
     }
 
     #[test]
-    fn record_eviction_counts_yielded_separately() {
+    fn record_eviction_never_counts_yielded() {
+        // The cooperative yield is retired: `yielded` stays a zero series.
         use crate::units::EvictionMetricOutcome;
         let mut m = Metrics::default();
-        m.record_eviction("asr-runner", EvictionMetricOutcome::Yielded);
-        m.record_eviction("asr-runner", EvictionMetricOutcome::Yielded);
+        m.record_eviction("asr-runner", EvictionMetricOutcome::Graceful);
         m.record_eviction("asr-runner", EvictionMetricOutcome::Graceful);
         let c = m.evictions["asr-runner"];
-        assert_eq!(c.yielded, 2);
-        assert_eq!(c.graceful, 1);
+        assert_eq!(c.yielded, 0);
+        assert_eq!(c.graceful, 2);
         assert_eq!(c.sigkill, 0);
     }
 
@@ -1081,7 +1132,7 @@ mod tests {
             }
         }
         assert_eq!(s.metrics.evictions.len(), 2);
-        assert_eq!(s.metrics.eviction_durations.len(), 6);
+        assert_eq!(s.metrics.eviction_durations.len(), 4);
     }
 
     #[test]

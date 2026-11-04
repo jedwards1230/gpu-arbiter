@@ -212,8 +212,15 @@ claim (zero config, covers all Steam games). Non\-Steam launchers are matched by
 configured cmdline substrings
 .RI ( game_patterns ).
 .PP
-Eviction of each managed unit runs the same bounded loop, in the configured
-order: stop the unit via its supervisor
+Every eviction
+.B stops
+the unit \(em a game launch, a busier tenant, the gaming invariant, a manual
+stop. On a game launch every unit below
+.B game_priority
+is stopped, in the configured order. "Evicted" means
+.BR "not running" ,
+the one postcondition observable on every platform. Each eviction runs the
+same bounded loop: stop the unit via its supervisor
 .RB ( systemctl " stop, or the per-unit " stop_cmd " override),"
 then poll the GPU backend
 .RB ( nvidia-smi " or the " amdgpu " sysfs reader, per " gpu_backend )
@@ -229,22 +236,51 @@ evict, the daemon still hands the GPU to gaming, but marks the state
 until the next clean eviction pass or a clean return to
 .IR available ,
 so an operator can tell a wedged tenant apart from a fully\-reclaimed GPU.
+On Windows the wait is for the service to reach STOPPED, and
+.B eviction_timeout_s
+(default 5) is what bounds it before
+.B kill_cmd
+runs. A
+.B stop_cmd
+that fails outright with the unit still up is escalated to the kill as well,
+and still counted as an error. On every platform the postcondition is
+.BR "not running" :
+a VRAM drop only counts once the unit is confirmed stopped, and a unit still
+running (or unconfirmed) 2 s after the kill is an eviction error, whatever the
+kill command's exit status.
 .PP
-A unit that configures
+While gaming, every steady pass re\-checks those units and stops any
+that is running again (a service manager restart, a start from outside the
+daemon), with a warning in the log at most once a minute per unit. An
+unknown run state counts as running. After a stop that needed the kill or
+failed, the unit is backed off (15 s, doubling to 120 s, reset when gaming
+ends) so a misbehaving unit cannot make every pass a full kill cycle.
+.B gaming
+ends only once no game has been seen for
+.B game_exit_grace_s
+seconds in a row (default 30, at most 3600;
+.B 0
+ends it on the first clean pass); until then nothing is resumed or started and
+.I state
+stays
+.IR gaming .
+Each eviction is logged at info level with the unit, its reason, the outcome,
+and total VRAM before and after.
+.PP
 .B yield_cmd
-(together with
-.BR busy_cmd ,
-which is required to observe release) gets a
-.B cooperative
-stage ahead of that loop: the daemon asks the tenant to drop the GPU while
-staying alive and polls
+and both
+.B yield_timeout_s
+keys are deprecated since 0.14.0: they still parse, so an older config keeps
+loading, but they do nothing, and the daemon warns about them once at startup.
+.B resume_cmd
+runs once after the daemon brings a stopped unit back (and once per unit at
+startup) and must be idempotent; use it to clear tenant\-side park flags. It
+runs only once the unit is up (started by that pass, or confirmed running).
+The pass re\-scans processes immediately before each start and each resume;
+the first game it sees skips every remaining start and resume in that pass,
+and a unit whose resume was skipped stays owed.
 .B busy_cmd
-until it reports not busy, up to
-.BR yield_timeout_s .
-On success the unit is never stopped \(em no in\-flight work is lost and there
-is no cold model reload afterwards. On timeout or failure it falls through to
-the stop loop above, so a tenant can never hold the GPU against a higher tier
-by ignoring the request.
+is not run for a held unit or one confirmed stopped.
 .PP
 Tenants also rank against
 .I each other
@@ -337,9 +373,9 @@ must be one of the configured managed units; an unknown unit is rejected with
 404. Routes through the same reconcile task that drives automatic
 eviction/restart (never a directly\-racing HTTP handler).
 .B stop
-additionally
+stops the unit like any eviction and additionally
 .B holds
-the unit down: without the hold, the ensure\-running self\-heal step would
+it down: without the hold, the ensure\-running self\-heal step would
 restart it on the very next reconcile pass (even the periodic backstop
 timer), making a manual stop a self\-reverting no\-op. A held unit stays down
 across game launches/exits until
@@ -350,12 +386,26 @@ is
 .B rejected with 409 Conflict
 while a game holds the GPU (state
 .IR gaming " or " evicting )
-\(em eviction is edge\-triggered (it fires on the available \(-> gaming
-transition), so a unit started mid\-game would NOT be re\-evicted by the next
-pass; it would sit on the GPU alongside the game. On rejection nothing
+\(em a unit started mid\-game would only be stopped again by the next pass's
+gaming invariant. On rejection nothing
 changes: the unit is not started and any hold stays in place \(em retry once
 the state is
 .IR available .
+It is likewise rejected with 409 while a busy higher\-priority tenant
+preempts the unit (the same pass would stop it again); the hold stays.
+.B start
+on a held, stopped unit starts it, clears the hold, and runs the
+.B resume_cmd
+the stop left owed in the same pass.
+.B start
+on a unit that is already running (started outside the daemon, or one whose
+stop failed) skips
+.BR start_cmd ,
+and clears the hold; any owed
+.B resume_cmd
+then runs once, as soon as the GPU is free for the unit. It replies 200. A failed start
+replies 500 and keeps the hold; the daemon log carries the command's exit code
+and bounded stderr and stdout.
 Example, on the unix socket:
 .RS
 .nf

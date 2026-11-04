@@ -90,15 +90,22 @@ fn default_game_priority() -> u8 {
     DEFAULT_GAME_PRIORITY
 }
 
-/// Default [`Config::yield_timeout_s`]: 3s.
+/// Default [`Config::game_exit_grace_s`]: 30s.
 ///
-/// A starting point, not a measured value — it is the first of two eviction
-/// stages, so its budget is spent before the stop path begins and directly
-/// delays a game getting the GPU. Short enough that a tenant which ignores the
-/// request costs little, long enough that a real park-to-host-RAM has a chance
-/// to complete. Tune from the `stage="yield"` histogram.
-fn default_yield_timeout_s() -> u64 {
-    3
+/// Long enough to ride out the claim gaps a real game produces — a launcher
+/// handing off to the game binary, an anti-cheat relaunch, a single scan that
+/// lands between two processes, quitting to a launcher and starting the next
+/// game — short enough that tenants come back promptly once gaming is over.
+pub const DEFAULT_GAME_EXIT_GRACE_S: u64 = 30;
+
+/// Upper bound for [`Config::game_exit_grace_s`]: one hour. A larger value is
+/// almost certainly a unit mistake (milliseconds, minutes) and would keep every
+/// tenant off the GPU long after the game ended, so it is rejected at load.
+pub const MAX_GAME_EXIT_GRACE_S: u64 = 3600;
+
+/// serde default for [`Config::game_exit_grace_s`].
+fn default_game_exit_grace_s() -> u64 {
+    DEFAULT_GAME_EXIT_GRACE_S
 }
 
 /// Default base URL for [`Introspection::Ollama`] when a unit sets no
@@ -239,44 +246,28 @@ pub struct ManagedUnit {
     /// [`crate::units::BusyReply`].
     #[serde(default)]
     pub busy_cmd: Option<ArgvCmd>,
-    /// Optional **cooperative** GPU release, tried before any stop.
-    ///
-    /// Asks the tenant to let go of the GPU while staying alive. For a
-    /// PyTorch-backed ASR service, for example, that can mean flipping a
-    /// control gate on which the worker parks its model to host RAM
-    /// (`model.cpu()` + `torch.cuda.empty_cache()`) and restores it on resume.
-    /// The win over a stop is real: no in-flight work is lost and there is no
-    /// cold model reload afterwards.
-    ///
-    /// Exit 0 means "the request was accepted", **not** "the GPU is free" — the
-    /// tenant needs time to actually drop its context, so the eviction then
-    /// polls for release. Failing to release within
-    /// [`ManagedUnit::yield_timeout_s`] escalates to the normal
-    /// stop → wait → kill path, so a tenant that ignores or mishandles the
-    /// request can never hold the GPU against a higher tier.
-    ///
-    /// `None` (the default) skips straight to the stop path, which is how every
-    /// tenant behaved before this existed.
+    /// **Deprecated, ignored** (since 0.14.0). Was a cooperative GPU release
+    /// tried before a stop. Every eviction now stops the unit: a parked tenant
+    /// kept its process and several GB of CUDA state resident, and on Windows
+    /// nothing could observe that. Still parsed so a 0.13 config keeps loading;
+    /// the daemon warns once at startup and `--check-config` lists it (see
+    /// [`Config::deprecated_keys`]).
     #[serde(default)]
     pub yield_cmd: Option<ArgvCmd>,
-    /// Undo for [`ManagedUnit::yield_cmd`] — lets the tenant use the GPU again.
+    /// Idempotent "you may use the GPU again" hook.
     ///
-    /// Run on the restore path **before** any start, and only on an edge: once
-    /// when the unit becomes eligible to run again (no game, not held, not
-    /// preempted — regardless of `eager_restart`) after an eviction attempt
-    /// (yielded or stopped), and once per unit when the daemon starts. A failed
-    /// resume is retried on the next pass. It must be idempotent, because the
-    /// startup resume also runs on units that were never yielded — that is what
-    /// keeps a daemon restart from leaving a yielded tenant parked forever.
+    /// Runs on an edge: once when a unit the arbiter stopped becomes eligible
+    /// to run again (no game, not held, not preempted — regardless of
+    /// `eager_restart`), after the restore path has started it if it starts it
+    /// at all, and once per unit when the daemon starts. A failed run is
+    /// retried on the next pass. Its job today is clearing tenant-side park
+    /// flags — including stale ones a 0.13 cooperative yield left behind — so
+    /// it must be idempotent: the startup run reaches units that were never
+    /// stopped.
     #[serde(default)]
     pub resume_cmd: Option<ArgvCmd>,
-    /// How long to wait for a cooperative release before escalating to the stop
-    /// path. `None` falls back to [`Config::yield_timeout_s`].
-    ///
-    /// Per-unit because the right value is tenant-specific: parking a 17 GB
-    /// model to host RAM is not the same operation as draining a small one, and
-    /// the whole point of the duration metrics is to set this from observation
-    /// rather than guesswork.
+    /// **Deprecated, ignored** (since 0.14.0), with [`ManagedUnit::yield_cmd`].
+    /// Still parsed so a 0.13 config keeps loading.
     #[serde(default)]
     pub yield_timeout_s: Option<u64>,
     /// **Fallback** substring (case-insensitive) matched against `nvidia-smi`
@@ -471,16 +462,10 @@ pub struct Config {
     /// event-driven (`cn_proc`); this only covers dropped events.
     pub reconcile_interval_s: u64,
 
-    /// Default cooperative-release timeout, for units that set `yield_cmd` but
-    /// not their own [`ManagedUnit::yield_timeout_s`].
-    ///
-    /// Deliberately shorter than `eviction_timeout_s`: this is the *first* of
-    /// two stages, and its budget is spent before the stop path even begins, so
-    /// a generous value here directly delays a game getting the GPU. Tune it
-    /// from the `gpu_arbiter_eviction_duration_seconds{stage="yield"}` histogram
-    /// rather than by guessing — that is what the histogram is for.
-    #[serde(default = "default_yield_timeout_s")]
-    pub yield_timeout_s: u64,
+    /// **Deprecated, ignored** (since 0.14.0): was the default cooperative-
+    /// release budget. Still parsed so a 0.13 config keeps loading; see
+    /// [`Config::deprecated_keys`].
+    pub yield_timeout_s: Option<u64>,
 
     /// The priority a detected **game** claims at. Higher wins; see
     /// [`ManagedUnit::priority`] for the ladder's semantics.
@@ -491,6 +476,23 @@ pub struct Config {
     /// option (a tenant you never want interrupted), but a deliberate one.
     #[serde(default = "default_game_priority")]
     pub game_priority: u8,
+
+    /// Seconds the game-claim set must stay **continuously empty** before
+    /// `gaming` ends. Defaults to [`DEFAULT_GAME_EXIT_GRACE_S`] (30); at most
+    /// [`MAX_GAME_EXIT_GRACE_S`] (3600).
+    ///
+    /// Without a debounce, one reconcile pass that happened to see no game
+    /// (a launcher handing off to the game binary, a scan between two
+    /// processes) ended gaming on the spot: owed resumes ran and eager units
+    /// were started straight back onto the GPU, only for the next pass to see
+    /// the game again and evict them — a flap per gap. Inside the grace
+    /// window the state stays `gaming` and nothing is resumed or started; a
+    /// claim reappearing resets the window. `0` restores the immediate
+    /// behavior. The window is in memory only: a daemon restart inside it
+    /// starts from `available` again (the startup pass then sees no game and
+    /// restores tenants at once).
+    #[serde(default = "default_game_exit_grace_s")]
+    pub game_exit_grace_s: u64,
 
     // ── detection ──────────────────────────────────────────────────────────
     /// Match `SteamLaunch AppId=` in exec'd cmdlines (covers all Steam games).
@@ -562,7 +564,8 @@ impl Default for Config {
             port: 48750,
             bind: default_bind(),
             game_priority: DEFAULT_GAME_PRIORITY,
-            yield_timeout_s: default_yield_timeout_s(),
+            yield_timeout_s: None,
+            game_exit_grace_s: DEFAULT_GAME_EXIT_GRACE_S,
             managed_units: default_managed_units(),
             eviction_timeout_s: 5,
             vram_free_threshold_mb: 2000,
@@ -591,6 +594,9 @@ pub enum ConfigError {
     /// The config file was not valid TOML / did not match the schema.
     #[error("parsing config: {0}")]
     Parse(#[from] toml::de::Error),
+    /// The config parsed but a value is out of range.
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 /// serde default for [`Config::managed_units`]: a single Ollama entry,
@@ -625,6 +631,27 @@ impl Config {
         &self.managed_units
     }
 
+    /// Keys this config sets that are parsed for compatibility but do nothing,
+    /// as `key` (top level) or `unit.key` (a managed unit), in file order.
+    /// The daemon logs them once at startup and `--check-config` warns on
+    /// them, so a deploy still carrying a 0.13 key finds out without failing.
+    #[must_use]
+    pub fn deprecated_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        if self.yield_timeout_s.is_some() {
+            keys.push("yield_timeout_s".to_string());
+        }
+        for u in self.resolved_units() {
+            if u.yield_cmd.is_some() {
+                keys.push(format!("{}.yield_cmd", u.unit));
+            }
+            if u.yield_timeout_s.is_some() {
+                keys.push(format!("{}.yield_timeout_s", u.unit));
+            }
+        }
+        keys
+    }
+
     /// Parse a [`Config`] from a TOML string. Pure — unit-tested on macOS.
     ///
     /// # Errors
@@ -633,6 +660,12 @@ impl Config {
     /// the wrong type, or an unknown key is present (`deny_unknown_fields`).
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let cfg: Config = toml::from_str(s)?;
+        if cfg.game_exit_grace_s > MAX_GAME_EXIT_GRACE_S {
+            return Err(ConfigError::Invalid(format!(
+                "game_exit_grace_s = {} exceeds the maximum of {MAX_GAME_EXIT_GRACE_S} seconds",
+                cfg.game_exit_grace_s
+            )));
+        }
         Ok(cfg)
     }
 
@@ -1178,5 +1211,80 @@ match = "Heroic"
             Config::default().resolved_units()[0].ollama_base_url(),
             DEFAULT_OLLAMA_URL
         );
+    }
+
+    #[test]
+    fn game_exit_grace_defaults_parses_and_rejects_bad_values() {
+        // Absent from the file and from `Default` alike: 30 seconds.
+        assert_eq!(Config::default().game_exit_grace_s, 30);
+        assert_eq!(Config::from_toml("").unwrap().game_exit_grace_s, 30);
+        // 0 is valid: the pre-debounce immediate behavior.
+        assert_eq!(
+            Config::from_toml("game_exit_grace_s = 0")
+                .unwrap()
+                .game_exit_grace_s,
+            0
+        );
+        assert_eq!(
+            Config::from_toml("game_exit_grace_s = 30")
+                .unwrap()
+                .game_exit_grace_s,
+            30
+        );
+        // Bounded: up to an hour, and no further.
+        assert_eq!(
+            Config::from_toml("game_exit_grace_s = 3600")
+                .unwrap()
+                .game_exit_grace_s,
+            3600
+        );
+        assert!(matches!(
+            Config::from_toml("game_exit_grace_s = 3601"),
+            Err(ConfigError::Invalid(_))
+        ));
+        // Unsigned seconds only: a negative or a string is a parse error.
+        assert!(Config::from_toml("game_exit_grace_s = -1").is_err());
+        assert!(Config::from_toml(r#"game_exit_grace_s = "10s""#).is_err());
+        // A root key, so it is rejected inside a [[managed_units]] table.
+        assert!(
+            Config::from_toml(
+                r#"
+                [[managed_units]]
+                unit = "ollama.service"
+                game_exit_grace_s = 10
+                "#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deprecated_yield_keys_still_parse_and_are_listed() {
+        // A 0.13-era config: deny_unknown_fields must not reject these.
+        let c = Config::from_toml(
+            r#"
+            yield_timeout_s = 3
+
+            [[managed_units]]
+            unit = "earmark-asr"
+            busy_cmd = ["true"]
+            yield_cmd = ["true"]
+            yield_timeout_s = 10
+            resume_cmd = ["true"]
+
+            [[managed_units]]
+            unit = "ollama"
+            "#,
+        )
+        .expect("a config carrying the deprecated keys must still load");
+        assert_eq!(
+            c.deprecated_keys(),
+            [
+                "yield_timeout_s",
+                "earmark-asr.yield_cmd",
+                "earmark-asr.yield_timeout_s"
+            ]
+        );
+        assert!(Config::default().deprecated_keys().is_empty());
     }
 }

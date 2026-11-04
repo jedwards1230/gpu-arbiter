@@ -106,29 +106,18 @@ below.
 Integer (seconds). Default
 .BR 5 .
 How long to wait for a graceful teardown (VRAM drop below
-.BR vram_free_threshold_mb )
-before escalating to SIGKILL.
+.BR vram_free_threshold_mb ,
+or on Windows the service reaching STOPPED)
+before escalating to SIGKILL, or to
+.B kill_cmd
+for a command\-driven unit.
 .TP
 .B yield_timeout_s
-Integer (seconds). Default
-.BR 3 .
-Default budget for a
-.B cooperative
-release, used by units that set
-.B yield_cmd
-but no per\-unit
-.BR yield_timeout_s .
-Deliberately shorter than
-.BR eviction_timeout_s :
-this is the
-.I first
-of two eviction stages and its budget is spent before the stop path even
-begins, so a generous value here directly delays a game getting the GPU. Tune
-it from the
-.B gpu_arbiter_eviction_duration_seconds{stage="yield"}
-histogram rather than by guessing. See
-.B THE PRIORITY LADDER
-below.
+.BR Deprecated ,
+ignored since 0.14.0 (the cooperative yield was retired). Still parsed so an
+older config keeps loading; the daemon warns once at startup and
+.B \-\-check\-config
+lists it.
 .TP
 .B game_priority
 Integer 0\(en255. Default
@@ -141,6 +130,27 @@ claims at; higher wins. The default sits above every unit's default
 which is what makes gaming preempt everything. Lowering it below a tenant's
 priority would let that tenant survive a game launch \(em a real option (a
 tenant you never want interrupted), but a deliberate one.
+.TP
+.B game_exit_grace_s
+Integer (seconds). Default
+.BR 30 .
+How long the game\-claim set must stay
+.B continuously
+empty before
+.I gaming
+ends and tenants are resumed or restarted. Inside the window
+.I state
+stays
+.IR gaming ,
+nothing is resumed or started, and a claim reappearing resets it. Rides out
+launcher hand\-offs and single scans that miss the game, which otherwise
+restarted tenants only for the next pass to evict them again.
+.B 0
+ends gaming on the first clean pass; at most
+.BR 3600 .
+The window is in memory only: a daemon restart inside it starts from
+.I available
+again. Daemons older than 0.14.0 reject the key.
 .TP
 .B vram_free_threshold_mb
 Integer (MiB). Default
@@ -294,49 +304,35 @@ warnings and counted in
 an idle reply never is.
 .TP
 .B yield_cmd
-String or array of strings. Default: none.
-.B Cooperative
-GPU release, tried before any stop: asks the tenant to let go of the GPU while
-staying alive. Exit 0 means "the request was accepted",
-.B not
-"the GPU is free" \(em the daemon then polls
-.B busy_cmd
-until the tenant reports not busy. Failing to release within
-.B yield_timeout_s
-escalates to the ordinary stop \(-> wait \(-> kill path, so a tenant that
-ignores or mishandles the request can never hold the GPU against a higher tier.
-.IP
-.B "Ignored unless busy_cmd is also set."
-Release would be unobservable, so the daemon logs a warning, skips the yield
-stage entirely, and stops the unit instead. It escalates immediately rather
-than sleeping out the budget: waiting cannot produce information it is
-structurally unable to observe.
+String or array of strings.
+.BR Deprecated ,
+ignored since 0.14.0: every eviction stops the unit, because a parked tenant
+kept its process and CUDA state resident and Windows could not observe that.
+Still parsed so an older config keeps loading; warned about at startup and by
+.BR \-\-check\-config .
 .TP
 .B resume_cmd
-String or array of strings. Default: none. Undo for
-.BR yield_cmd ,
-letting the tenant use the GPU again. Run on the restore path
-.B before
-any start, and
-.B edge\-triggered:
-once when the unit becomes eligible to run again after an eviction attempt
-(yielded, stopped, or errored), and once per unit when the daemon starts \(em
-never on steady\-state passes. A failed resume is retried on the next pass.
-This applies whether or not the unit sets
+String or array of strings. Default: none. Idempotent "you may use the GPU
+again" hook.
+.B Edge\-triggered:
+it is owed after every eviction and once per unit when the daemon starts, and
+runs once the unit is eligible to run again
+.B and up
+(started by that pass, or confirmed running); a unit that stays down keeps it
+owed \(em never on steady\-state passes. A failed run is retried
+on the next pass. This applies whether or not the unit sets
 .BR eager_restart ,
-which only controls whether a stopped unit is started; resuming never starts
-a unit.
-The ledger is in memory only; the startup resume is what keeps a daemon
-restart from leaving a yielded tenant parked. It must therefore be
+which only controls whether a stopped unit is started; it never starts a unit
+itself. Use it to clear tenant\-side park flags, including stale ones a 0.13
+cooperative yield left behind. It must be
 .BR idempotent ,
-because the startup resume also reaches units that were never yielded.
+because the startup run also reaches units that were never stopped.
 .TP
 .B yield_timeout_s
-Integer (seconds). Default: none (falls back to the top\-level
-.BR yield_timeout_s ).
-How long to wait for this unit's cooperative release before escalating to the
-stop path. Per\-unit because the right value is tenant\-specific: parking a
-17 GB model to host RAM is not the same operation as draining a small one.
+(per unit)
+.BR Deprecated ,
+ignored since 0.14.0, with
+.BR yield_cmd .
 .TP
 .B stop_cmd
 String or array of strings. Default: none. Override for stopping/evicting the
@@ -522,9 +518,7 @@ list. Daemons older than this key reject it as unknown.
 .SH THE PRIORITY LADDER
 Gaming\-beats\-everything is the floor, not the whole model. Tenants also rank
 against
-.I each other,
-and a tenant that supports it can be asked to let go of the GPU without being
-killed.
+.IR "each other" .
 .PP
 Every unit has a
 .B priority
@@ -558,34 +552,22 @@ Preemption is visible through
 .I units[].running
 instead.
 .PP
-When a unit sets
-.BR yield_cmd ,
-eviction runs in two stages rather than one:
-.IP 1. 4
-.B Yield
-\(em run
-.B yield_cmd
-and poll
 .B busy_cmd
-until the tenant reports not busy, up to
-.BR yield_timeout_s .
-The tenant stays alive; it just parks its model (for a PyTorch service,
-typically
-.B model.cpu()
-+
-.BR torch.cuda.empty_cache() ).
-On success the unit is never stopped \(em no in\-flight work is lost and there
-is no cold model reload afterwards.
-.IP 2. 4
-.B Stop
-\(em the ordinary stop \(-> poll\-VRAM \(-> SIGKILL path, reached whenever the
-yield times out, exits non\-zero, or is not configured.
+is not run for a held unit, or for one whose
+.B is_active
+check says it is stopped.
 .PP
-Tune both budgets from the
-.B gpu_arbiter_eviction_duration_seconds{stage=...}
-histogram; the yield/stop split exists precisely to show whether the
-cooperative stage is paying for itself or merely adding latency ahead of a stop
-that was always going to happen.
+A preempted tenant is
+.B stopped
+exactly like a game eviction and comes back (if
+.BR eager_restart )
+once nothing above it is busy, followed by its
+.BR resume_cmd .
+Tune
+.B eviction_timeout_s
+from the
+.B gpu_arbiter_eviction_duration_seconds{stage="stop"}
+histogram.
 .SH INTROSPECTION RESOLUTION
 For each managed unit, the
 .B models[]

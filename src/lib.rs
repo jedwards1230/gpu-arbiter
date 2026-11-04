@@ -121,4 +121,56 @@ pub(crate) mod testutil {
     pub(crate) fn toml_path(p: &std::path::Path) -> String {
         p.display().to_string().replace('\\', r"\\")
     }
+
+    /// A unique temp path for a marker file, safe to interpolate into an
+    /// `sh -c` / `cmd /c` command string (no parentheses — the thread id's
+    /// `ThreadId(N)` debug form would be parsed by both shells). Returned
+    /// absent.
+    pub(crate) fn temp_marker(tag: &str) -> std::path::PathBuf {
+        let name = format!(
+            "gpu-arbiter-{tag}-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        )
+        .replace(['(', ')'], "-");
+        let p = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// `start_cmd` / `stop_cmd` / `is_active_cmd` TOML lines for a
+    /// command-driven unit whose run state is the marker file `run`: start
+    /// creates it, stop deletes it, is-active tests for it. Lets a test watch
+    /// a unit really stop (or come back) instead of a constant `is_active`.
+    pub(crate) fn stateful_unit_cmds(run: &std::path::Path) -> String {
+        let p = toml_path(run);
+        if cfg!(windows) {
+            format!(
+                r#"start_cmd = ["cmd", "/c", "type nul > {p}"]
+            stop_cmd = ["cmd", "/c", "del /q {p} 2>nul & exit 0"]
+            is_active_cmd = ["cmd", "/c", "if exist {p} (exit 0) else (exit 1)"]"#
+            )
+        } else {
+            format!(
+                r#"start_cmd = ["touch", "{p}"]
+            stop_cmd = ["rm", "-f", "{p}"]
+            is_active_cmd = ["test", "-e", "{p}"]"#
+            )
+        }
+    }
+
+    /// A `kill_cmd` TOML line that stops the `run`-marker unit (see
+    /// [`stateful_unit_cmds`]) and touches `killed`, so a test can prove the
+    /// escalation reached `kill_cmd`.
+    pub(crate) fn stateful_kill_cmd(run: &std::path::Path, killed: &std::path::Path) -> String {
+        let (r, k) = (toml_path(run), toml_path(killed));
+        if cfg!(windows) {
+            format!(r#"kill_cmd = ["cmd", "/c", "del /q {r} 2>nul & type nul > {k}"]"#)
+        } else {
+            format!(r#"kill_cmd = ["sh", "-c", "rm -f {r}; touch {k}"]"#)
+        }
+    }
 }
